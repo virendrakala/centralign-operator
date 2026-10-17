@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#F8FAFC">
+    <meta name="description" content="CentrAlign autonomous browser operator workbench">
+    <title>CentrAlign Operator</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="CentrAlign Operator home">
+          <span class="brand-mark" aria-hidden="true">CA</span>
+          <span><strong>CentrAlign Operator</strong><small>Autonomous browser runtime</small></span>
+        </a>
+        <div class="header-actions">
+          <span id="providerBadge" class="planner-badge">Checking planner…</span>
+          <a class="erp-link" href="/erp/login" target="_blank" rel="noreferrer">Open sandbox ERP <span aria-hidden="true">↗</span></a>
+          <span id="runIndicator" class="status-pill status-neutral" data-state="idle" aria-live="polite"><span class="status-dot"></span><span id="runIndicatorText">Ready</span></span>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <div class="page-heading">
+        <div><p class="eyebrow">CUMULATIVE AP OPERATIONS</p><h1>Computer-use workbench</h1><p class="intro-copy">Ground every decision in invoice files, live ERP DOM, and captured browser frames.</p></div>
+        <span class="local-pill"><span></span>Loopback sandbox</span>
+      </div>
+
+      <div class="workbench-grid">
+        <section class="left-pane" aria-label="Task and execution trace">
+          <article class="card composer-card">
+            <div class="card-heading"><div><h2>Task bar</h2><p>Give the operator an outcome to complete.</p></div><span class="section-mark">01</span></div>
+            <form id="taskForm">
+              <label class="field-label" for="taskInput">Natural language task</label>
+              <textarea id="taskInput" maxlength="2000" required>Find the latest invoice from Acme, check policy compliance, enter it into the ERP portal, and verify it in the ledger</textarea>
+              <div class="scenario-row" aria-label="Preset scenarios">
+                <button type="button" class="scenario-chip" data-scenario="acme">Acme · Approval + Self-Heal</button>
+                <button type="button" class="scenario-chip" data-scenario="northstar">Northstar · Standard Entry</button>
+                <button type="button" class="scenario-chip" data-scenario="vertex">Vertex · Policy Gate</button>
+              </div>
+              <div class="composer-footer"><span class="keyboard-hint"><kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd></span><button id="runButton" class="button button-primary" type="submit">Run Operator <span aria-hidden="true">→</span></button></div>
+            </form>
+          </article>
+
+          <article class="card trace-card">
+            <div class="card-heading trace-heading"><div><h2>Live execution trace</h2><p>Thought → Action → DOM observation → Self-correction</p></div><span class="trace-run">Run <code id="traceRunId">—</code></span></div>
+            <section id="approvalBanner" class="approval-banner" hidden aria-live="polite">
+              <div class="approval-head"><span class="approval-icon">!</span><div><span class="approval-label">HUMAN APPROVAL GATE</span><h3 id="approvalTitle">Review invoice before ERP entry</h3></div></div>
+              <div id="approvalFacts" class="approval-facts"></div>
+              <p id="approvalDetail" class="approval-reason"></p>
+              <div class="approval-actions"><button id="rejectButton" class="button button-secondary" type="button">Decline</button><button id="approveButton" class="button button-approve" type="button">Approve</button></div>
+              <p id="approvalTokenMessage" class="token-message" hidden></p>
+            </section>
+            <ol id="traceList" class="trace-list" aria-live="polite"></ol>
+            <div id="traceEmpty" class="empty-state">Start a task to inspect file actions, browser controls, DOM observations, and recovery steps.</div>
+          </article>
+
+          <article class="card history-card">
+            <div class="card-heading history-heading"><div><h2>Run history</h2><p>Open a run to inspect its trace and captured frames.</p></div></div>
+            <div id="runHistory" class="run-history"><p class="muted-copy">No runs yet.</p></div>
+          </article>
+        </section>
+
+        <section class="right-pane" aria-label="Browser viewport and verification evidence">
+          <article class="card viewport-card">
+            <div class="card-heading viewport-heading"><div><h2>Live browser viewport</h2><p>Playwright screenshot after each browser action.</p></div><span id="frameBadge" class="frame-badge">Waiting for browser</span></div>
+            <div class="browser-chrome"><span class="browser-lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="browser-origin">127.0.0.1</span><code id="browserUrl">/erp/login</code></div>
+            <div class="browser-frame" id="browserFrameWrap">
+              <img id="browserFrame" alt="Latest screenshot from the Playwright-controlled ERP browser" hidden>
+              <div id="browserPlaceholder" class="browser-placeholder"><div class="placeholder-icon" aria-hidden="true">◫</div><strong>Browser frame will appear here</strong><span>Run an operator task to start the local ERP session.</span></div>
+            </div>
+            <div class="viewport-foot"><span id="frameAction">No browser action yet</span><span id="frameDimensions">16:10 · 1280 × 800</span></div>
+          </article>
+
+          <article class="card evidence-card">
+            <div class="card-heading evidence-heading"><div><h2>Verification evidence</h2><p>PDF source fields compared with the live ERP ledger DOM.</p></div><span id="evidenceBadge" class="semantic-badge badge-neutral">Not verified</span></div>
+            <div id="evidenceMeta" class="evidence-meta"><span>Source PDF</span><code id="evidenceSource">—</code><span>SHA-256</span><code id="evidenceHash">—</code></div>
+            <div class="table-wrap"><table class="evidence-table"><thead><tr><th>Field</th><th>PDF Source</th><th>ERP Ledger DOM</th><th>Proof</th></tr></thead><tbody id="evidenceBody"><tr><td colspan="4" class="empty-cell">No ledger read-back has been captured.</td></tr></tbody></table></div>
+            <div class="crop-heading"><div><h3>Final ledger screenshot</h3><p>Cropped row captured independently from the live ledger table.</p></div><span id="cropStatus" class="crop-status">No capture</span></div>
+            <div class="crop-frame"><img id="ledgerCrop" alt="Cropped screenshot of the verified ERP ledger row" hidden><div id="cropPlaceholder">The verified ledger row will appear here.</div></div>
+          </article>
+        </section>
+      </div>
+      <footer class="page-footer"><span>CentrAlign Operator · synthetic data only</span><span>Local browser actions are restricted to the ERP sandbox.</span></footer>
+    </main>
+  </body>
+</html>

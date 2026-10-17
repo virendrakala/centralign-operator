@@ -1,0 +1,6 @@
+INVOICE
+Invoice Number: AC-2048
+Vendor: Acme Analytics
+Invoice Date: 2026-08-04
+Due Date: 2026-09-03
+Amount Due: INR 81,000.00

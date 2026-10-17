@@ -1,0 +1,6 @@
+INVOICE
+Invoice Number: NS-7002
+Vendor: Northstar Hosting
+Invoice Date: 2026-09-20
+Due Date: 2026-10-20
+Amount Due: INR 18,400.00

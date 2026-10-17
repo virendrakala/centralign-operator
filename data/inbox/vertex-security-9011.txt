@@ -1,0 +1,5 @@
+Invoice Number: VTX-9011
+Vendor: Vertex Sec
+Invoice Date: 15/11/2026
+Due Date: 15/12/2026
+Amount Due: INR 72,500.00
