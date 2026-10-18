@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 import uvicorn
 
-from agent_loop import AgentLoop, TOOL_DEFINITIONS
+from agent_loop import AgentLoop, TOOL_BY_NAME, TOOL_DEFINITIONS
+from browser_tools import ERP_ROUTES, FORM_SELECTORS
 from company_app import CompanyApp
 from llm_clients import (
     ChatCompletionsClient,
@@ -300,10 +301,12 @@ class AgentLoopUnitTests(unittest.TestCase):
                 {"tool": "browser_check", "arguments": {"selector": "#approval_verified"}},
             ]
         }))
-        with self.assertRaisesRegex(ValueError, "Unexpected tool arguments"):
+        with self.assertRaisesRegex(ValueError, "Allowed fields: selector, value") as invalid_field:
             AgentLoop._validate_arguments(ToolCall("browser_fill_form", {
                 "fields": [{"selector": "#email_input", "value": "x", "javascript": "alert(1)"}]
             }))
+        for selector in FORM_SELECTORS:
+            self.assertIn(selector, str(invalid_field.exception))
         with self.assertRaisesRegex(ValueError, "between 2 and 3"):
             AgentLoop._validate_arguments(ToolCall("browser_action_sequence", {
                 "actions": [{"tool": "browser_open", "arguments": {"path": "/erp/login"}}]
@@ -320,6 +323,55 @@ class AgentLoopUnitTests(unittest.TestCase):
             loop = AgentLoop(Path(temp_dir), "batch-guard", "test", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
             with self.assertRaisesRegex(ValueError, "navigation and clicks are single-step"):
                 asyncio.run(loop._execute("browser_action_sequence", click_batch.arguments))
+
+    def test_browser_open_schema_matches_route_allowlist_and_rejections_list_options(self) -> None:
+        path_schema = TOOL_BY_NAME["browser_open"]["parameters"]["properties"]["path"]
+        self.assertEqual(path_schema["enum"], list(ERP_ROUTES))
+        for path, description in ERP_ROUTES.items():
+            self.assertIn(path, path_schema["description"])
+            self.assertIn(description, path_schema["description"])
+
+        with TemporaryDirectory(prefix="centralign-route-options-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "route-options", "test", "http://127.0.0.1:8765",
+                lambda *_: None, lambda *_: None, offline=True,
+            )
+            with self.assertRaises(ValueError) as rejected:
+                asyncio.run(loop._execute("browser_open", {"path": "/erp/invoice_entry"}))
+            message = str(rejected.exception)
+            self.assertIn("Allowed routes:", message)
+            for path in ERP_ROUTES:
+                self.assertIn(path, message)
+
+            with self.assertRaises(ValueError) as schema_rejected:
+                AgentLoop._validate_arguments(ToolCall("browser_open", {"path": "/erp/invoice"}))
+            for path in ERP_ROUTES:
+                self.assertIn(path, str(schema_rejected.exception))
+
+    def test_tool_retry_limit_summary_includes_last_tool_error(self) -> None:
+        class BadRouteClient:
+            name = "test-provider"
+            model = "test-model"
+
+            @staticmethod
+            def next_tool_call(*_args):
+                return ToolCall("browser_open", {"path": "/erp/invoice"})
+
+        with TemporaryDirectory(prefix="centralign-last-tool-error-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "last-tool-error", "test", "http://127.0.0.1:8765",
+                lambda *_: None, lambda *_: None, client=BadRouteClient(),
+            )
+
+            async def skip_browser() -> None:
+                return None
+
+            loop.browser.start = skip_browser
+            loop.browser.close = skip_browser
+            status, summary = asyncio.run(loop.run())
+        self.assertEqual(status, "needs_review")
+        self.assertIn("Last tool error (browser_open)", summary)
+        self.assertIn("one of the allowed values:", summary)
 
     def test_host_rejects_unlisted_tools_routes_and_unsafe_writes(self) -> None:
         with TemporaryDirectory(prefix="centralign-guards-") as temp_dir:
@@ -339,10 +391,14 @@ class AgentLoopUnitTests(unittest.TestCase):
                 await loop._execute("list_files", {})
                 document = await loop._execute("read_document", {"path": f"inbox/{fixture.name}"})
                 self.assertEqual(document["invoice"]["invoice_number"], "NS-7002")
-                with self.assertRaisesRegex(ValueError, "limited to the four local ERP routes"):
+                with self.assertRaisesRegex(ValueError, "Allowed routes:") as rejected_route:
                     await loop._execute("browser_open", {"path": "/outside"})
-                with self.assertRaisesRegex(ValueError, "known ERP form controls"):
+                for path in ERP_ROUTES:
+                    self.assertIn(path, str(rejected_route.exception))
+                with self.assertRaisesRegex(ValueError, "Allowed fields:") as rejected_field:
                     await loop.browser.browser_fill("#arbitrary-selector", "value")
+                for selector in FORM_SELECTORS:
+                    self.assertIn(selector, str(rejected_field.exception))
                 with self.assertRaisesRegex(ValueError, "Read the invoice and procurement policy"):
                     await loop._execute("browser_click", {"selector": "#submit_btn"})
 

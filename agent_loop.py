@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from browser_tools import BrowserTools
+from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, FORM_SELECTORS, BrowserTools
 from company_app import CompanyApp
 from documents import list_workspace_files, read_document
 from llm_clients import LLMClient, ToolCall, make_client
@@ -18,19 +18,20 @@ MAX_STEPS = 64
 MAX_TOOL_ERRORS = 3
 MAX_SUBMIT_ATTEMPTS = 3
 STOP_STATUSES = {"complete", "needs_input", "needs_review", "stopped_by_user"}
+_ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP_ROUTES.items())
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "list_files", "description": "List invoice sources and the procurement policy available to this run.", "parameters": {"type": "object", "properties": {}, "required": []}},
     {"name": "read_document", "description": "Read an allowed invoice document and inspect its extracted text and fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "read_policy", "description": "Read the procurement policy and parsed approval/vendor rules before deciding on a write.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_open", "description": "Open one of the local ERP routes in the Playwright browser.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "browser_open", "description": "Open one of the local ERP pages in the Playwright browser.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
     {"name": "browser_snapshot", "description": "Inspect the current ERP page's simplified DOM, visible alerts, form values, and tables.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_fill", "description": "Fill a known ERP form control using a source field, observed vendor row, or sandbox credential placeholder.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
-    {"name": "browser_fill_form", "description": "Fill up to ten known ERP form controls in order; the host validates every field against the selected invoice and sandbox credentials.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
+    {"name": "browser_fill", "description": "Fill a known ERP form control using a source field, observed vendor row, or sandbox credential placeholder.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(FORM_SELECTORS), "description": "Allowed ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
+    {"name": "browser_fill_form", "description": "Fill up to ten known ERP form controls in order; the host validates every field against the selected invoice and sandbox credentials.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(FORM_SELECTORS), "description": "Allowed ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
     {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
-    {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}},
-    {"name": "browser_click", "description": "Click the ERP login or invoice-submit control after host preconditions pass.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}},
+    {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
+    {"name": "browser_click", "description": "Click the ERP login or invoice-submit control after host preconditions pass.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
     {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["reason", "extracted_fields"]}},
     {"name": "verify_ledger_row", "description": "Read a matching ERP ledger row from the live DOM and compare it to the selected source document.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["invoice_number", "expected_fields"]}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
@@ -188,7 +189,10 @@ class AgentLoop:
             seen = set()
             for field in fields:
                 if not isinstance(field, dict) or set(field) != {"selector", "value"}:
-                    raise ValueError("Each form field requires exactly selector and value.")
+                    allowed = ", ".join(sorted(FORM_SELECTORS))
+                    raise ValueError(
+                        f"Each form field requires only selector and value. Allowed ERP fields: {allowed}."
+                    )
                 selector = _clean_text(field["selector"], 80)
                 if selector in seen:
                     raise ValueError("A form control may appear only once in a fill batch.")
@@ -198,8 +202,9 @@ class AgentLoop:
                 try:
                     result = await self._execute(call.name, call.arguments)
                 except Exception as exc:
-                    steps.append({"tool": call.name, "arguments": call.arguments, "result": {"status": "error", "message": f"{type(exc).__name__}: {exc}"}})
-                    return {"status": "error", "message": "The form batch stopped at the first rejected field.", "steps": steps}
+                    error = f"{type(exc).__name__}: {exc}"
+                    steps.append({"tool": call.name, "arguments": call.arguments, "result": {"status": "error", "message": error}})
+                    return {"status": "error", "message": f"The form batch stopped at the first rejected field: {error}", "steps": steps}
                 steps.append({"tool": call.name, "arguments": call.arguments, "result": result})
             return {"status": "filled_form", "fields_filled": len(steps), "steps": steps, "snapshot": steps[-1]["result"].get("snapshot", {})}
         if name == "browser_action_sequence":
@@ -223,7 +228,7 @@ class AgentLoop:
                     result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
                 steps.append({"tool": child.name, "arguments": child.arguments, "result": result})
                 if result.get("status") == "error":
-                    return {"status": "error", "message": "The browser sequence stopped at the first rejected action.", "steps": steps}
+                    return {"status": "error", "message": f"The browser sequence stopped at the first rejected action: {result.get('message', 'action failed')}.", "steps": steps}
                 if result.get("snapshot", {}).get("alert"):
                     return {"status": "sequence_stopped", "reason": "A visible ERP alert requires a separate observation/action call.", "steps": steps}
             return {"status": "sequence_complete", "steps": steps}
@@ -363,7 +368,8 @@ class AgentLoop:
                 if result.get("status") == "error":
                     self.tool_errors += 1
                     if self.tool_errors >= MAX_TOOL_ERRORS:
-                        return "needs_review", f"The tool retry limit was reached: {result.get('message', 'repeated tool errors')}"
+                        last_error = result.get("message", "repeated tool errors")
+                        return "needs_review", f"The tool retry limit was reached. Last tool error ({call.name}): {last_error}"
                 if self.finished:
                     return self.finished
             return "needs_review", f"The agent reached the {MAX_STEPS}-step limit without calling finish."
@@ -390,7 +396,13 @@ class AgentLoop:
                 "properties" in schema and schema.get("additionalProperties") is not True
             )
             if closed_object and value.keys() - properties.keys():
-                raise ValueError(f"Unexpected tool arguments: {', '.join(sorted(value.keys() - properties.keys()))}")
+                unexpected = ", ".join(sorted(value.keys() - properties.keys()))
+                allowed = ", ".join(sorted(properties)) or "none"
+                message = f"Unexpected tool arguments: {unexpected}. Allowed fields: {allowed}."
+                if label.startswith("Tool argument fields["):
+                    selectors = ", ".join(sorted(FORM_SELECTORS))
+                    message += f" Allowed ERP field selectors: {selectors}."
+                raise ValueError(message)
             for key, item in value.items():
                 if key in properties:
                     AgentLoop._validate_schema_value(item, properties[key], f"Tool argument {key}")
@@ -406,7 +418,8 @@ class AgentLoop:
         if expected == "string" and not isinstance(value, str):
             raise ValueError(f"{label} must be a string.")
         if expected == "string" and schema.get("enum") and value not in schema["enum"]:
-            raise ValueError(f"{label} must be one of the allowed values.")
+            allowed = ", ".join(str(option) for option in schema["enum"])
+            raise ValueError(f"{label} must be one of the allowed values: {allowed}.")
 
     def _append_nested_observations(self, result: dict[str, Any]) -> None:
         for step in result.get("steps", []):

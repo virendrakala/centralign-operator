@@ -8,12 +8,23 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 
-ERP_ROUTES = {"/erp/login", "/erp/vendors", "/erp/invoices/new", "/erp/ledger"}
+ERP_ROUTES = {
+    "/erp/login": "Employee sign-in page.",
+    "/erp/vendors": "Vendor directory with approved legal entity names.",
+    "/erp/invoices/new": "New invoice form for entering an invoice.",
+    "/erp/ledger": "Posted invoice ledger for duplicate checks and read-back verification.",
+}
 FORM_SELECTORS = {
     "#email_input", "#password_input", "#vendor_input", "#invoice_number_input",
     "#invoice_date_input", "#due_date_input", "#amount_input", "#currency_input",
     "#approval_token", "#source_file_input", "#source_sha256_input",
 }
+APPROVAL_CHECK_SELECTORS = {"#approval_verified"}
+CLICK_SELECTORS = {"#login_btn", "#submit_btn"}
+
+
+def _allowed_routes() -> str:
+    return ", ".join(f"{path} ({description})" for path, description in ERP_ROUTES.items())
 
 
 def _normalize(value: str) -> str:
@@ -182,7 +193,7 @@ class BrowserTools:
     async def browser_open(self, path: str) -> dict[str, Any]:
         parsed = urlparse(path)
         if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or parsed.path not in ERP_ROUTES:
-            raise ValueError("Browser navigation is limited to the four local ERP routes.")
+            raise ValueError(f"Invalid ERP route. Allowed routes: {_allowed_routes()}.")
         await self.page.goto(self.base_url + parsed.path, wait_until="domcontentloaded")
         result = await self._observe("page.goto")
         return {**result, "path": parsed.path}
@@ -192,12 +203,13 @@ class BrowserTools:
 
     async def browser_fill(self, selector: str, value: str) -> dict[str, Any]:
         if selector not in FORM_SELECTORS:
-            raise ValueError("The agent may fill only known ERP form controls.")
+            raise ValueError(f"Invalid ERP field. Allowed fields: {', '.join(sorted(FORM_SELECTORS))}.")
         path = urlparse(self.page.url).path
         if selector in {"#email_input", "#password_input"} and path != "/erp/login":
-            raise ValueError("Login fields may only be filled on the ERP login page.")
+            raise ValueError("Login fields may only be filled on /erp/login. Allowed fields there: #email_input, #password_input.")
         if selector not in {"#email_input", "#password_input"} and path != "/erp/invoices/new":
-            raise ValueError("Invoice fields may only be filled on the ERP invoice form.")
+            invoice_fields = sorted(FORM_SELECTORS - {"#email_input", "#password_input"})
+            raise ValueError(f"Invoice fields may only be filled on /erp/invoices/new. Allowed fields there: {', '.join(invoice_fields)}.")
         if self.invoice is None and selector not in {"#email_input", "#password_input"}:
             raise ValueError("Read an invoice document before filling the ERP invoice form.")
 
@@ -243,8 +255,10 @@ class BrowserTools:
         return {"status": "filled", "snapshot": snapshot}
 
     async def browser_check(self, selector: str) -> dict[str, Any]:
-        if selector != "#approval_verified" or urlparse(self.page.url).path != "/erp/invoices/new":
-            raise ValueError("The agent may check only the manager approval control on the invoice form.")
+        if selector not in APPROVAL_CHECK_SELECTORS:
+            raise ValueError(f"Invalid ERP check selector. Allowed selectors: {', '.join(sorted(APPROVAL_CHECK_SELECTORS))}.")
+        if urlparse(self.page.url).path != "/erp/invoices/new":
+            raise ValueError("The manager approval control can only be checked on /erp/invoices/new.")
         if not self.approval_token:
             raise ValueError("Manager approval is required before checking this control.")
         await self.page.locator(selector).check()
@@ -254,8 +268,8 @@ class BrowserTools:
         return {"status": "checked", "snapshot": snapshot}
 
     async def browser_click(self, selector: str) -> dict[str, Any]:
-        if selector not in {"#login_btn", "#submit_btn"}:
-            raise ValueError("The agent may click only the ERP login and invoice submit controls.")
+        if selector not in CLICK_SELECTORS:
+            raise ValueError(f"Invalid ERP click selector. Allowed selectors: {', '.join(sorted(CLICK_SELECTORS))}.")
         path = urlparse(self.page.url).path
         if selector == "#login_btn" and path != "/erp/login":
             raise ValueError("The login control is not available on this page.")
