@@ -37,7 +37,9 @@ Task
   -> finish only after live ledger read-back verification
 ```
 
-The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover. Fill batches return a short list of fields set and one compact snapshot capped at 4,000 characters.
+The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover. Fill batches return a short list of fields set and one compact snapshot capped at 4,000 characters. Snapshots retain the URL path, page title, every visible alert, empty/filled form-field states, buttons, and capped table rows; passwords and other sensitive field values are never included.
+
+Sign-in uses a dedicated `erp_login` tool. The host fills and submits credentials from `policies/company_memory.md`; the model cannot access the login selectors or password. Redirects to the login page state `Session required: call erp_login`. Navigating away from a populated form returns a warning listing the unsaved fields. If a tool with the same arguments repeats without changing page state, the agent warns after three repetitions and stops after five, including the last alert in its final message. Live providers receive the last six observations in full and one-line summaries of older observations; offline replay keeps its complete local state.
 
 The Acme demo follows the actual ERP validation path. The source says `Acme Analytics`, while the ERP requires the legal name displayed in its vendor directory. The agent first enters the source label. After the ERP displays its unknown-vendor alert, the agent inspects the directory, retries with the observed legal entity, and reads the posted row back from the ledger.
 
@@ -47,7 +49,7 @@ The app uses `FakeLLM` replay only when started explicitly with `--offline`. A l
 
 For HTTP 429 and 503, the active provider is retried up to four times after the initial attempt. The agent honors `Retry-After` or a response message such as `retry in 8s`, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. Each wait appears in the UI trace as `[RATE_LIMIT_RECOVERY]`. After those retries fail, it uses one other live provider only when `CENTRALIGN_FALLBACK_PROVIDER` is set.
 
-Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. On login, the host injects the email and password from `policies/company_memory.md`; model-entered login values are ignored, the trace states that the host supplied credentials, and the password is never included in model observations.
+Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. When `erp_login` runs, the trace states that credentials were supplied by the host. The credentials are not part of the model's tool schema or observations.
 
 Groq (default model `llama-3.3-70b-versatile`):
 
@@ -88,7 +90,7 @@ python3 web_app.py
 
 `CENTRALIGN_PROVIDER` chooses the primary provider. If it is unset, the first configured provider is selected in this order: Groq, OpenRouter, Gemini, OpenAI. Set `CENTRALIGN_FALLBACK_PROVIDER` to at most one other configured provider to enable live failover. `CENTRALIGN_MODEL` overrides the primary provider's default model; a provider-specific model variable takes precedence when both are set. Gemini 2.5 Flash-Lite may not be enabled for every AI Studio account, so set `CENTRALIGN_GEMINI_MODEL` to a model available to your account if needed.
 
-When a live provider is enabled, the task and observations—including extracted source text—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials are injected by the local host and are not supplied to the model.
+When a live provider is enabled, the task and observations—including extracted source text—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials are used by the local host and are never supplied to the model.
 
 ## Safety and verification
 
@@ -116,7 +118,7 @@ When a live provider is enabled, the task and observations—including extracted
 
 ## Checks
 
-The browser integration test starts an isolated local server and uses FakeLLM with Playwright. It covers approval before invoice-form access, ERP-originated vendor recovery, live read-back, duplicate handling, denied approval, token binding, and tool/route guards.
+The browser integration tests start isolated local servers and use Playwright. They cover host-managed sign-in success/failure, required snapshot state, unsaved-form navigation warnings, approval before invoice-form access, ERP-originated vendor recovery, live read-back, duplicate handling, denied approval, token binding, repeated-action loop detection, and tool/route guards.
 
 ```bash
 python3 -m compileall -q .

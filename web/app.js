@@ -22,18 +22,19 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
   const p = event.payload || {};
-  if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials were supplied by the host; the password is not provided to the model.";
+  if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials are supplied by the host and never exposed to the model.";
   if (event.event_type === "thought" || event.event_type === "self_correction") return p.text || "";
   if (event.event_type === "action") {
     if (p.tool === "list_files") return "List the available invoice sources and procurement policy.";
     if (p.tool === "read_document") return `Read ${p.path} as untrusted invoice data.`;
     if (p.tool === "read_policy") return "Read the procurement rules and approval threshold.";
     if (p.tool === "browser_open") return `Open the local ERP route ${p.path}.`;
+    if (p.tool === "erp_login") return "Sign in using credentials supplied by the host.";
     if (p.tool === "browser_snapshot") return "Inspect the visible ERP page and its alerts.";
     if (p.tool === "browser_fill") return `Fill ${p.selector} · ${p.value === "[redacted]" ? "sensitive value redacted" : p.value || ""}`;
     if (p.tool === "browser_fill_form") return `Fill ${p.fields?.length || 0} validated form fields in one batch.`;
@@ -46,11 +47,14 @@ function eventSummary(event) {
   }
   if (event.event_type === "observation") {
     if (p.alert) return `ERP alert: ${p.alert}`;
+    if (p.session_required) return p.session_required;
+    if (p.warning) return p.warning;
     if (p.fields) return `${p.fields.invoice_number} · ${p.fields.vendor} · ${p.fields.amount} · due ${p.fields.due_date}`;
     if (p.files) return `${p.files.length} source and policy files available.`;
     if (p.dom_tree) return p.summary || p.dom_tree.slice(0, 240);
     if (p.error) return p.error;
   }
+  if (event.event_type === "loop_guard_warning") return p.warning || `Repeated ${p.tool || "action"} without a page-state change.`;
   if (event.event_type === "approval_requested") return p.reason || "A human decision is required.";
   if (event.event_type === "approval_decision") return p.token_minted ? `Approved. Runtime token ${p.token_preview} was minted and delivered to the worker.` : "Approval was declined or timed out.";
   if (event.event_type === "planner") return `${p.mode === "replay" ? "Replay" : "Live provider"} · ${p.provider} · ${p.model}`;
@@ -75,7 +79,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "verification", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "loop_guard_warning", "verification", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);

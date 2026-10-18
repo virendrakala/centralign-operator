@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
-from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, FORM_SELECTORS, BrowserTools
+from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, MODEL_FORM_SELECTORS, BrowserTools
 from company_app import CompanyApp
 from documents import list_workspace_files, read_document
 from llm_clients import LLMClient, ProviderRequestError, ToolCall, make_client
@@ -18,6 +20,9 @@ MAX_STEPS = 64
 MAX_TOOL_ERRORS = 3
 MAX_TOOL_VALIDATION_RETRIES = 3
 MAX_SUBMIT_ATTEMPTS = 3
+LOOP_GUARD_WARN_AFTER = 3
+LOOP_GUARD_STOP_AFTER = 5
+FULL_OBSERVATIONS_TO_KEEP = 6
 STOP_STATUSES = {"complete", "needs_input", "needs_review", "stopped_by_user"}
 _ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP_ROUTES.items())
 
@@ -26,13 +31,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "list_files", "description": "List invoice sources and the procurement policy available to this run.", "parameters": {"type": "object", "properties": {}, "required": []}},
     {"name": "read_document", "description": "Read an allowed invoice document and inspect its extracted text and fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "read_policy", "description": "Read the procurement policy and parsed approval/vendor rules before deciding on a write.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_open", "description": "Open one of the local ERP pages in the Playwright browser.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
-    {"name": "browser_snapshot", "description": "Inspect the current ERP page's simplified DOM, visible alerts, form values, and tables.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_fill", "description": "Fill a known ERP form control using a source field, observed vendor row, or placeholder. For login, credentials come from the host; never provide or request a password.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(FORM_SELECTORS), "description": "Allowed ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
-    {"name": "browser_fill_form", "description": "Fill up to ten known ERP form controls in order; the host validates every field against the selected invoice and supplies login credentials. Never provide or request a password.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(FORM_SELECTORS), "description": "Allowed ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
+    {"name": "browser_open", "description": "Open one of the local ERP pages. The result warns if navigating away discards unsaved form fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
+    {"name": "erp_login", "description": "Sign in to the local ERP using credentials supplied by the host from company memory. The host fills and submits the form and returns success/failure, landing page, and any alert. Never ask for or handle credentials.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+    {"name": "browser_snapshot", "description": "Inspect the current ERP page. Snapshots include URL path, page title, all visible alerts, form field empty/filled state, buttons, and capped table rows without secret values. If the page says Session required: call erp_login, use that tool.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "browser_fill", "description": "Fill an allowlisted invoice form field using source data, an observed vendor row, or a host approval placeholder. Login credentials are not model-accessible; use erp_login.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowed non-credential ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
+    {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice form fields; credential fields are not available. Use erp_login for sign-in.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowed non-credential ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
     {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
     {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "browser_click", "description": "Click the ERP login or invoice-submit control after host preconditions pass.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
+    {"name": "browser_click", "description": "Click the invoice-submit control after host preconditions pass. Login is performed only with erp_login.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
     {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["reason", "extracted_fields"]}},
     {"name": "verify_ledger_row", "description": "Read a matching ERP ledger row from the live DOM and compare it to the selected source document.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["invoice_number", "expected_fields"]}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
@@ -90,10 +96,103 @@ class AgentLoop:
         self.submit_attempts = 0
         self.tool_errors = 0
         self.finished: tuple[str, str] | None = None
+        self._last_page_snapshot: dict[str, Any] | None = None
+        self._last_action_key: str | None = None
+        self._last_action_page_signature: str | None = None
+        self._same_action_no_change_count = 0
 
     def _event_action(self, call: ToolCall) -> None:
         safe_args = self._redact_arguments(call.name, call.arguments)
         self.emit("action", {"tool": call.name, **safe_args})
+
+    def _conversation_observations(self) -> list[dict[str, Any]]:
+        """Keep recent observations intact and compress earlier context to one-line summaries."""
+        if getattr(self.client, "name", "") == "offline-replay":
+            # FakeLLM is deterministic local replay, not a token-billed conversation model.
+            return self.observations
+        if len(self.observations) <= FULL_OBSERVATIONS_TO_KEEP:
+            return self.observations
+        older = self.observations[:-FULL_OBSERVATIONS_TO_KEEP]
+        summaries = [self._observation_one_line(item) for item in older]
+        return [{
+            "tool": "history_summary",
+            "arguments": {},
+            "result": {"summaries": summaries},
+        }, *self.observations[-FULL_OBSERVATIONS_TO_KEEP:]]
+
+    @staticmethod
+    def _observation_one_line(item: dict[str, Any]) -> str:
+        tool = str(item.get("tool", "observation"))
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        if tool == "read_document":
+            invoice = result.get("invoice") or {}
+            if invoice:
+                text = "invoice " + ", ".join(
+                    f"{key}={invoice.get(key, '')}" for key in
+                    ("vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file")
+                )
+            else:
+                text = str(result.get("path", args.get("path", "document read")))
+        elif tool == "read_policy":
+            policy = result.get("policy") or {}
+            text = f"thresholds={policy.get('thresholds', {})}; approved vendors={policy.get('approved_vendors', [])}"
+        else:
+            snapshot = result.get("snapshot") or {}
+            path = snapshot.get("url_path") or urlparse(str(snapshot.get("url", ""))).path
+            alerts = snapshot.get("alerts") or ([snapshot.get("alert")] if snapshot.get("alert") else [])
+            text = ", ".join(part for part in (
+                f"path={path}" if path else "",
+                f"status={result.get('status')}" if result.get("status") else "",
+                f"alert={'; '.join(str(alert) for alert in alerts)}" if alerts else "",
+                f"session={snapshot.get('session_required')}" if snapshot.get("session_required") else "",
+                f"warning={result.get('warning')}" if result.get("warning") else "",
+                f"fields={','.join(str(field.get('selector')) + ':' + str(field.get('state')) for field in snapshot.get('form_fields', []) if isinstance(field, dict))}" if snapshot.get("form_fields") else "",
+                f"message={result.get('message')}" if result.get("message") else "",
+                f"args={json.dumps(args, ensure_ascii=False, sort_keys=True)}" if args else "",
+            ) if part)
+        return _clean_text(f"{tool}: {text or result.get('status', 'observed')}", 240).replace("\n", " ")
+
+    @staticmethod
+    def _snapshot_from_result(result: dict[str, Any]) -> dict[str, Any] | None:
+        snapshot = result.get("snapshot")
+        if isinstance(snapshot, dict):
+            return snapshot
+        if any(key in result for key in ("url_path", "form_fields", "alerts", "tables")):
+            return result
+        return None
+
+    @staticmethod
+    def _page_signature(snapshot: dict[str, Any] | None) -> str | None:
+        if snapshot is None:
+            return None
+        state = {key: snapshot.get(key) for key in (
+            "url_path", "page_title", "alerts", "notice", "form_fields", "buttons", "tables", "session_required"
+        )}
+        if not state.get("url_path"):
+            state["url_path"] = urlparse(str(snapshot.get("url", ""))).path
+        if not state.get("page_title"):
+            state["page_title"] = snapshot.get("title", "")
+        if not state.get("alerts"):
+            state["alerts"] = [snapshot.get("alert")] if snapshot.get("alert") else []
+        return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _last_alert(snapshot: dict[str, Any] | None) -> str:
+        if not snapshot:
+            return "none"
+        alerts = snapshot.get("alerts")
+        if isinstance(alerts, list) and alerts:
+            return _clean_text(alerts[-1], 300)
+        return _clean_text(snapshot.get("alert"), 300) or "none"
+
+    @staticmethod
+    def _action_label(name: str, arguments: dict[str, Any]) -> str:
+        if name == "browser_click":
+            return f"{name}({arguments.get('selector', 'unknown selector')})"
+        if name == "browser_open":
+            return f"{name}({arguments.get('path', 'unknown route')})"
+        return f"{name}({json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))})"
 
     def _provider_recovery(self, payload: dict[str, Any]) -> None:
         self.emit("rate_limit_recovery", payload)
@@ -159,14 +258,14 @@ class AgentLoop:
         host_credentials = {"#email_input", "#password_input"}
         sensitive = {"#approval_token", "#source_sha256_input"}
         if name == "browser_fill" and safe.get("selector") in host_credentials:
-            safe["value"] = "[credentials supplied by host]"
+            safe["value"] = "[ignored; use erp_login]"
         elif name == "browser_fill" and safe.get("selector") in sensitive:
             safe["value"] = "[redacted]"
         elif name == "browser_fill_form":
             fields = safe.get("fields")
             if isinstance(fields, list):
                 safe["fields"] = [
-                    {**field, "value": "[credentials supplied by host]"}
+                    {**field, "value": "[ignored; use erp_login]"}
                     if isinstance(field, dict) and field.get("selector") in host_credentials
                     else {**field, "value": "[redacted]"}
                     if isinstance(field, dict) and field.get("selector") in sensitive
@@ -237,10 +336,15 @@ class AgentLoop:
             if path == "/erp/invoices/new" and self.selected_invoice and self._needs_approval() and not self.approval_granted:
                 raise ValueError("Procurement approval is required before opening the invoice write form.")
             return await self.browser.browser_open(path)
+        if name == "erp_login":
+            self.emit("credentials_supplied", {
+                "message": "Credentials supplied by host for ERP sign-in; the model never receives their values."
+            })
+            return await self.browser.erp_login()
         if name == "browser_snapshot":
             return await self.browser.browser_snapshot()
         if name == "browser_fill":
-            if not self.selected_invoice and arguments.get("selector") not in {"#email_input", "#password_input"}:
+            if not self.selected_invoice:
                 raise ValueError("Choose and verify an invoice before filling the ERP form.")
             selector = _clean_text(arguments.get("selector"), 80)
             result = await self.browser.browser_fill(selector, _clean_text(arguments.get("value"), 600))
@@ -255,7 +359,7 @@ class AgentLoop:
             seen = set()
             for field in fields:
                 if not isinstance(field, dict) or set(field) != {"selector", "value"}:
-                    allowed = ", ".join(sorted(FORM_SELECTORS))
+                    allowed = ", ".join(sorted(MODEL_FORM_SELECTORS))
                     raise ValueError(
                         f"Each form field requires only selector and value. Allowed ERP fields: {allowed}."
                     )
@@ -458,15 +562,12 @@ class AgentLoop:
         model_name = getattr(self.client, "model", "unknown")
         mode = "replay" if provider_name == "offline-replay" else "live"
         self.emit("planner", {"mode": mode, "provider": provider_name, "model": model_name})
-        self.emit("credentials_supplied", {
-            "message": "ERP login credentials are supplied by the host from policies/company_memory.md. Model-entered login values are ignored, and the password is never provided to the model."
-        })
         validation_retries = 0
         last_validation_error = ""
         try:
             for step in range(1, MAX_STEPS + 1):
                 try:
-                    call = await asyncio.to_thread(self.client.next_tool_call, self.task, self.observations, TOOL_DEFINITIONS)
+                    call = await asyncio.to_thread(self.client.next_tool_call, self.task, self._conversation_observations(), TOOL_DEFINITIONS)
                 except ProviderRequestError as exc:
                     if not self._is_recoverable_provider_tool_error(exc):
                         provider_name = getattr(self.client, "name", type(self.client).__name__)
@@ -544,8 +645,44 @@ class AgentLoop:
                     except Exception as exc:
                         result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
                 safe_arguments = self._redact_arguments(call.name, call.arguments)
-                self.observations.append({"tool": call.name, "arguments": safe_arguments, "result": self._redact_nested_result(result)})
-                self.emit("observation", {"tool": call.name, **self._redact_nested_result(result)})
+                safe_result = self._redact_nested_result(result)
+                self.observations.append({"tool": call.name, "arguments": safe_arguments, "result": safe_result})
+                self.emit("observation", {"tool": call.name, **safe_result})
+                page_before = self._page_signature(self._last_page_snapshot)
+                observed_snapshot = self._snapshot_from_result(safe_result)
+                if observed_snapshot is not None:
+                    self._last_page_snapshot = observed_snapshot
+                page_after = self._page_signature(self._last_page_snapshot)
+                action_key = json.dumps([call.name, safe_arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if call.name != "finish":
+                    if (
+                        action_key == self._last_action_key
+                        and page_before == self._last_action_page_signature
+                        and page_after == page_before
+                    ):
+                        self._same_action_no_change_count += 1
+                    elif page_after == page_before:
+                        self._same_action_no_change_count = 1
+                    else:
+                        self._same_action_no_change_count = 0
+                    self._last_action_key = action_key
+                    self._last_action_page_signature = page_after
+                    action_label = self._action_label(call.name, safe_arguments)
+                    if self._same_action_no_change_count == LOOP_GUARD_WARN_AFTER:
+                        warning = (
+                            f"Loop guard: {action_label} has repeated {LOOP_GUARD_WARN_AFTER} times with no page-state change. "
+                            f"Last observed alert: {self._last_alert(self._last_page_snapshot)}. Choose a different action or stop."
+                        )
+                        self.observations.append({"tool": "loop_guard_warning", "arguments": {}, "result": {"warning": warning}})
+                        self.emit("loop_guard_warning", {"tool": call.name, "arguments": safe_arguments, "count": self._same_action_no_change_count, "alert": self._last_alert(self._last_page_snapshot), "warning": warning})
+                    elif self._same_action_no_change_count >= LOOP_GUARD_STOP_AFTER:
+                        last_alert = self._last_alert(self._last_page_snapshot)
+                        reason = (
+                            f"Stopped after repeated action {action_label} {LOOP_GUARD_STOP_AFTER} times with no page-state change. "
+                            f"Last observed alert: {last_alert}."
+                        )
+                        self.emit("run_error", {"error": reason})
+                        return "needs_review", reason
                 if result.get("status") == "error":
                     self.tool_errors += 1
                     if self.tool_errors >= MAX_TOOL_ERRORS:
@@ -594,7 +731,7 @@ class AgentLoop:
                 allowed = ", ".join(sorted(properties)) or "none"
                 message = f"Unexpected tool arguments: {unexpected}. Allowed fields: {allowed}."
                 if label.startswith("Tool argument fields["):
-                    selectors = ", ".join(sorted(FORM_SELECTORS))
+                    selectors = ", ".join(sorted(MODEL_FORM_SELECTORS))
                     message += f" Allowed ERP field selectors: {selectors}."
                 raise ValueError(message)
             for key, item in value.items():

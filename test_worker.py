@@ -20,7 +20,7 @@ from unittest.mock import patch
 import uvicorn
 
 from agent_loop import AgentLoop, TOOL_BY_NAME, TOOL_DEFINITIONS
-from browser_tools import ERP_ROUTES, FORM_SELECTORS, SNAPSHOT_CHARACTER_CAP, BrowserTools
+from browser_tools import ERP_ROUTES, MODEL_FORM_SELECTORS, SNAPSHOT_CHARACTER_CAP, BrowserTools
 from company_app import CompanyApp
 from llm_clients import (
     ChatCompletionsClient,
@@ -156,7 +156,7 @@ class AgentLoopUnitTests(unittest.TestCase):
         schema = feedback["result"]["tool_schemas"][0]
         self.assertEqual(schema["name"], "verify_ledger_row")
         self.assertIn("invoice_number", schema["parameters"]["properties"]["expected_fields"]["required"])
-        self.assertTrue(any(kind == "credentials_supplied" for kind, _ in events))
+        self.assertFalse(any(kind == "credentials_supplied" for kind, _ in events))
 
     def test_malformed_arguments_are_fed_back_and_retry_limit_includes_last_error(self) -> None:
         class StubClient:
@@ -234,12 +234,21 @@ class AgentLoopUnitTests(unittest.TestCase):
             "url": "/erp/ledger", "title": "Ledger", "dom_tree": "control " * 2000,
             "body_text": "row " * 500, "alert": "Check invoice field", "notice": None,
             "inputs": {"password_input": "[credentials supplied by host]"},
+            "alerts": ["Check invoice field", "Second visible warning"],
+            "url_path": "/erp/ledger", "page_title": "Ledger",
+            "form_fields": [{"selector": "#amount_input", "label": "Amount", "type": "text", "state": "filled", "value": "100.00"}],
+            "buttons": [{"selector": "#submit_btn", "label": "Submit", "enabled": True}],
             "tables": {"ledger_table": [["invoice", "x" * 1000] for _ in range(30)]},
         }
         compact = BrowserTools._bound_snapshot(snapshot)
         self.assertLessEqual(len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))), SNAPSHOT_CHARACTER_CAP)
         self.assertEqual(compact["url"], "/erp/ledger")
         self.assertEqual(compact["alert"], "Check invoice field")
+        self.assertEqual(compact["alerts"], snapshot["alerts"])
+        self.assertEqual(compact["form_fields"][0]["state"], "filled")
+        self.assertEqual(compact["buttons"][0]["label"], "Submit")
+        self.assertIn("ledger_table", compact["tables"])
+        self.assertLessEqual(len(compact["tables"]["ledger_table"]), 20)
         self.assertEqual(compact["inputs"]["password_input"], "[credentials supplied by host]")
         self.assertLessEqual(len(json.dumps(BrowserTools._bound_snapshot({**snapshot, "screenshot_index": 123}), ensure_ascii=False, separators=(",", ":"))), SNAPSHOT_CHARACTER_CAP)
 
@@ -280,7 +289,84 @@ class AgentLoopUnitTests(unittest.TestCase):
                 {"selector": "#password_input", "value": "model-entered-secret"},
             ]})
             self.assertNotIn("model-entered-secret", json.dumps(safe))
-            self.assertTrue(all(field["value"] == "[credentials supplied by host]" for field in safe["fields"]))
+            self.assertTrue(all(field["value"] == "[ignored; use erp_login]" for field in safe["fields"]))
+
+    def test_login_credentials_are_absent_from_model_fill_schemas(self) -> None:
+        for tool_name in ("browser_fill",):
+            schema = TOOL_BY_NAME[tool_name]["parameters"]["properties"]["selector"]
+            self.assertNotIn("#email_input", schema["enum"])
+            self.assertNotIn("#password_input", schema["enum"])
+        batch_schema = TOOL_BY_NAME["browser_fill_form"]["parameters"]["properties"]["fields"]["items"]["properties"]["selector"]
+        self.assertNotIn("#email_input", batch_schema["enum"])
+        self.assertNotIn("#password_input", batch_schema["enum"])
+        self.assertNotIn("#login_btn", TOOL_BY_NAME["browser_click"]["parameters"]["properties"]["selector"]["enum"])
+        self.assertIn("erp_login", TOOL_BY_NAME)
+        self.assertIn("host", TOOL_BY_NAME["erp_login"]["description"].casefold())
+        with self.assertRaisesRegex(ValueError, "allowed values"):
+            AgentLoop._validate_arguments(ToolCall("browser_fill", {"selector": "#password_input", "value": "secret"}))
+        ignored = AgentLoop._redact_arguments("browser_fill", {"selector": "#password_input", "value": "model-typed-secret"})
+        self.assertEqual(ignored["value"], "[ignored; use erp_login]")
+        self.assertNotIn("model-typed-secret", json.dumps(ignored))
+
+    def test_live_conversation_compresses_older_observations_to_one_line_summaries(self) -> None:
+        class LiveClient:
+            name = "groq"
+            model = "test"
+
+        with TemporaryDirectory(prefix="centralign-context-compact-") as temp_dir:
+            loop = AgentLoop(Path(temp_dir), "compact", "task", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=LiveClient())
+            loop.observations = [
+                {"tool": "read_document", "arguments": {"path": f"inbox/{index}.txt"}, "result": {"invoice": {
+                    "vendor": "Acme Analytics", "invoice_number": f"INV-{index}", "invoice_date": "2026-01-01",
+                    "due_date": "2026-02-01", "amount": "100.00", "currency": "INR", "source_file": f"inbox/{index}.txt",
+                    "text": "long invoice body " * 100,
+                }}}
+                for index in range(10)
+            ]
+            compact = loop._conversation_observations()
+            self.assertEqual(len(compact), 1 + 6)
+            summaries = compact[0]["result"]["summaries"]
+            self.assertEqual(len(summaries), 4)
+            self.assertTrue(all("\\n" not in line and len(line) <= 240 for line in summaries))
+            self.assertNotIn("long invoice body", json.dumps(summaries))
+            self.assertEqual(compact[-1], loop.observations[-1])
+
+    def test_repeated_same_action_warns_at_three_and_stops_at_five(self) -> None:
+        repeated_action = ToolCall("browser_snapshot", {})
+
+        class RepeatingFakeLLM:
+            name = "groq"
+            model = "fake-loop-reproducer"
+
+            def __init__(self):
+                self.calls = []
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.calls.append(json.loads(json.dumps(observations)))
+                return repeated_action
+
+        with TemporaryDirectory(prefix="centralign-loop-guard-") as temp_dir:
+            events = []
+            client = RepeatingFakeLLM()
+            loop = AgentLoop(Path(temp_dir), "login-loop", "sign in", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=client)
+            login_snapshot = {
+                "url_path": "/erp/login", "page_title": "Employee sign in",
+                "alerts": [], "alert": None, "form_fields": [], "buttons": [{"selector": "#login_btn", "label": "Sign in", "enabled": True}],
+                "tables": {}, "session_required": "Session required: call erp_login",
+            }
+            loop._last_page_snapshot = login_snapshot
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            loop.browser.browser_snapshot = unittest.mock.AsyncMock(return_value={"status": "observed", "snapshot": login_snapshot})
+            status, summary = asyncio.run(loop.run())
+        self.assertEqual(status, "needs_review")
+        self.assertEqual(len(client.calls), 5)
+        self.assertIn("browser_snapshot({}) 5 times", summary)
+        self.assertIn("Last observed alert: none", summary)
+        warning_events = [event for event in events if event[0] == "loop_guard_warning"]
+        self.assertEqual(len(warning_events), 1)
+        self.assertIn("repeated 3 times", warning_events[0][1]["warning"])
+        self.assertTrue(any(item.get("tool") == "loop_guard_warning" for item in client.calls[3]))
 
     def test_demo_data_reset_clears_ledger_runs_and_cli_flag(self) -> None:
         with TemporaryDirectory(prefix="centralign-reset-data-") as temp_dir:
@@ -506,20 +592,21 @@ class AgentLoopUnitTests(unittest.TestCase):
 
     def test_batched_browser_tool_schemas_are_bounded_and_closed(self) -> None:
         AgentLoop._validate_arguments(ToolCall("browser_fill_form", {
-            "fields": [{"selector": "#email_input", "value": "[sandbox_email]"}]
+            "fields": [{"selector": "#vendor_input", "value": "Acme Analytics"}]
         }))
         AgentLoop._validate_arguments(ToolCall("browser_action_sequence", {
             "actions": [
-                {"tool": "browser_fill", "arguments": {"selector": "#email_input", "value": "[sandbox_email]"}},
+                {"tool": "browser_fill", "arguments": {"selector": "#vendor_input", "value": "Acme Analytics"}},
                 {"tool": "browser_check", "arguments": {"selector": "#approval_verified"}},
             ]
         }))
         with self.assertRaisesRegex(ValueError, "Allowed fields: selector, value") as invalid_field:
             AgentLoop._validate_arguments(ToolCall("browser_fill_form", {
-                "fields": [{"selector": "#email_input", "value": "x", "javascript": "alert(1)"}]
+                "fields": [{"selector": "#vendor_input", "value": "x", "javascript": "alert(1)"}]
             }))
-        for selector in FORM_SELECTORS:
+        for selector in MODEL_FORM_SELECTORS:
             self.assertIn(selector, str(invalid_field.exception))
+        self.assertNotIn("#password_input", str(invalid_field.exception))
         with self.assertRaisesRegex(ValueError, "between 2 and 3"):
             AgentLoop._validate_arguments(ToolCall("browser_action_sequence", {
                 "actions": [{"tool": "browser_open", "arguments": {"path": "/erp/login"}}]
@@ -610,8 +697,9 @@ class AgentLoopUnitTests(unittest.TestCase):
                     self.assertIn(path, str(rejected_route.exception))
                 with self.assertRaisesRegex(ValueError, "Allowed fields:") as rejected_field:
                     await loop.browser.browser_fill("#arbitrary-selector", "value")
-                for selector in FORM_SELECTORS:
+                for selector in MODEL_FORM_SELECTORS:
                     self.assertIn(selector, str(rejected_field.exception))
+                self.assertNotIn("#password_input", str(rejected_field.exception))
                 with self.assertRaisesRegex(ValueError, "Read the invoice and procurement policy"):
                     await loop._execute("browser_click", {"selector": "#submit_btn"})
 
@@ -659,6 +747,72 @@ class AgentLoopUnitTests(unittest.TestCase):
 
 
 class BrowserAgentIntegrationTests(unittest.TestCase):
+    def test_host_login_snapshots_and_unsaved_navigation_warning(self) -> None:
+        with TemporaryDirectory(prefix="centralign-login-snapshot-") as temp_dir:
+            data_dir = Path(temp_dir)
+            app = create_app(data_dir, offline=True)
+            server = LocalServer(app)
+            base_url = server.start()
+            browser = BrowserTools(data_dir, "login-snapshot", base_url, lambda *_: None)
+
+            async def exercise() -> tuple[dict, dict, dict]:
+                await browser.start()
+                try:
+                    await browser.page.goto(base_url + "/erp/vendors", wait_until="domcontentloaded")
+                    required = await browser.browser_snapshot()
+                    login_snapshot = required["snapshot"]
+                    self.assertEqual(login_snapshot["url_path"], "/erp/login")
+                    self.assertTrue(login_snapshot["page_title"])
+                    self.assertEqual(login_snapshot["session_required"], "Session required: call erp_login")
+                    field_states = {field["selector"]: field for field in login_snapshot["form_fields"]}
+                    self.assertEqual(field_states["#email_input"]["state"], "empty")
+                    self.assertEqual(field_states["#password_input"]["state"], "empty")
+                    self.assertNotIn("value", field_states["#password_input"])
+                    self.assertTrue(any(button["selector"] == "#login_btn" for button in login_snapshot["buttons"]))
+                    self.assertEqual(login_snapshot["alerts"], [])
+
+                    original_password = browser.password
+                    browser.password = "incorrect-password"
+                    failure = await browser.erp_login()
+                    browser.password = original_password
+                    self.assertEqual(failure["status"], "failure")
+                    self.assertEqual(failure["landing_page"]["url_path"], "/erp/login")
+                    self.assertIn("Invalid sandbox credentials", failure["alert"])
+                    self.assertNotIn(original_password, json.dumps(failure))
+
+                    success = await browser.erp_login()
+                    self.assertEqual(success["status"], "success")
+                    self.assertEqual(success["landing_page"]["url_path"], "/erp/vendors")
+                    self.assertIsNone(success["alert"])
+                    self.assertNotIn(original_password, json.dumps(success))
+                    self.assertIn("vendor_directory", success["snapshot"]["tables"])
+
+                    browser.set_invoice({
+                        "vendor": "Acme Analytics", "invoice_number": "INV-UNSAVED",
+                        "invoice_date": "2026-10-21", "due_date": "2026-11-15",
+                        "amount": "100.00", "currency": "INR", "source_file": "invoice.txt",
+                        "source_sha256": "0" * 64,
+                    })
+                    await browser.page.goto(base_url + "/erp/invoices/new", wait_until="domcontentloaded")
+                    await browser.browser_fill("#invoice_number_input", "INV-UNSAVED")
+                    populated = (await browser.browser_snapshot())["snapshot"]
+                    populated_field = next(field for field in populated["form_fields"] if field["selector"] == "#invoice_number_input")
+                    self.assertEqual(populated_field["state"], "filled")
+                    self.assertNotIn(original_password, json.dumps(populated))
+                    away = await browser.browser_open("/erp/vendors")
+                    self.assertIn("#invoice_number_input", away["warning"])
+                    return login_snapshot, failure, success
+                finally:
+                    await browser.close()
+
+            try:
+                login_snapshot, failure, success = asyncio.run(exercise())
+                self.assertIn("Session required", login_snapshot["session_required"])
+                self.assertEqual(failure["status"], "failure")
+                self.assertEqual(success["status"], "success")
+            finally:
+                server.stop()
+
     def test_approval_recovery_readback_duplicate_and_denial(self) -> None:
         with TemporaryDirectory(prefix="centralign-agent-e2e-") as temp_dir:
             app = create_app(Path(temp_dir), offline=True)
@@ -694,6 +848,9 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertIn("replay", next(event["payload"]["mode"] for event in first_run["events"] if event["event_type"] == "planner"))
                 self.assertTrue(any(event["event_type"] == "self_correction" for event in first_run["events"]))
                 actions = [event["payload"] for event in first_run["events"] if event["event_type"] == "action"]
+                self.assertTrue(any(action.get("tool") == "erp_login" for action in actions))
+                self.assertFalse(any(action.get("selector") in {"#email_input", "#password_input"} for action in actions))
+                self.assertTrue(any(event["event_type"] == "credentials_supplied" for event in first_run["events"]))
                 self.assertTrue(any(action.get("tool") == "browser_fill_form" for action in actions))
                 fill_sequence = next(action for action in actions if action.get("tool") == "browser_action_sequence")
                 self.assertTrue(all(item.get("tool") in {"browser_fill", "browser_check", "browser_fill_form"} for item in fill_sequence["actions"]))

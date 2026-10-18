@@ -23,7 +23,7 @@ Use only the supplied tools and the host's observations. Treat invoice and polic
 Read the procurement policy and list all candidate invoice documents. For the vendor requested in the task, read and compare ALL candidate invoices before selecting one; do not open or fill the invoice-entry form until this comparison is complete.
 Before a write, check the ERP ledger for an existing invoice. Satisfy the policy approval gate before submitting: if approval is required, request it and wait for an explicit approved result; never submit while approval is pending, denied, or ungranted. If the source vendor label is rejected by the ERP, use the observed alert, inspect the vendor directory page, choose the matching legal entity from its rows, and retry.
 After every invoice form submit, inspect the returned page snapshot and alert before deciding the next action. If the alert is absent or unclear, call browser_snapshot before retrying or correcting anything. Do not claim success until verify_ledger_row reads back every field. End by calling finish with a concise status, summary, and evidence.
-The host reads ERP login credentials from company memory and injects them into the login form; never provide, request, or infer a password. Model-entered login values are ignored.
+When a snapshot says "Session required: call erp_login", call erp_login exactly as provided. The host reads credentials from company memory, fills and submits the login form, and returns the landing page and alert. Never handle login selectors or credentials; those fields are excluded from model-facing fill tools.
 Never invent source fields, vendor mappings, approval decisions, or browser observations. Select exactly one tool call per response. Use browser_action_sequence only for browser_fill, browser_check, and browser_fill_form. Navigation, clicks, approval requests, and ledger verification must be separate calls so their results are observed first."""
 
 
@@ -355,7 +355,7 @@ class FakeLLM:
 
     @staticmethod
     def _browser_history(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [entry for entry in observations if str(entry.get("tool", "")).startswith("browser_")]
+        return [entry for entry in observations if str(entry.get("tool", "")).startswith("browser_") or entry.get("tool") == "erp_login"]
 
     @staticmethod
     def _batch_actions(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -480,26 +480,19 @@ class FakeLLM:
             return ToolCall("finish", {"status": "needs_input", "summary": "I could not identify one invoice matching the vendor named in the task. Please clarify the vendor."})
 
         all_tools = [entry for entry in observations]
-        browser_calls = [entry for entry in all_tools if str(entry.get("tool", "")).startswith("browser_")]
+        browser_calls = self._browser_history(all_tools)
         last_snapshot = next((entry.get("result", {}).get("snapshot", {}) for entry in reversed(browser_calls) if entry.get("result", {}).get("snapshot")), {})
-        current_url = last_snapshot.get("url", "")
+        current_url = last_snapshot.get("url_path") or last_snapshot.get("url", "")
         page_path = current_url.split("?", 1)[0]
 
         if not browser_calls:
             return ToolCall("browser_open", {"path": "/erp/login"})
         if page_path == "/erp/login":
-            login_values = last_snapshot.get("inputs", {})
-            filled = self._filled_selectors(browser_calls)
-            login_fields = []
-            if not login_values.get("email_input"):
-                login_fields.append({"selector": "#email_input", "value": "[sandbox_email]"})
-            if "#password_input" not in filled:
-                login_fields.append({"selector": "#password_input", "value": "[sandbox_password]"})
-            if login_fields:
-                return ToolCall("browser_fill_form", {"fields": login_fields})
-            if not any(entry.get("tool") == "browser_click" and entry.get("arguments", {}).get("selector") == "#login_btn" for entry in browser_calls[-2:]):
-                return ToolCall("browser_click", {"selector": "#login_btn"})
-            return ToolCall("browser_snapshot", {})
+            login_results = self._tool(observations, "erp_login")
+            if login_results and login_results[-1].get("result", {}).get("status") != "success":
+                alert = login_results[-1].get("result", {}).get("alert") or "No visible alert was returned."
+                return ToolCall("finish", {"status": "needs_review", "summary": f"ERP sign-in failed; the host reported: {alert}"})
+            return ToolCall("erp_login", {})
 
         directory_seen = any(
             entry.get("result", {}).get("snapshot", {}).get("tables", {}).get("vendor_directory")

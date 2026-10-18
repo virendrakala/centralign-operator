@@ -19,8 +19,11 @@ FORM_SELECTORS = {
     "#invoice_date_input", "#due_date_input", "#amount_input", "#currency_input",
     "#approval_token", "#source_file_input", "#source_sha256_input",
 }
+HOST_CREDENTIAL_SELECTORS = {"#email_input", "#password_input"}
+MODEL_FORM_SELECTORS = FORM_SELECTORS - HOST_CREDENTIAL_SELECTORS
 APPROVAL_CHECK_SELECTORS = {"#approval_verified"}
-CLICK_SELECTORS = {"#login_btn", "#submit_btn"}
+CLICK_SELECTORS = {"#submit_btn"}
+LOGIN_BUTTON_SELECTOR = "#login_btn"
 SNAPSHOT_CHARACTER_CAP = 4000
 
 
@@ -101,23 +104,36 @@ class BrowserTools:
     async def _snapshot_data(self) -> dict[str, Any]:
         if self.page is None:
             raise ValueError("Open an ERP page before taking a browser snapshot.")
-        dom_tree = await self.page.locator("body").evaluate("""body => {
-          const nodes = [...body.querySelectorAll('h1,h2,h3,label,input,select,button,[role=alert],table thead th,table tbody tr')];
-          return nodes.slice(0, 50).map(el => {
-            const id = el.id ? `[id=${el.id}] ` : '';
-            const tag = el.tagName.toLowerCase();
-            const type = el.getAttribute('type') ? ` type=${el.getAttribute('type')}` : '';
-            const label = el.getAttribute('aria-label') || (el.labels?.[0]?.innerText || '').trim() || el.getAttribute('placeholder') || '';
-            const sensitive = el.type === 'password' || ['email_input','approval_token','source_sha256_input'].includes(el.id);
-            const text = sensitive ? '[redacted]' : (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
-            const detail = label && !text.includes(label) ? ` label=${label}` : '';
-            return `${id}<${tag}${type}>${detail}${text ? ` ${text}` : ''}`;
-          }).join('\\n');
+        extracted = await self.page.locator("body").evaluate("""body => {
+          const visible = el => {
+            const style = getComputedStyle(el), box = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && box.width > 0 && box.height > 0;
+          };
+          const clean = value => String(value || '').trim().replace(/\\s+/g, ' ');
+          const fields = [...body.querySelectorAll('input,select,textarea')].filter(visible).map(el => {
+            const id = el.id || el.name || el.tagName.toLowerCase();
+            const label = clean(el.getAttribute('aria-label') || (el.labels?.[0]?.innerText || '') || el.getAttribute('placeholder') || id);
+            const value = el.type === 'checkbox' || el.type === 'radio' ? (el.checked ? 'checked' : '') : (el.value || '');
+            const secret = el.type === 'password' || ['email_input','approval_token','source_sha256_input'].includes(el.id);
+            return {selector: el.id ? `#${el.id}` : `[name=${el.name}]`, label, type: el.type || el.tagName.toLowerCase(), state: value ? 'filled' : 'empty', ...(secret || !value ? {} : {value: clean(value).slice(0, 120)})};
+          });
+          const alerts = [...body.querySelectorAll('[role=alert], .alert, #ui_error_banner, [aria-live=assertive]')]
+            .filter(visible).map(el => clean(el.innerText || el.textContent)).filter(Boolean);
+          const buttons = [...body.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')]
+            .filter(visible).map(el => ({selector: el.id ? `#${el.id}` : '', label: clean(el.innerText || el.value || el.getAttribute('aria-label')), enabled: !el.disabled}));
+          const tables = [...body.querySelectorAll('table[id]')].map(table => ({id: table.id, rows: [...table.querySelectorAll('tbody tr')].slice(0, 10).map(row => [...row.cells].map(cell => clean(cell.innerText).slice(0, 100)))}));
+          const headings = [...body.querySelectorAll('h1,h2,h3')].filter(visible).map(el => clean(el.innerText)).filter(Boolean);
+          const dom = [...body.querySelectorAll('h1,h2,h3,label,input,select,textarea,button,[role=alert],table thead th,table tbody tr')]
+            .filter(visible).slice(0, 50).map(el => {
+              const id = el.id ? `[id=${el.id}] ` : '';
+              const tag = el.tagName.toLowerCase();
+              const label = el.getAttribute('aria-label') || (el.labels?.[0]?.innerText || '').trim() || el.getAttribute('placeholder') || '';
+              const secret = el.type === 'password' || ['email_input','approval_token','source_sha256_input'].includes(el.id);
+              const text = secret ? '[redacted]' : clean(el.innerText || el.value || '').slice(0, 100);
+              return `${id}<${tag}>${label ? ` ${clean(label).slice(0,80)}` : ''}${text ? ` ${text}` : ''}`;
+            }).join('\\n');
+          return {fields, alerts, buttons, tables, headings, dom};
         }""")
-        alert_locator = self.page.locator("[role='alert'], #ui_error_banner").first
-        alert = None
-        if await alert_locator.count() and await alert_locator.is_visible():
-            alert = (await alert_locator.inner_text()).strip()
         notice_locator = self.page.locator("#post_success").first
         notice = None
         if await notice_locator.count() and await notice_locator.is_visible():
@@ -125,49 +141,83 @@ class BrowserTools:
         inputs = await self.page.locator("input").evaluate_all("""elements => Object.fromEntries(elements.map(el => [
           el.id || el.name,
           ['email_input','password_input'].includes(el.id) ? (el.value ? '[credentials supplied by host]' : '') :
-            ['approval_token','source_sha256_input'].includes(el.id) ? '[redacted]' : el.value
+            ['approval_token','source_sha256_input'].includes(el.id) ? (el.value ? '[redacted]' : '') : el.value
         ]))""")
-        tables: dict[str, list[list[str]]] = {}
-        for table_id in ("vendor_directory", "ledger_table"):
-            locator = self.page.locator(f"#{table_id}")
-            if await locator.count():
-                rows = await locator.locator("tbody tr").evaluate_all(
-                    "rows => rows.map(row => [...row.cells].map(cell => cell.innerText.trim()))"
-                )
-                if table_id == "ledger_table" and self.invoice:
-                    target = str(self.invoice.get("invoice_number", ""))
-                    matching = [row for row in rows if target and target in row]
-                    remainder = [row for row in rows if row not in matching]
-                    rows = matching + remainder[:7]
-                tables[table_id] = rows[:20]
+        tables = {table["id"]: table["rows"] for table in extracted["tables"]}
+        for table_id, rows in tables.items():
+            if table_id == "ledger_table" and self.invoice:
+                target = str(self.invoice.get("invoice_number", ""))
+                matching = [row for row in rows if target and target in row]
+                remainder = [row for row in rows if row not in matching]
+                tables[table_id] = matching + remainder[:9]
         if "vendor_directory" in tables:
             self.vendor_rows = tables["vendor_directory"]
+        current = urlparse(self.page.url)
+        alerts = [str(text)[:300] for text in extracted["alerts"]]
+        alert = alerts[0] if alerts else None
+        form_fields = extracted["fields"]
+        session_required = "Session required: call erp_login" if current.path == "/erp/login" else None
         snapshot = {
-            "url": (urlparse(self.page.url).path + (f"?{urlparse(self.page.url).query}" if urlparse(self.page.url).query else ""))[:250],
+            "url": (current.path + (f"?{current.query}" if current.query else ""))[:250],
+            "url_path": current.path[:200],
             "title": (await self.page.title())[:160],
-            "dom_tree": dom_tree,
+            "page_title": (await self.page.title())[:160],
+            "dom_tree": extracted["dom"],
             "body_text": "\n".join(part for part in [
-                await self.page.locator("h1").first.inner_text() if await self.page.locator("h1").count() else "",
+                " ".join(extracted["headings"]),
+                session_required or "",
                 alert or "", notice or "",
             ] if part)[:800],
             "alert": alert,
+            "alerts": alerts,
             "notice": notice,
+            "form_fields": form_fields,
+            "buttons": extracted["buttons"][:15],
             "inputs": inputs,
             "tables": tables,
+            "session_required": session_required,
         }
         return self._bound_snapshot(snapshot)
 
     @staticmethod
     def _bound_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-        """Keep forms, tables, and alerts while enforcing a compact serialized size."""
+        """Bound a snapshot while retaining every required page-state section and alert."""
         compact = dict(snapshot)
+        compact.setdefault("url_path", urlparse(str(compact.get("url", ""))).path)
+        compact.setdefault("page_title", compact.get("title", ""))
+        compact.setdefault("alerts", [compact["alert"]] if compact.get("alert") else [])
+        compact.setdefault("form_fields", [])
+        compact.setdefault("buttons", [])
+        compact.setdefault("tables", {})
+        compact.setdefault("session_required", None)
         compact["dom_tree"] = str(compact.get("dom_tree", ""))[:1500]
         compact["body_text"] = str(compact.get("body_text", ""))[:800]
         compact["alert"] = str(compact["alert"])[:500] if compact.get("alert") else None
+        # Keep every visible alert entry; shortening text is safe, dropping an entry is not.
+        compact["alerts"] = [str(alert)[:200] for alert in compact["alerts"]]
         compact["notice"] = str(compact["notice"])[:300] if compact.get("notice") else None
-        compact["inputs"] = {
-            str(key): str(value)[:180] for key, value in (compact.get("inputs") or {}).items()
-        }
+        sanitized_fields = []
+        for field in compact["form_fields"]:
+            if not isinstance(field, dict):
+                continue
+            safe_field = {key: str(value)[:120] for key, value in field.items() if key in {"selector", "label", "type", "state", "value"}}
+            if safe_field.get("selector") in HOST_CREDENTIAL_SELECTORS | {"#approval_token", "#source_sha256_input"} or safe_field.get("type") == "password":
+                safe_field.pop("value", None)
+            sanitized_fields.append(safe_field)
+        compact["form_fields"] = sanitized_fields
+        compact["buttons"] = [
+            {"selector": str(button.get("selector", ""))[:100], "label": str(button.get("label", ""))[:120], "enabled": bool(button.get("enabled", True))}
+            for button in compact["buttons"] if isinstance(button, dict)
+        ][:15]
+        compact["inputs"] = {}
+        for key, value in (snapshot.get("inputs") or {}).items():
+            name = str(key)
+            if name in {"email_input", "password_input"}:
+                compact["inputs"][name] = "[credentials supplied by host]" if value else ""
+            elif name in {"approval_token", "source_sha256_input"}:
+                compact["inputs"][name] = "[redacted]" if value else ""
+            else:
+                compact["inputs"][name] = str(value)[:180]
         compact["tables"] = {
             str(table): [[str(cell)[:160] for cell in row] for row in rows[:20]]
             for table, rows in (compact.get("tables") or {}).items()
@@ -178,22 +228,24 @@ class BrowserTools:
             return len(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
 
         while encoded_size() > SNAPSHOT_CHARACTER_CAP:
-            if len(compact["dom_tree"]) > 500:
-                compact["dom_tree"] = compact["dom_tree"][: max(500, len(compact["dom_tree"]) // 2)]
-            elif len(compact["body_text"]) > 250:
-                compact["body_text"] = compact["body_text"][: max(250, len(compact["body_text"]) // 2)]
+            if len(compact["dom_tree"]) > 300:
+                compact["dom_tree"] = compact["dom_tree"][: max(300, len(compact["dom_tree"]) // 2)]
+            elif len(compact["body_text"]) > 120:
+                compact["body_text"] = compact["body_text"][: max(120, len(compact["body_text"]) // 2)]
+            elif any("value" in field for field in compact["form_fields"]):
+                field = next(field for field in reversed(compact["form_fields"]) if "value" in field)
+                field["value"] = field["value"][: len(field["value"]) // 2]
+                if not field["value"]:
+                    field.pop("value", None)
             elif compact["tables"] and any(compact["tables"].values()):
                 table = max(compact["tables"], key=lambda key: sum(len(row) for row in compact["tables"][key]))
                 compact["tables"][table] = compact["tables"][table][:-1]
-            elif compact["dom_tree"]:
-                compact["dom_tree"] = compact["dom_tree"][: len(compact["dom_tree"]) // 2]
-            elif compact["body_text"]:
-                compact["body_text"] = compact["body_text"][: len(compact["body_text"]) // 2]
             elif any(compact["inputs"].values()):
                 key = max(compact["inputs"], key=lambda item: len(compact["inputs"][item]))
                 compact["inputs"][key] = compact["inputs"][key][: len(compact["inputs"][key]) // 2]
             elif compact.get("title"):
                 compact["title"] = compact["title"][: len(compact["title"]) // 2]
+                compact["page_title"] = compact["title"]
             elif compact.get("url"):
                 compact["url"] = compact["url"][: len(compact["url"]) // 2]
             else:
@@ -241,6 +293,11 @@ class BrowserTools:
             "dom_tree": snapshot["dom_tree"],
             "summary": snapshot["body_text"][:420],
             "alert": snapshot["alert"],
+            "alerts": snapshot["alerts"],
+            "form_fields": snapshot["form_fields"],
+            "buttons": snapshot["buttons"],
+            "tables": snapshot["tables"],
+            "session_required": snapshot["session_required"],
             "notice": snapshot["notice"],
             "screenshot_index": frame["screenshot_index"],
         })
@@ -250,31 +307,41 @@ class BrowserTools:
         parsed = urlparse(path)
         if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or parsed.path not in ERP_ROUTES:
             raise ValueError(f"Invalid ERP route. Allowed routes: {_allowed_routes()}.")
+        warning = await self._unsaved_form_warning(parsed.path)
         await self.page.goto(self.base_url + parsed.path, wait_until="domcontentloaded")
         result = await self._observe("page.goto")
-        return {**result, "path": parsed.path}
+        return {**result, "path": parsed.path, **({"warning": warning} if warning else {})}
+
+    async def _unsaved_form_warning(self, next_path: str) -> str | None:
+        if self.page is None:
+            return None
+        fields = await self.page.locator("input,select,textarea").evaluate_all("""elements => elements
+          .filter(el => {
+            const style = getComputedStyle(el), box = el.getBoundingClientRect();
+            if (style.display === 'none' || style.visibility === 'hidden' || !box.width || !box.height || el.type === 'hidden') return false;
+            return el.type === 'checkbox' || el.type === 'radio' ? el.checked : Boolean(el.value);
+          }).map(el => el.id ? `#${el.id}` : el.name || el.tagName.toLowerCase())""")
+        if not fields:
+            return None
+        return "Navigating away will discard unsaved form fields: " + ", ".join(fields[:15]) + "."
 
     async def browser_snapshot(self) -> dict[str, Any]:
         return await self._observe("DOM snapshot")
 
     async def browser_fill(self, selector: str, value: str) -> dict[str, Any]:
-        if selector not in FORM_SELECTORS:
-            raise ValueError(f"Invalid ERP field. Allowed fields: {', '.join(sorted(FORM_SELECTORS))}.")
+        if selector in HOST_CREDENTIAL_SELECTORS:
+            raise ValueError("Login credentials are host-managed. Call erp_login; credential selectors are not available to the model.")
+        if selector not in MODEL_FORM_SELECTORS:
+            raise ValueError(f"Invalid ERP field. Allowed fields: {', '.join(sorted(MODEL_FORM_SELECTORS))}.")
         path = urlparse(self.page.url).path
-        if selector in {"#email_input", "#password_input"} and path != "/erp/login":
-            raise ValueError("Login fields may only be filled on /erp/login. Allowed fields there: #email_input, #password_input.")
-        if selector not in {"#email_input", "#password_input"} and path != "/erp/invoices/new":
-            invoice_fields = sorted(FORM_SELECTORS - {"#email_input", "#password_input"})
+        if path != "/erp/invoices/new":
+            invoice_fields = sorted(MODEL_FORM_SELECTORS)
             raise ValueError(f"Invoice fields may only be filled on /erp/invoices/new. Allowed fields there: {', '.join(invoice_fields)}.")
-        if self.invoice is None and selector not in {"#email_input", "#password_input"}:
+        if self.invoice is None:
             raise ValueError("Read an invoice document before filling the ERP invoice form.")
 
         actual_value = value
-        if selector == "#email_input":
-            actual_value = self.email
-        elif selector == "#password_input":
-            actual_value = self.password
-        elif selector == "#approval_token":
+        if selector == "#approval_token":
             if not self.approval_token or value != "[approved_token]":
                 raise ValueError("An approved runtime token is required for this field.")
             actual_value = self.approval_token
@@ -302,6 +369,31 @@ class BrowserTools:
         await self.page.locator(selector).fill(actual_value)
         return {"status": "filled", "field": selector, "alert": await self._visible_alert()}
 
+    async def erp_login(self) -> dict[str, Any]:
+        """Sign in using host-owned credentials and report only the outcome and page state."""
+        if self.page is None:
+            raise ValueError("Start the browser before signing in to the ERP.")
+        if urlparse(self.page.url).path != "/erp/login":
+            await self.page.goto(self.base_url + "/erp/login", wait_until="domcontentloaded")
+        await self.page.locator("#email_input").fill(self.email)
+        await self.page.locator("#password_input").fill(self.password)
+        await self.page.locator(LOGIN_BUTTON_SELECTOR).click()
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=1800)
+        except Exception:
+            pass
+        snapshot = await self._snapshot_data()
+        frame = await self._capture("host-managed ERP login")
+        snapshot = self._bound_snapshot({**snapshot, "screenshot_index": frame["screenshot_index"]})
+        success = snapshot["url_path"] != "/erp/login" and not snapshot["alerts"]
+        return {
+            "status": "success" if success else "failure",
+            "message": "Signed in with credentials supplied by host." if success else "ERP sign-in failed; credentials were supplied by host.",
+            "landing_page": {"url_path": snapshot["url_path"], "title": snapshot["page_title"]},
+            "alert": snapshot["alert"],
+            "snapshot": snapshot,
+        }
+
     async def _visible_alert(self) -> str | None:
         locator = self.page.locator("[role='alert'], #ui_error_banner").first
         if await locator.count() and await locator.is_visible():
@@ -324,11 +416,11 @@ class BrowserTools:
         return {"status": "checked", "field": selector, "alert": await self._visible_alert()}
 
     async def browser_click(self, selector: str) -> dict[str, Any]:
+        if selector == LOGIN_BUTTON_SELECTOR:
+            raise ValueError("The login control is host-managed. Call erp_login; only invoice submission is model-clickable.")
         if selector not in CLICK_SELECTORS:
             raise ValueError(f"Invalid ERP click selector. Allowed selectors: {', '.join(sorted(CLICK_SELECTORS))}.")
         path = urlparse(self.page.url).path
-        if selector == "#login_btn" and path != "/erp/login":
-            raise ValueError("The login control is not available on this page.")
         if selector == "#submit_btn" and path != "/erp/invoices/new":
             raise ValueError("The submit control is not available on this page.")
         frame = await self._capture("click target", selector)
@@ -340,7 +432,7 @@ class BrowserTools:
         snapshot = await self._snapshot_data()
         frame = await self._capture("locator.click", selector)
         snapshot = self._bound_snapshot({**snapshot, "screenshot_index": frame["screenshot_index"]})
-        self.emit("observation", {"tool": "browser_snapshot", "action": "locator.click", "url": urlparse(self.page.url).path, "dom_tree": snapshot["dom_tree"], "summary": snapshot["body_text"][:420], "alert": snapshot["alert"], "notice": snapshot["notice"], "screenshot_index": frame["screenshot_index"]})
+        self.emit("observation", {"tool": "browser_snapshot", "action": "locator.click", "url": urlparse(self.page.url).path, "dom_tree": snapshot["dom_tree"], "summary": snapshot["body_text"][:420], "alert": snapshot["alert"], "alerts": snapshot["alerts"], "form_fields": snapshot["form_fields"], "buttons": snapshot["buttons"], "tables": snapshot["tables"], "session_required": snapshot["session_required"], "notice": snapshot["notice"], "screenshot_index": frame["screenshot_index"]})
         if selector == "#submit_btn" and not snapshot["alert"] and urlparse(self.page.url).path == "/erp/ledger":
             self.write_submitted = True
         return {"status": "clicked", "snapshot": snapshot}
