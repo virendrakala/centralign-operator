@@ -55,7 +55,7 @@ function eventSummary(event) {
   if (event.event_type === "provider_turn") return `${p.provider} · ${p.model}`;
   if (event.event_type === "rate_limit_recovery") {
     if (p.action === "retry_wait") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.provider} returned HTTP ${p.status_code}; waiting ${p.wait_seconds}s before retry ${p.retry}/${p.retry_limit}.`;
-    if (p.action === "retries_exhausted") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.provider} still returned HTTP ${p.status_code} after ${p.retry_count} retries.`;
+    if (p.action === "retries_exhausted") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.provider} still returned HTTP ${p.status_code} after ${p.retry_count} retries.${p.response_body ? ` ${p.response_body}` : ""}`;
     if (p.action === "provider_fallback") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.previous_provider} retries failed; switching to live provider ${p.provider}.`;
   }
   if (event.event_type === "verification") return p.status === "verified" ? `All ${Object.keys(p.matches || {}).length} fields match. Source ${p.source_file}.` : `Ledger verification status: ${p.status}.`;

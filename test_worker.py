@@ -237,6 +237,58 @@ class AgentLoopUnitTests(unittest.TestCase):
                 _request("https://example.test", {}, {}, provider="gemini", model="flash")
         self.assertEqual(caught.exception.status_code, 503)
         self.assertEqual(caught.exception.retry_after_seconds, 7.0)
+        self.assertEqual(caught.exception.response_body, "Please retry in 7s")
+
+    def test_provider_requests_set_user_agent_and_safely_include_error_excerpt(self) -> None:
+        api_key = "groq-secret-api-key"
+        error_payload = f"Access denied for {api_key}. " + ("diagnostic " * 80)
+        requests = []
+
+        def reject(request, timeout):
+            requests.append(request)
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "Forbidden", {}, io.BytesIO(error_payload.encode("utf-8"))
+            )
+
+        with patch("urllib.request.urlopen", side_effect=reject):
+            with self.assertRaises(ProviderRequestError) as caught:
+                _request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    {},
+                    {"Authorization": f"Bearer {api_key}"},
+                    provider="groq",
+                    model="llama-3.3-70b-versatile",
+                )
+
+        self.assertEqual(requests[0].get_header("User-agent"), "CentrAlignOperator/0.1")
+        excerpt = caught.exception.response_body
+        self.assertIsNotNone(excerpt)
+        self.assertLessEqual(len(excerpt), 300)
+        self.assertNotIn(api_key, excerpt)
+        self.assertNotIn(api_key, str(caught.exception))
+        self.assertIn("Access denied for [REDACTED]", excerpt)
+
+        gemini_key = "gemini-secret-api-key"
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                "https://generativelanguage.googleapis.com/v1beta?key=gemini-secret-api-key",
+                403,
+                "Forbidden",
+                {},
+                io.BytesIO(f"Rejected {gemini_key}".encode("utf-8")),
+            ),
+        ):
+            with self.assertRaises(ProviderRequestError) as gemini_error:
+                _request(
+                    "https://generativelanguage.googleapis.com/v1beta?key=gemini-secret-api-key",
+                    {},
+                    {},
+                    provider="gemini",
+                    model="gemini-2.5-flash-lite",
+                )
+        self.assertNotIn(gemini_key, gemini_error.exception.response_body)
+        self.assertIn("Rejected [REDACTED]", gemini_error.exception.response_body)
 
     def test_batched_browser_tool_schemas_are_bounded_and_closed(self) -> None:
         AgentLoop._validate_arguments(ToolCall("browser_fill_form", {

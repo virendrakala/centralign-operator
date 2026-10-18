@@ -46,19 +46,30 @@ class LLMClient(Protocol):
 class ProviderRequestError(RuntimeError):
     """HTTP failure with the status needed for safe provider recovery."""
 
-    def __init__(self, provider: str, model: str, status_code: int, retry_after_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
         self.provider = provider
         self.model = model
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
-        super().__init__(f"{provider} returned HTTP {status_code} for model {model}.")
+        self.response_body = response_body
+        detail = f" Response: {response_body}" if response_body else ""
+        super().__init__(f"{provider} returned HTTP {status_code} for model {model}.{detail}")
 
 
 class ProviderRetriesExhausted(RuntimeError):
-    def __init__(self, provider: str, model: str, status_code: int, retries: int) -> None:
+    def __init__(self, provider: str, model: str, status_code: int, retries: int, response_body: str | None = None) -> None:
         self.provider, self.model = provider, model
         self.status_code, self.retries = status_code, retries
-        super().__init__(f"{provider} returned HTTP {status_code} after {retries} retries for model {model}.")
+        self.response_body = response_body
+        detail = f" Response: {response_body}" if response_body else ""
+        super().__init__(f"{provider} returned HTTP {status_code} after {retries} retries for model {model}.{detail}")
 
 
 class LiveProvidersExhausted(RuntimeError):
@@ -85,6 +96,28 @@ def _retry_hint_seconds(retry_after: str | None, body: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
+def _safe_error_excerpt(body: str, url: str, headers: dict[str, str]) -> str | None:
+    """Return a short provider error excerpt with credentials removed."""
+    cleaned = re.sub(r"\s+", " ", body).strip()
+    secrets: set[str] = set()
+    for name, value in headers.items():
+        if name.casefold() == "authorization":
+            token = re.sub(r"^Bearer\s+", "", value.strip(), flags=re.IGNORECASE)
+            if token:
+                secrets.add(token)
+    for name, value in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True):
+        if name.casefold() in {"key", "api_key", "apikey", "access_token", "token"} and value:
+            secrets.add(value)
+    for secret in sorted(secrets, key=len, reverse=True):
+        for encoded in {secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)}:
+            if encoded:
+                cleaned = cleaned.replace(encoded, "[REDACTED]")
+    cleaned = re.sub(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer [REDACTED]", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return None
+    return cleaned if len(cleaned) <= 300 else f"{cleaned[:297]}..."
+
+
 def _request(
     url: str,
     body: dict[str, Any],
@@ -93,20 +126,24 @@ def _request(
     provider: str,
     model: str,
 ) -> dict[str, Any]:
+    request_headers = dict(headers)
+    if not any(name.casefold() == "user-agent" for name in request_headers):
+        request_headers["User-Agent"] = "CentrAlignOperator/0.1"
     request = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        url, data=json.dumps(body).encode("utf-8"), headers=request_headers, method="POST"
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # Keep provider response text out of the trace; extract only a retry hint.
+        # Keep only a short response excerpt, with the request's credentials redacted.
         try:
             error_body = exc.read().decode("utf-8", errors="replace")[:4096]
         except Exception:
             error_body = ""
         retry_hint = _retry_hint_seconds((exc.headers or {}).get("Retry-After"), error_body)
-        raise ProviderRequestError(provider, model, exc.code, retry_hint) from exc
+        safe_excerpt = _safe_error_excerpt(error_body, url, request_headers)
+        raise ProviderRequestError(provider, model, exc.code, retry_hint, safe_excerpt) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach model API: {exc.reason}") from exc
 
@@ -650,8 +687,11 @@ class ResilientClient:
                         "marker": "[RATE_LIMIT_RECOVERY]", "action": "retries_exhausted",
                         "provider": provider, "model": client.model,
                         "status_code": exc.status_code, "retry_count": self.MAX_RETRIES,
+                        "response_body": exc.response_body,
                     })
-                    raise ProviderRetriesExhausted(provider, client.model, exc.status_code, self.MAX_RETRIES) from exc
+                    raise ProviderRetriesExhausted(
+                        provider, client.model, exc.status_code, self.MAX_RETRIES, exc.response_body
+                    ) from exc
                 wait_seconds = self._retry_wait(exc, retry_number + 1)
                 self._safe_notify(self.on_recovery, {
                     "marker": "[RATE_LIMIT_RECOVERY]", "action": "retry_wait",
@@ -676,7 +716,7 @@ class ResilientClient:
             fallback_index = self.active_provider + 1
             if fallback_index >= len(self.providers):
                 raise LiveProvidersExhausted(
-                    f"Live provider {provider} failed with HTTP {primary_error.status_code} after {self.MAX_RETRIES} retries; no live fallback provider is configured."
+                    f"Live provider {primary_error}; no live fallback provider is configured."
                 ) from primary_error
             fallback_provider, fallback_client = self.providers[fallback_index]
             self._safe_notify(self.on_recovery, {
@@ -688,7 +728,7 @@ class ResilientClient:
                 call = self._call_with_retries(fallback_provider, fallback_client, task, observations, tools)
             except Exception as fallback_error:
                 raise LiveProvidersExhausted(
-                    f"Live providers failed: {provider} returned HTTP {primary_error.status_code} after {self.MAX_RETRIES} retries; "
+                    f"Live providers failed: {primary_error}; "
                     f"fallback {fallback_provider} failed: {fallback_error}."
                 ) from fallback_error
             self.active_provider = fallback_index
