@@ -436,6 +436,14 @@ class CompanyApp:
                 (status, datetime.now(timezone.utc).isoformat(), summary, run_id),
             )
 
+    def reset_demo_data(self) -> None:
+        """Clear persisted ledger, run history, and audit events, keeping source fixtures."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM audit_events")
+            conn.execute("DELETE FROM runs")
+            conn.execute("DELETE FROM bills")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('audit_events', 'bills')")
+
     def list_bills(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM bills ORDER BY id DESC").fetchall()

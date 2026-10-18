@@ -20,12 +20,14 @@ from unittest.mock import patch
 import uvicorn
 
 from agent_loop import AgentLoop, TOOL_BY_NAME, TOOL_DEFINITIONS
-from browser_tools import ERP_ROUTES, FORM_SELECTORS
+from browser_tools import ERP_ROUTES, FORM_SELECTORS, SNAPSHOT_CHARACTER_CAP, BrowserTools
 from company_app import CompanyApp
 from llm_clients import (
     ChatCompletionsClient,
     FakeLLM,
+    GeminiClient,
     LiveProvidersExhausted,
+    OpenAIClient,
     ProviderConfigurationError,
     ProviderRequestError,
     ResilientClient,
@@ -34,7 +36,7 @@ from llm_clients import (
     make_client,
 )
 from worker import planner_config
-from web_app import RunManager, create_app
+from web_app import RunManager, create_app, main as web_main
 
 
 ROOT = Path(__file__).resolve().parent
@@ -112,6 +114,201 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertEqual(client.name, "offline-replay")
         self.assertEqual(client.model, "FakeLLM scripted replay")
         self.assertEqual(call, ToolCall("list_files", {}))
+
+    def test_provider_tool_use_failed_is_fed_back_with_schema_then_retried(self) -> None:
+        class StubClient:
+            name = "groq"
+            model = "openai/gpt-oss-120b"
+
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    ProviderRequestError(
+                        "groq", self.model, 400,
+                        response_body='{"error":{"code":"tool_use_failed","message":"verify_ledger_row omitted invoice_number"}}',
+                        error_code="tool_use_failed", rejected_tool_name="verify_ledger_row",
+                    ),
+                    ToolCall("finish", {"status": "needs_review", "summary": "Stopped after test recovery."}),
+                ]
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.calls.append(json.loads(json.dumps(observations)))
+                response = self.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        with TemporaryDirectory(prefix="centralign-validation-retry-") as temp_dir:
+            events = []
+            client = StubClient()
+            loop = AgentLoop(
+                Path(temp_dir), "validation-retry", "verify invoice", "http://127.0.0.1:8765",
+                lambda kind, payload: events.append((kind, payload)), lambda *_: None, client=client,
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, _ = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_review")
+        self.assertEqual(len(client.calls), 2)
+        feedback = next(item for item in client.calls[1] if item.get("tool") == "tool_validation_feedback")
+        self.assertIn("tool_use_failed", feedback["result"]["error"])
+        schema = feedback["result"]["tool_schemas"][0]
+        self.assertEqual(schema["name"], "verify_ledger_row")
+        self.assertIn("invoice_number", schema["parameters"]["properties"]["expected_fields"]["required"])
+        self.assertTrue(any(kind == "credentials_supplied" for kind, _ in events))
+
+    def test_malformed_arguments_are_fed_back_and_retry_limit_includes_last_error(self) -> None:
+        class StubClient:
+            name = "openai"
+            model = "test-model"
+
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = []
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.calls.append(json.loads(json.dumps(observations)))
+                response = self.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        malformed = ToolCall("__malformed_tool_arguments__", {
+            "tool_name": "verify_ledger_row", "message": "arguments were not valid JSON"
+        })
+        finish = ToolCall("finish", {"status": "needs_review", "summary": "Recovered."})
+        with TemporaryDirectory(prefix="centralign-malformed-arguments-") as temp_dir:
+            client = StubClient([malformed, finish])
+            loop = AgentLoop(Path(temp_dir), "malformed", "verify invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            asyncio.run(loop.run())
+            self.assertEqual(len(client.calls), 2)
+            feedback = next(item for item in client.calls[1] if item.get("tool") == "tool_validation_feedback")
+            self.assertEqual(feedback["result"]["tool_schemas"][0]["name"], "verify_ledger_row")
+
+        with TemporaryDirectory(prefix="centralign-validation-cap-") as temp_dir:
+            error = ProviderRequestError(
+                "groq", "test-model", 400, response_body='{"error":{"code":"tool_use_failed","message":"still missing invoice_number"}}',
+                error_code="tool_use_failed", rejected_tool_name="verify_ledger_row",
+            )
+            client = StubClient([error, error, error, error])
+            loop = AgentLoop(Path(temp_dir), "validation-cap", "verify invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+            self.assertEqual(status, "needs_review")
+            self.assertIn("retry limit reached after 3 retries", summary)
+            self.assertIn("still missing invoice_number", summary)
+            self.assertEqual(len(client.calls), 4)  # initial attempt and three retries
+            self.assertEqual(sum(item.get("tool") == "tool_validation_feedback" for item in client.calls[-1]), 3)
+
+    def test_all_live_adapters_surface_malformed_tool_arguments(self) -> None:
+        openai = OpenAIClient("test-key", "test-model")
+        with patch("llm_clients._request", return_value={"output": [{
+            "type": "function_call", "name": "verify_ledger_row", "arguments": "{bad json"
+        }]}):
+            openai_call = openai.next_tool_call("task", [], TOOL_DEFINITIONS)
+        self.assertEqual(openai_call.name, "__malformed_tool_arguments__")
+        self.assertEqual(openai_call.arguments["tool_name"], "verify_ledger_row")
+
+        gemini = GeminiClient("test-key", "test-model")
+        with patch("llm_clients._request", return_value={"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "verify_ledger_row", "args": ["not", "an", "object"]}}
+        ]}}]}):
+            gemini_call = gemini.next_tool_call("task", [], TOOL_DEFINITIONS)
+        self.assertEqual(gemini_call.name, "__malformed_tool_arguments__")
+        self.assertEqual(gemini_call.arguments["tool_name"], "verify_ledger_row")
+
+        chat = ChatCompletionsClient("groq", "https://api.groq.com/openai/v1/chat/completions", "test-key", "test-model")
+        with patch("llm_clients._request", return_value={"choices": [{"message": {"tool_calls": [{
+            "function": {"name": "verify_ledger_row", "arguments": "not-json"}
+        }]}}]}):
+            chat_call = chat.next_tool_call("task", [], TOOL_DEFINITIONS)
+        self.assertEqual(chat_call.name, "__malformed_tool_arguments__")
+        self.assertEqual(chat_call.arguments["tool_name"], "verify_ledger_row")
+
+    def test_browser_fill_batch_returns_one_bounded_snapshot_and_masks_login_values(self) -> None:
+        snapshot = {
+            "url": "/erp/ledger", "title": "Ledger", "dom_tree": "control " * 2000,
+            "body_text": "row " * 500, "alert": "Check invoice field", "notice": None,
+            "inputs": {"password_input": "[credentials supplied by host]"},
+            "tables": {"ledger_table": [["invoice", "x" * 1000] for _ in range(30)]},
+        }
+        compact = BrowserTools._bound_snapshot(snapshot)
+        self.assertLessEqual(len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))), SNAPSHOT_CHARACTER_CAP)
+        self.assertEqual(compact["url"], "/erp/ledger")
+        self.assertEqual(compact["alert"], "Check invoice field")
+        self.assertEqual(compact["inputs"]["password_input"], "[credentials supplied by host]")
+        self.assertLessEqual(len(json.dumps(BrowserTools._bound_snapshot({**snapshot, "screenshot_index": 123}), ensure_ascii=False, separators=(",", ":"))), SNAPSHOT_CHARACTER_CAP)
+
+        class StubBrowser:
+            def __init__(self):
+                self.snapshots = 0
+                self.fills = []
+
+            async def browser_fill(self, selector, value):
+                self.fills.append((selector, value))
+                return {"status": "filled", "field": selector, "alert": None}
+
+            async def compact_snapshot(self, *_args):
+                self.snapshots += 1
+                return {"url": "/erp/invoices/new", "inputs": {}, "tables": {}, "alert": None}
+
+        with TemporaryDirectory(prefix="centralign-fill-result-") as temp_dir:
+            loop = AgentLoop(Path(temp_dir), "fill-result", "fill invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
+            browser = StubBrowser()
+            loop.browser = browser
+            loop.selected_invoice = {"invoice_number": "INV-1"}
+            result = asyncio.run(loop._execute("browser_fill_form", {"fields": [
+                {"selector": "#invoice_number_input", "value": "INV-1"},
+                {"selector": "#amount_input", "value": "100.00"},
+            ]}))
+            self.assertEqual(browser.snapshots, 1)
+            self.assertEqual(result["fields_set"], ["#invoice_number_input", "#amount_input"])
+            self.assertNotIn("steps", result)
+            browser.snapshots = 0
+            sequence = asyncio.run(loop._execute("browser_action_sequence", {"actions": [
+                {"tool": "browser_fill", "arguments": {"selector": "#invoice_number_input", "value": "INV-1"}},
+                {"tool": "browser_fill", "arguments": {"selector": "#amount_input", "value": "100.00"}},
+            ]}))
+            self.assertEqual(browser.snapshots, 1)
+            self.assertEqual(sequence["fields_set"], ["#invoice_number_input", "#amount_input"])
+            safe = AgentLoop._redact_arguments("browser_fill_form", {"fields": [
+                {"selector": "#email_input", "value": "model-email@example.test"},
+                {"selector": "#password_input", "value": "model-entered-secret"},
+            ]})
+            self.assertNotIn("model-entered-secret", json.dumps(safe))
+            self.assertTrue(all(field["value"] == "[credentials supplied by host]" for field in safe["fields"]))
+
+    def test_demo_data_reset_clears_ledger_runs_and_cli_flag(self) -> None:
+        with TemporaryDirectory(prefix="centralign-reset-data-") as temp_dir:
+            data_dir = Path(temp_dir)
+            company = CompanyApp(data_dir)
+            company.create_bill({
+                "vendor": "Acme Analytics Pvt Ltd", "invoice_number": "RESET-1",
+                "invoice_date": "2026-10-01", "due_date": "2026-11-01",
+                "amount": "100.00", "currency": "INR", "source_file": "invoice.txt",
+            })
+            company.start_run("reset-run", "test run")
+            company.append_event("reset-run", 1, "task_started", {"task": "test"})
+            company.reset_demo_data()
+            self.assertEqual(company.list_bills(), [])
+            self.assertEqual(company.list_runs(), [])
+            self.assertEqual(company.read_audit("reset-run"), [])
+
+            company.create_bill({
+                "vendor": "Acme Analytics Pvt Ltd", "invoice_number": "RESET-2",
+                "invoice_date": "2026-10-01", "due_date": "2026-11-01",
+                "amount": "100.00", "currency": "INR", "source_file": "invoice.txt",
+            })
+            company.start_run("reset-run-2", "test run")
+            with patch("sys.argv", ["web_app.py", "--data-dir", str(data_dir), "--reset-demo-data"]), patch("uvicorn.run") as serve:
+                web_main()
+            serve.assert_called_once()
+            self.assertEqual(CompanyApp(data_dir).list_bills(), [])
+            self.assertEqual(CompanyApp(data_dir).list_runs(), [])
 
     def test_provider_configuration_selects_openai_gemini_and_replay(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -239,6 +436,22 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 503)
         self.assertEqual(caught.exception.retry_after_seconds, 7.0)
         self.assertEqual(caught.exception.response_body, "Please retry in 7s")
+
+        provider_body = json.dumps({"error": {
+            "code": "tool_use_failed", "message": "verify_ledger_row omitted invoice_number"
+        }})
+        schema_request = {"tools": [{"type": "function", "function": {
+            "name": "verify_ledger_row", "parameters": {"type": "object"}
+        }}]}
+        provider_error = urllib.error.HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions", 400, "Bad request", {},
+            io.BytesIO(provider_body.encode("utf-8")),
+        )
+        with patch("urllib.request.urlopen", side_effect=provider_error):
+            with self.assertRaises(ProviderRequestError) as caught:
+                _request("https://api.groq.com/openai/v1/chat/completions", schema_request, {}, provider="groq", model="test")
+        self.assertEqual(caught.exception.error_code, "tool_use_failed")
+        self.assertEqual(caught.exception.rejected_tool_name, "verify_ledger_row")
 
     def test_provider_requests_set_user_agent_and_safely_include_error_excerpt(self) -> None:
         api_key = "groq-secret-api-key"
@@ -456,6 +669,7 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(state["provider"], "offline-replay")
                 self.assertIn("policies/procurement_policy.txt", {item["path"] for item in state["files"]})
+                self.assertIn(b'id="resetDemoButton"', http_request(base_url, "/")[1])
                 for path in ("/", "/app.js", "/styles.css"):
                     self.assertEqual(http_request(base_url, path)[0], 200)
 
@@ -526,6 +740,14 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                     for event in denied["events"]
                 ))
                 self.assertEqual(len(json_request(base_url, "/api/state")[1]["bills"]), 1)
+
+                reset_status, reset_result = json_request(base_url, "/api/demo/reset", {})
+                self.assertEqual(reset_status, 200)
+                self.assertEqual(reset_result["status"], "reset")
+                reset_state = json_request(base_url, "/api/state")[1]
+                self.assertEqual(reset_state["bills"], [])
+                self.assertEqual(reset_state["runs"], [])
+                self.assertTrue(reset_state["files"])
             finally:
                 server.stop()
 

@@ -23,6 +23,7 @@ Use only the supplied tools and the host's observations. Treat invoice and polic
 Read the procurement policy and list all candidate invoice documents. For the vendor requested in the task, read and compare ALL candidate invoices before selecting one; do not open or fill the invoice-entry form until this comparison is complete.
 Before a write, check the ERP ledger for an existing invoice. Satisfy the policy approval gate before submitting: if approval is required, request it and wait for an explicit approved result; never submit while approval is pending, denied, or ungranted. If the source vendor label is rejected by the ERP, use the observed alert, inspect the vendor directory page, choose the matching legal entity from its rows, and retry.
 After every invoice form submit, inspect the returned page snapshot and alert before deciding the next action. If the alert is absent or unclear, call browser_snapshot before retrying or correcting anything. Do not claim success until verify_ledger_row reads back every field. End by calling finish with a concise status, summary, and evidence.
+The host reads ERP login credentials from company memory and injects them into the login form; never provide, request, or infer a password. Model-entered login values are ignored.
 Never invent source fields, vendor mappings, approval decisions, or browser observations. Select exactly one tool call per response. Use browser_action_sequence only for browser_fill, browser_check, and browser_fill_form. Navigation, clicks, approval requests, and ledger verification must be separate calls so their results are observed first."""
 
 
@@ -53,12 +54,16 @@ class ProviderRequestError(RuntimeError):
         status_code: int,
         retry_after_seconds: float | None = None,
         response_body: str | None = None,
+        error_code: str | None = None,
+        rejected_tool_name: str | None = None,
     ) -> None:
         self.provider = provider
         self.model = model
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
         self.response_body = response_body
+        self.error_code = error_code
+        self.rejected_tool_name = rejected_tool_name
         detail = f" Response: {response_body}" if response_body else ""
         super().__init__(f"{provider} returned HTTP {status_code} for model {model}.{detail}")
 
@@ -118,6 +123,46 @@ def _safe_error_excerpt(body: str, url: str, headers: dict[str, str]) -> str | N
     return cleaned if len(cleaned) <= 300 else f"{cleaned[:297]}..."
 
 
+def _provider_error_metadata(raw_body: str, request_body: dict[str, Any]) -> tuple[str | None, str | None]:
+    try:
+        parsed = json.loads(raw_body)
+    except (TypeError, json.JSONDecodeError):
+        parsed = {}
+    error = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+    error = error if isinstance(error, dict) else {}
+    code = error.get("code") or parsed.get("code") if isinstance(parsed, dict) else None
+    code = str(code) if code else None
+
+    declared_names: set[str] = set()
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "function" and isinstance(node.get("name"), str):
+                declared_names.add(node["name"])
+            function = node.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                declared_names.add(function["name"])
+            declarations = node.get("function_declarations")
+            if isinstance(declarations, list):
+                declared_names.update(
+                    item["name"] for item in declarations
+                    if isinstance(item, dict) and isinstance(item.get("name"), str)
+                )
+            for value in node.values():
+                collect(value)
+        elif isinstance(node, list):
+            for value in node:
+                collect(value)
+
+    collect(request_body)
+    lowered_body = raw_body.casefold()
+    rejected_name = next(
+        (name for name in declared_names if re.search(rf"\b{re.escape(name.casefold())}\b", lowered_body)),
+        None,
+    )
+    return code, rejected_name
+
+
 def _request(
     url: str,
     body: dict[str, Any],
@@ -143,7 +188,10 @@ def _request(
             error_body = ""
         retry_hint = _retry_hint_seconds((exc.headers or {}).get("Retry-After"), error_body)
         safe_excerpt = _safe_error_excerpt(error_body, url, request_headers)
-        raise ProviderRequestError(provider, model, exc.code, retry_hint, safe_excerpt) from exc
+        error_code, rejected_tool_name = _provider_error_metadata(error_body, body)
+        raise ProviderRequestError(
+            provider, model, exc.code, retry_hint, safe_excerpt, error_code, rejected_tool_name
+        ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach model API: {exc.reason}") from exc
 
@@ -175,15 +223,18 @@ class OpenAIClient:
             provider=self.name,
             model=self.model,
         )
-        calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
+        output = response.get("output", [])
+        calls = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"] if isinstance(output, list) else []
         if not calls:
             return None
         call = calls[0]
         try:
             arguments = json.loads(call.get("arguments", "{}"))
         except json.JSONDecodeError as exc:
-            return ToolCall("__invalid_json__", {"message": exc.msg})
-        return ToolCall(str(call.get("name", "")), arguments if isinstance(arguments, dict) else {})
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": str(call.get("name", "")), "message": exc.msg})
+        if not isinstance(arguments, dict):
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": str(call.get("name", "")), "message": "Tool arguments must be a JSON object."})
+        return ToolCall(str(call.get("name", "")), arguments)
 
 
 class GeminiClient:
@@ -230,7 +281,9 @@ class GeminiClient:
             return None
         call = calls[0]
         arguments = call.get("args", {})
-        return ToolCall(str(call.get("name", "")), arguments if isinstance(arguments, dict) else {})
+        if not isinstance(arguments, dict):
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": str(call.get("name", "")), "message": "Tool arguments must be a JSON object."})
+        return ToolCall(str(call.get("name", "")), arguments)
 
 
 class ChatCompletionsClient:
@@ -261,17 +314,22 @@ class ChatCompletionsClient:
             model=self.model,
         )
         choices = response.get("choices", [])
-        message = choices[0].get("message", {}) if choices else {}
+        message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
         calls = message.get("tool_calls", []) if isinstance(message, dict) else []
         if not calls:
             return None
-        function = calls[0].get("function", {})
+        first_call = calls[0] if isinstance(calls, list) and isinstance(calls[0], dict) else {}
+        function = first_call.get("function", {})
+        if not isinstance(function, dict):
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": "", "message": "Tool function arguments must be an object."})
         try:
             raw_arguments = function.get("arguments", "{}")
             arguments = raw_arguments if isinstance(raw_arguments, dict) else json.loads(raw_arguments)
         except (json.JSONDecodeError, TypeError) as exc:
-            return ToolCall("__invalid_json__", {"message": str(exc)[:160]})
-        return ToolCall(str(function.get("name", "")), arguments if isinstance(arguments, dict) else {})
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": str(function.get("name", "")), "message": str(exc)[:160]})
+        if not isinstance(arguments, dict):
+            return ToolCall("__malformed_tool_arguments__", {"tool_name": str(function.get("name", "")), "message": "Tool arguments must be a JSON object."})
+        return ToolCall(str(function.get("name", "")), arguments)
 
 
 _STOPWORDS = {
@@ -298,6 +356,52 @@ class FakeLLM:
     @staticmethod
     def _browser_history(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [entry for entry in observations if str(entry.get("tool", "")).startswith("browser_")]
+
+    @staticmethod
+    def _batch_actions(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        tool = entry.get("tool")
+        arguments = entry.get("arguments", {})
+        if tool == "browser_action_sequence":
+            actions = arguments.get("actions", [])
+            return [item for item in actions if isinstance(item, dict)] if isinstance(actions, list) else []
+        if tool == "browser_fill_form":
+            return [{"tool": tool, "arguments": arguments}]
+        return []
+
+    @classmethod
+    def _filled_selectors(cls, entries: list[dict[str, Any]]) -> set[str]:
+        selectors: set[str] = set()
+        for entry in entries:
+            if entry.get("tool") == "browser_fill":
+                selector = entry.get("arguments", {}).get("selector")
+                if isinstance(selector, str):
+                    selectors.add(selector)
+            actions = cls._batch_actions(entry)
+            for action in actions:
+                action_tool, args = action.get("tool"), action.get("arguments", {})
+                if action_tool == "browser_fill" and isinstance(args, dict):
+                    selector = args.get("selector")
+                    if isinstance(selector, str):
+                        selectors.add(selector)
+                elif action_tool == "browser_fill_form" and isinstance(args, dict):
+                    for field in args.get("fields", []):
+                        if isinstance(field, dict) and isinstance(field.get("selector"), str):
+                            selectors.add(field["selector"])
+        return selectors
+
+    @classmethod
+    def _checked_selectors(cls, entries: list[dict[str, Any]]) -> set[str]:
+        selectors = {
+            entry.get("arguments", {}).get("selector")
+            for entry in entries if entry.get("tool") == "browser_check"
+        }
+        for entry in entries:
+            for action in cls._batch_actions(entry):
+                if action.get("tool") == "browser_check":
+                    args = action.get("arguments", {})
+                    if isinstance(args, dict):
+                        selectors.add(args.get("selector"))
+        return {selector for selector in selectors if isinstance(selector, str)}
 
     @staticmethod
     def _invoice_for_task(task: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -385,7 +489,7 @@ class FakeLLM:
             return ToolCall("browser_open", {"path": "/erp/login"})
         if page_path == "/erp/login":
             login_values = last_snapshot.get("inputs", {})
-            filled = {entry.get("arguments", {}).get("selector") for entry in browser_calls if entry.get("tool") == "browser_fill"}
+            filled = self._filled_selectors(browser_calls)
             login_fields = []
             if not login_values.get("email_input"):
                 login_fields.append({"selector": "#email_input", "value": "[sandbox_email]"})
@@ -508,10 +612,8 @@ class FakeLLM:
         fills_since_open = []
         last_open_index = max((i for i, entry in enumerate(observations) if entry.get("tool") == "browser_open" and entry.get("arguments", {}).get("path") == "/erp/invoices/new"), default=-1)
         for entry in observations[last_open_index + 1:]:
-            if entry.get("tool") == "browser_fill":
-                fills_since_open.append(entry.get("arguments", {}).get("selector", ""))
-            if entry.get("tool") == "browser_check":
-                fills_since_open.append(entry.get("arguments", {}).get("selector", ""))
+            fills_since_open.extend(self._filled_selectors([entry]))
+            fills_since_open.extend(self._checked_selectors([entry]))
         selector_for_id = {
             "vendor_input": "#vendor_input", "invoice_number_input": "#invoice_number_input",
             "invoice_date_input": "#invoice_date_input", "due_date_input": "#due_date_input",

@@ -209,6 +209,24 @@ class RunManager:
             result.append({**run, "awaiting_approval": run["id"] in self._pending and not self._pending[run["id"]].done()})
         return result
 
+    async def reset_demo_data(self) -> None:
+        """Stop active work before atomically clearing the demo ledger and run history."""
+        current = asyncio.current_task()
+        pending = [future for future in self._pending.values() if not future.done()]
+        for future in pending:
+            future.cancel()
+        running = [task for task in self._tasks.values() if task is not current and not task.done()]
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        self._tasks.clear()
+        self._pending.clear()
+        self._approval_payload.clear()
+        self._tokens.clear()
+        self._sequence.clear()
+        self.company.reset_demo_data()
+
 
 def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAPI:
     selected_data_dir = Path(data_dir or DEFAULT_DATA_DIR).resolve()
@@ -253,6 +271,12 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
             "provider": provider,
             "model": model,
         }
+
+    @application.post("/api/demo/reset")
+    async def reset_demo() -> dict[str, str]:
+        await manager.reset_demo_data()
+        application.state.erp_sessions.clear()
+        return {"status": "reset"}
 
     @application.post("/api/runs", status_code=202)
     async def start_run(payload: RunCreate, request: Request) -> dict[str, str]:
@@ -404,9 +428,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--reset-demo-data", action="store_true", help="clear the demo ledger and run history before starting")
     args = parser.parse_args()
     import uvicorn
     selected_app = app if args.data_dir is None and not args.offline else create_app(args.data_dir, offline=args.offline)
+    if args.reset_demo_data:
+        selected_app.state.company.reset_demo_data()
     uvicorn.run(selected_app, host="127.0.0.1", port=args.port, log_level="info")
 
 

@@ -20,6 +20,8 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The Operator and the sandbo
 python3 web_app.py --data-dir /tmp/centralign-operator --offline
 ```
 
+Use `python3 web_app.py --offline --reset-demo-data` to clear the persisted ledger and run history before the server starts. The workbench also has a **Reset demo data** button; it cancels active runs, clears ledger and run records, and preserves invoice files and policy.
+
 The first startup copies the bundled text fixtures and policy into a new data directory and creates the sample Acme PDFs if they are missing. The local ERP login details are in `data/policies/company_memory.md`; they are synthetic sandbox credentials.
 
 ## Agent loop
@@ -35,7 +37,7 @@ Task
   -> finish only after live ledger read-back verification
 ```
 
-The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover.
+The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover. Fill batches return a short list of fields set and one compact snapshot capped at 4,000 characters.
 
 The Acme demo follows the actual ERP validation path. The source says `Acme Analytics`, while the ERP requires the legal name displayed in its vendor directory. The agent first enters the source label. After the ERP displays its unknown-vendor alert, the agent inspects the directory, retries with the observed legal entity, and reads the posted row back from the ledger.
 
@@ -44,6 +46,8 @@ The Acme demo follows the actual ERP validation path. The source says `Acme Anal
 The app uses `FakeLLM` replay only when started explicitly with `--offline`. A live run without a configured API key, or one whose live providers fail, stops with a clear error; it never switches into replay.
 
 For HTTP 429 and 503, the active provider is retried up to four times after the initial attempt. The agent honors `Retry-After` or a response message such as `retry in 8s`, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. Each wait appears in the UI trace as `[RATE_LIMIT_RECOVERY]`. After those retries fail, it uses one other live provider only when `CENTRALIGN_FALLBACK_PROVIDER` is set.
+
+Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. On login, the host injects the email and password from `policies/company_memory.md`; model-entered login values are ignored, the trace states that the host supplied credentials, and the password is never included in model observations.
 
 Groq (default model `llama-3.3-70b-versatile`):
 

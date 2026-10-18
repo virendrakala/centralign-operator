@@ -21,6 +21,7 @@ FORM_SELECTORS = {
 }
 APPROVAL_CHECK_SELECTORS = {"#approval_verified"}
 CLICK_SELECTORS = {"#login_btn", "#submit_btn"}
+SNAPSHOT_CHARACTER_CAP = 4000
 
 
 def _allowed_routes() -> str:
@@ -101,13 +102,13 @@ class BrowserTools:
         if self.page is None:
             raise ValueError("Open an ERP page before taking a browser snapshot.")
         dom_tree = await self.page.locator("body").evaluate("""body => {
-          const nodes = [...body.querySelectorAll('h1,h2,h3,label,input,select,button,a,[role=alert],table thead th,table tbody tr')];
-          return nodes.slice(0, 90).map(el => {
+          const nodes = [...body.querySelectorAll('h1,h2,h3,label,input,select,button,[role=alert],table thead th,table tbody tr')];
+          return nodes.slice(0, 50).map(el => {
             const id = el.id ? `[id=${el.id}] ` : '';
             const tag = el.tagName.toLowerCase();
             const type = el.getAttribute('type') ? ` type=${el.getAttribute('type')}` : '';
             const label = el.getAttribute('aria-label') || (el.labels?.[0]?.innerText || '').trim() || el.getAttribute('placeholder') || '';
-            const sensitive = el.type === 'password' || ['approval_token','source_sha256_input'].includes(el.id);
+            const sensitive = el.type === 'password' || ['email_input','approval_token','source_sha256_input'].includes(el.id);
             const text = sensitive ? '[redacted]' : (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
             const detail = label && !text.includes(label) ? ` label=${label}` : '';
             return `${id}<${tag}${type}>${detail}${text ? ` ${text}` : ''}`;
@@ -123,27 +124,81 @@ class BrowserTools:
             notice = (await notice_locator.inner_text()).strip()
         inputs = await self.page.locator("input").evaluate_all("""elements => Object.fromEntries(elements.map(el => [
           el.id || el.name,
-          el.type === 'password' || ['approval_token','source_sha256_input'].includes(el.id) ? '[redacted]' : el.value
+          ['email_input','password_input'].includes(el.id) ? (el.value ? '[credentials supplied by host]' : '') :
+            ['approval_token','source_sha256_input'].includes(el.id) ? '[redacted]' : el.value
         ]))""")
         tables: dict[str, list[list[str]]] = {}
         for table_id in ("vendor_directory", "ledger_table"):
             locator = self.page.locator(f"#{table_id}")
             if await locator.count():
-                tables[table_id] = await locator.locator("tbody tr").evaluate_all(
+                rows = await locator.locator("tbody tr").evaluate_all(
                     "rows => rows.map(row => [...row.cells].map(cell => cell.innerText.trim()))"
                 )
+                if table_id == "ledger_table" and self.invoice:
+                    target = str(self.invoice.get("invoice_number", ""))
+                    matching = [row for row in rows if target and target in row]
+                    remainder = [row for row in rows if row not in matching]
+                    rows = matching + remainder[:7]
+                tables[table_id] = rows[:20]
         if "vendor_directory" in tables:
             self.vendor_rows = tables["vendor_directory"]
-        return {
-            "url": urlparse(self.page.url).path + (f"?{urlparse(self.page.url).query}" if urlparse(self.page.url).query else ""),
-            "title": await self.page.title(),
+        snapshot = {
+            "url": (urlparse(self.page.url).path + (f"?{urlparse(self.page.url).query}" if urlparse(self.page.url).query else ""))[:250],
+            "title": (await self.page.title())[:160],
             "dom_tree": dom_tree,
-            "body_text": (await self.page.locator("body").inner_text())[:1200],
+            "body_text": "\n".join(part for part in [
+                await self.page.locator("h1").first.inner_text() if await self.page.locator("h1").count() else "",
+                alert or "", notice or "",
+            ] if part)[:800],
             "alert": alert,
             "notice": notice,
             "inputs": inputs,
             "tables": tables,
         }
+        return self._bound_snapshot(snapshot)
+
+    @staticmethod
+    def _bound_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Keep forms, tables, and alerts while enforcing a compact serialized size."""
+        compact = dict(snapshot)
+        compact["dom_tree"] = str(compact.get("dom_tree", ""))[:1500]
+        compact["body_text"] = str(compact.get("body_text", ""))[:800]
+        compact["alert"] = str(compact["alert"])[:500] if compact.get("alert") else None
+        compact["notice"] = str(compact["notice"])[:300] if compact.get("notice") else None
+        compact["inputs"] = {
+            str(key): str(value)[:180] for key, value in (compact.get("inputs") or {}).items()
+        }
+        compact["tables"] = {
+            str(table): [[str(cell)[:160] for cell in row] for row in rows[:20]]
+            for table, rows in (compact.get("tables") or {}).items()
+        }
+
+        def encoded_size() -> int:
+            import json
+            return len(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
+
+        while encoded_size() > SNAPSHOT_CHARACTER_CAP:
+            if len(compact["dom_tree"]) > 500:
+                compact["dom_tree"] = compact["dom_tree"][: max(500, len(compact["dom_tree"]) // 2)]
+            elif len(compact["body_text"]) > 250:
+                compact["body_text"] = compact["body_text"][: max(250, len(compact["body_text"]) // 2)]
+            elif compact["tables"] and any(compact["tables"].values()):
+                table = max(compact["tables"], key=lambda key: sum(len(row) for row in compact["tables"][key]))
+                compact["tables"][table] = compact["tables"][table][:-1]
+            elif compact["dom_tree"]:
+                compact["dom_tree"] = compact["dom_tree"][: len(compact["dom_tree"]) // 2]
+            elif compact["body_text"]:
+                compact["body_text"] = compact["body_text"][: len(compact["body_text"]) // 2]
+            elif any(compact["inputs"].values()):
+                key = max(compact["inputs"], key=lambda item: len(compact["inputs"][item]))
+                compact["inputs"][key] = compact["inputs"][key][: len(compact["inputs"][key]) // 2]
+            elif compact.get("title"):
+                compact["title"] = compact["title"][: len(compact["title"]) // 2]
+            elif compact.get("url"):
+                compact["url"] = compact["url"][: len(compact["url"]) // 2]
+            else:
+                break
+        return compact
 
     async def _capture(self, action: str, selector: str | None = None) -> dict[str, Any]:
         if selector and self.page is not None:
@@ -178,6 +233,7 @@ class BrowserTools:
     async def _observe(self, action: str) -> dict[str, Any]:
         snapshot = await self._snapshot_data()
         frame = await self._capture(action)
+        snapshot = self._bound_snapshot({**snapshot, "screenshot_index": frame["screenshot_index"]})
         self.emit("observation", {
             "tool": "browser_snapshot",
             "action": action,
@@ -244,15 +300,18 @@ class BrowserTools:
                 raise ValueError(f"{expected.replace('_', ' ').capitalize()} must come from the selected source document.")
 
         await self.page.locator(selector).fill(actual_value)
-        frame = await self._capture("locator.fill", selector)
+        return {"status": "filled", "field": selector, "alert": await self._visible_alert()}
+
+    async def _visible_alert(self) -> str | None:
+        locator = self.page.locator("[role='alert'], #ui_error_banner").first
+        if await locator.count() and await locator.is_visible():
+            return (await locator.inner_text()).strip()[:500]
+        return None
+
+    async def compact_snapshot(self, action: str, selector: str | None = None) -> dict[str, Any]:
         snapshot = await self._snapshot_data()
-        self.emit("observation", {
-            "tool": "browser_snapshot", "action": "locator.fill",
-            "url": urlparse(self.page.url).path, "dom_tree": snapshot["dom_tree"],
-            "summary": snapshot["body_text"][:420], "alert": snapshot["alert"],
-            "notice": snapshot["notice"], "screenshot_index": frame["screenshot_index"],
-        })
-        return {"status": "filled", "snapshot": snapshot}
+        frame = await self._capture(action, selector)
+        return self._bound_snapshot({**snapshot, "screenshot_index": frame["screenshot_index"]})
 
     async def browser_check(self, selector: str) -> dict[str, Any]:
         if selector not in APPROVAL_CHECK_SELECTORS:
@@ -262,10 +321,7 @@ class BrowserTools:
         if not self.approval_token:
             raise ValueError("Manager approval is required before checking this control.")
         await self.page.locator(selector).check()
-        frame = await self._capture("locator.check", selector)
-        snapshot = await self._snapshot_data()
-        self.emit("observation", {"tool": "browser_snapshot", "action": "locator.check", "url": urlparse(self.page.url).path, "dom_tree": snapshot["dom_tree"], "summary": snapshot["body_text"][:420], "alert": snapshot["alert"], "notice": snapshot["notice"], "screenshot_index": frame["screenshot_index"]})
-        return {"status": "checked", "snapshot": snapshot}
+        return {"status": "checked", "field": selector, "alert": await self._visible_alert()}
 
     async def browser_click(self, selector: str) -> dict[str, Any]:
         if selector not in CLICK_SELECTORS:
@@ -283,7 +339,7 @@ class BrowserTools:
             pass
         snapshot = await self._snapshot_data()
         frame = await self._capture("locator.click", selector)
-        snapshot["screenshot_index"] = frame["screenshot_index"]
+        snapshot = self._bound_snapshot({**snapshot, "screenshot_index": frame["screenshot_index"]})
         self.emit("observation", {"tool": "browser_snapshot", "action": "locator.click", "url": urlparse(self.page.url).path, "dom_tree": snapshot["dom_tree"], "summary": snapshot["body_text"][:420], "alert": snapshot["alert"], "notice": snapshot["notice"], "screenshot_index": frame["screenshot_index"]})
         if selector == "#submit_btn" and not snapshot["alert"] and urlparse(self.page.url).path == "/erp/ledger":
             self.write_submitted = True

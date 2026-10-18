@@ -21,11 +21,13 @@ function setStatus(status, detail = "") {
 function setRunButton(running) { const button = $("#runButton"); button.disabled = running; button.replaceChildren(document.createTextNode(running ? "Running…" : "Run Operator ")); if (!running) { const arrow = node("span", "", "→"); arrow.setAttribute("aria-hidden", "true"); button.append(arrow); } }
 function eventTitle(event) {
   const payload = event.payload || {};
+  if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
   const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
   const p = event.payload || {};
+  if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials were supplied by the host; the password is not provided to the model.";
   if (event.event_type === "thought" || event.event_type === "self_correction") return p.text || "";
   if (event.event_type === "action") {
     if (p.tool === "list_files") return "List the available invoice sources and procurement policy.";
@@ -197,5 +199,17 @@ const SCENARIOS = {
 };
 for (const button of document.querySelectorAll(".scenario-chip")) button.addEventListener("click", () => { $("#taskInput").value = SCENARIOS[button.dataset.scenario] || SCENARIOS.acme; document.querySelectorAll(".scenario-chip").forEach((chip) => chip.setAttribute("aria-pressed", String(chip === button))); $("#taskInput").focus(); });
 $("#approveButton").addEventListener("click", () => decideApproval(true)); $("#rejectButton").addEventListener("click", () => decideApproval(false));
+$("#resetDemoButton").addEventListener("click", async () => {
+  if (!window.confirm("Clear the demo ledger and run history? Invoice files and policy will stay in place.")) return;
+  const button = $("#resetDemoButton"); button.disabled = true;
+  if (state.pollTimer) clearTimeout(state.pollTimer);
+  try {
+    await requestJson("/api/demo/reset", { method: "POST" });
+    window.location.reload();
+  } catch (error) {
+    button.disabled = false;
+    setStatus("needs_review", error.message);
+  }
+});
 document.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") $("#taskForm").requestSubmit(); });
 setStatus("idle"); refreshState();
