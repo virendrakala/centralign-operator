@@ -11,7 +11,7 @@ from llm_clients import client_config
 
 
 def planner_config(*, offline: bool = False, model_override: str | None = None) -> tuple[str, str, str | None]:
-    """Return provider metadata; absent keys select the explicit FakeLLM replay."""
+    """Return live-provider metadata, or FakeLLM metadata for explicit offline mode."""
     return client_config(offline=offline, model_override=model_override)
 
 

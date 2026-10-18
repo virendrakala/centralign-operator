@@ -2,7 +2,7 @@
 
 CentrAlign Operator is a local invoice-processing prototype. One bounded agent loop reads invoice sources and procurement policy, operates a sandbox ERP through Playwright, pauses for human approval when policy requires it, and verifies the resulting ledger row from the ERP page.
 
-The ERP, invoices, credentials, approval broker, and SQLite ledger are synthetic demo data. The agent writes through the ERP form; it does not write directly to SQLite. The default setup uses an explicitly labelled FakeLLM replay and does not need an LLM API key.
+The ERP, invoices, credentials, approval broker, and SQLite ledger are synthetic demo data. The agent writes through the ERP form; it does not write directly to SQLite. The quickstart below explicitly uses FakeLLM replay and does not need an LLM API key.
 
 ## Run locally
 
@@ -24,24 +24,54 @@ The first startup copies the bundled text fixtures and policy into a new data di
 
 ## Agent loop
 
-The provider returns one tool call at a time. Python validates the tool name and arguments, checks policy and run state, executes the call, and gives the observation back to the provider.
+The provider returns one tool call per decision. A call can batch a form fill or contain a two-to-three-step browser action sequence. Python validates each nested action, checks policy and run state, executes it in order, and returns the observations to the provider.
 
 ```text
 Task
-  -> AgentLoop asks one provider for one tool call
+  -> AgentLoop asks the active provider for one tool call or browser action sequence
   -> host validates schema, route, selector, source, duplicate, and approval rules
   -> document tool or Playwright ERP action
   -> observation returned to the same loop
   -> finish only after live ledger read-back verification
 ```
 
-The tool set is `list_files`, `read_document`, `read_policy`, `browser_open`, `browser_snapshot`, `browser_fill`, `browser_check`, `browser_click`, `request_human_approval`, `verify_ledger_row`, and `finish`.
+The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover.
 
 The Acme demo follows the actual ERP validation path. The source says `Acme Analytics`, while the ERP requires the legal name displayed in its vendor directory. The agent first enters the source label. After the ERP displays its unknown-vendor alert, the agent inspects the directory, retries with the observed legal entity, and reads the posted row back from the ledger.
 
 ## Providers
 
-Without API keys, the app selects `offline-replay` and logs that the planner is `FakeLLM scripted replay`. This mode uses the same host loop and browser tools as live providers; it is deterministic and does not represent a live model decision.
+The app uses `FakeLLM` replay only when started explicitly with `--offline`. A live run without a configured API key, or one whose live providers fail, stops with a clear error; it never switches into replay.
+
+For HTTP 429 and 503, the active provider is retried up to four times after the initial attempt. The agent honors `Retry-After` or a response message such as `retry in 8s`, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. Each wait appears in the UI trace as `[RATE_LIMIT_RECOVERY]`. After those retries fail, it uses one other live provider only when `CENTRALIGN_FALLBACK_PROVIDER` is set.
+
+Groq (default model `llama-3.3-70b-versatile`):
+
+```bash
+export CENTRALIGN_PROVIDER=groq
+export GROQ_API_KEY="..."
+export CENTRALIGN_FALLBACK_PROVIDER=gemini # optional live fallback
+export CENTRALIGN_GROQ_MODEL="llama-3.3-70b-versatile" # optional
+python3 web_app.py
+```
+
+OpenRouter (default model `openrouter/free`):
+
+```bash
+export CENTRALIGN_PROVIDER=openrouter
+export OPENROUTER_API_KEY="..."
+export CENTRALIGN_OPENROUTER_MODEL="openrouter/free" # optional
+python3 web_app.py
+```
+
+Gemini API (default model `gemini-2.5-flash-lite`):
+
+```bash
+export CENTRALIGN_PROVIDER=gemini
+export GEMINI_API_KEY="..."
+export CENTRALIGN_GEMINI_MODEL="gemini-2.5-flash-lite" # optional
+python3 web_app.py
+```
 
 OpenAI Responses API:
 
@@ -52,14 +82,7 @@ export CENTRALIGN_MODEL="gpt-4o" # optional; this is the default
 python3 web_app.py
 ```
 
-Gemini API:
-
-```bash
-export CENTRALIGN_PROVIDER=gemini
-export GEMINI_API_KEY="..."
-export CENTRALIGN_MODEL="gemini-2.5-flash" # optional; this is the default
-python3 web_app.py
-```
+`CENTRALIGN_PROVIDER` chooses the primary provider. If it is unset, the first configured provider is selected in this order: Groq, OpenRouter, Gemini, OpenAI. Set `CENTRALIGN_FALLBACK_PROVIDER` to at most one other configured provider to enable live failover. `CENTRALIGN_MODEL` overrides the primary provider's default model; a provider-specific model variable takes precedence when both are set. Gemini 2.5 Flash-Lite may not be enabled for every AI Studio account, so set `CENTRALIGN_GEMINI_MODEL` to a model available to your account if needed.
 
 When a live provider is enabled, the task and observations—including extracted source text—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials are injected by the local host and are not supplied to the model.
 
@@ -77,7 +100,7 @@ When a live provider is enabled, the task and observations—including extracted
 | File | Responsibility |
 |---|---|
 | `agent_loop.py` | Shared bounded observe/decide/execute loop, tool schemas, host checks, and stop conditions. |
-| `llm_clients.py` | Provider interface plus OpenAI, Gemini, and offline FakeLLM implementations. |
+| `llm_clients.py` | OpenAI, Gemini, Groq, OpenRouter, single-key provider routing, retry recovery, and offline-only FakeLLM. |
 | `documents.py` | Confined invoice listing, PDF/TXT extraction, field parsing, and source hashes. |
 | `policy.py` | Procurement policy parsing and threshold checks. |
 | `browser_tools.py` | Playwright session, route/control allowlists, screenshots, and live ERP read-back. |

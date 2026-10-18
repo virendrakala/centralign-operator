@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import shutil
@@ -20,7 +21,17 @@ import uvicorn
 
 from agent_loop import AgentLoop, TOOL_DEFINITIONS
 from company_app import CompanyApp
-from llm_clients import FakeLLM, ToolCall
+from llm_clients import (
+    ChatCompletionsClient,
+    FakeLLM,
+    LiveProvidersExhausted,
+    ProviderConfigurationError,
+    ProviderRequestError,
+    ResilientClient,
+    ToolCall,
+    _request,
+    make_client,
+)
 from worker import planner_config
 from web_app import RunManager, create_app
 
@@ -103,12 +114,160 @@ class AgentLoopUnitTests(unittest.TestCase):
 
     def test_provider_configuration_selects_openai_gemini_and_replay(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(planner_config(), ("offline-replay", "FakeLLM scripted replay", None))
+            self.assertEqual(planner_config(), ("unconfigured", "No live provider API key configured", None))
             self.assertEqual(planner_config(offline=True)[0], "offline-replay")
+            with self.assertRaisesRegex(ProviderConfigurationError, "start with --offline"):
+                make_client()
         with patch.dict(os.environ, {"CENTRALIGN_PROVIDER": "openai", "OPENAI_API_KEY": "test-key"}, clear=True):
             self.assertEqual(planner_config(), ("openai", "gpt-4o", "test-key"))
         with patch.dict(os.environ, {"CENTRALIGN_PROVIDER": "gemini", "GEMINI_API_KEY": "test-key"}, clear=True):
-            self.assertEqual(planner_config(), ("gemini", "gemini-2.5-flash", "test-key"))
+            self.assertEqual(planner_config(), ("gemini", "gemini-2.5-flash-lite", "test-key"))
+
+    def test_provider_configuration_uses_one_key_and_explicit_live_fallback(self) -> None:
+        with patch.dict(os.environ, {
+            "CENTRALIGN_PROVIDER": "groq",
+            "GROQ_API_KEY": "groq-key",
+            "CENTRALIGN_FALLBACK_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "router-key",
+        }, clear=True):
+            self.assertEqual(planner_config(), ("groq", "llama-3.3-70b-versatile", "groq-key"))
+            client = make_client()
+            self.assertIsInstance(client, ResilientClient)
+            self.assertEqual([provider for provider, _ in client.providers], ["groq", "openrouter"])
+            with patch.dict(os.environ, {"CENTRALIGN_PROVIDER": "groq", "GROQ_API_KEY": "groq-key"}, clear=True):
+                only_primary = make_client()
+            self.assertEqual([provider for provider, _ in only_primary.providers], ["groq"])
+
+    def test_provider_router_waits_then_retries_same_provider_and_logs_answer(self) -> None:
+        class StubClient:
+            def __init__(self, name, model, responses):
+                self.name, self.model, self.responses = name, model, list(responses)
+                self.calls = 0
+
+            def next_tool_call(self, *_args):
+                self.calls += 1
+                value = self.responses.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+        events, answered, waits = [], [], []
+        provider = StubClient("gemini", "gemini-2.5-flash-lite", [
+            ProviderRequestError("gemini", "gemini-2.5-flash-lite", 429, 0.4),
+            ProviderRequestError("gemini", "gemini-2.5-flash-lite", 503),
+            ToolCall("list_files", {}),
+        ])
+        client = ResilientClient(
+            [("gemini", provider)], on_recovery=events.append, on_provider_turn=answered.append,
+            sleeper=waits.append, jitter=lambda _low, _high: 0.25,
+        )
+        self.assertEqual(client.next_tool_call("task", [], TOOL_DEFINITIONS), ToolCall("list_files", {}))
+        self.assertEqual(client.name, "gemini")
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual(waits, [0.4, 2.25])
+        self.assertEqual([event["wait_seconds"] for event in events if event["action"] == "retry_wait"], waits)
+        self.assertEqual(answered, [{"provider": "gemini", "model": "gemini-2.5-flash-lite", "turn": 1}])
+        self.assertEqual(client._retry_wait(ProviderRequestError("gemini", "flash", 429, 90), 1), 60.0)
+
+    def test_live_429_exhaustion_never_uses_replay_and_allows_only_explicit_live_fallback(self) -> None:
+        class StubClient:
+            name = "groq"
+            model = "llama-3.3-70b-versatile"
+
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+                self.calls = 0
+
+            def next_tool_call(self, *_args):
+                self.calls += 1
+                status = self.statuses.pop(0)
+                if isinstance(status, int):
+                    raise ProviderRequestError(self.name, self.model, status)
+                return status
+
+        sleeps, events = [], []
+        primary = StubClient([429] * 5)
+        live = ResilientClient([("groq", primary)], on_recovery=events.append, sleeper=sleeps.append, jitter=lambda _low, _high: 0)
+        with self.assertRaisesRegex(LiveProvidersExhausted, "no live fallback provider is configured"):
+            live.next_tool_call("record Acme invoice", [], TOOL_DEFINITIONS)
+        self.assertEqual(primary.calls, 5)  # first attempt plus four retries
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0, 8.0])
+        self.assertFalse(any(event.get("provider") == "offline-replay" for event in events))
+
+        primary = StubClient([503] * 5)
+        fallback = StubClient([ToolCall("list_files", {})])
+        events.clear()
+        live = ResilientClient(
+            [("groq", primary), ("openrouter", fallback)], on_recovery=events.append,
+            sleeper=lambda _seconds: None, jitter=lambda _low, _high: 0,
+        )
+        self.assertEqual(live.next_tool_call("task", [], TOOL_DEFINITIONS), ToolCall("list_files", {}))
+        self.assertEqual(live.name, "openrouter")
+        self.assertTrue(any(event["action"] == "provider_fallback" for event in events))
+
+        primary = StubClient([429] * 5)
+        fallback = StubClient([503] * 5)
+        live = ResilientClient(
+            [("groq", primary), ("openrouter", fallback)],
+            sleeper=lambda _seconds: None, jitter=lambda _low, _high: 0,
+        )
+        with self.assertRaisesRegex(LiveProvidersExhausted, "Live providers failed"):
+            live.next_tool_call("task", [], TOOL_DEFINITIONS)
+
+    def test_openai_compatible_tool_payload_and_429_retry_after(self) -> None:
+        tool_call = {"choices": [{"message": {"tool_calls": [{"function": {"name": "finish", "arguments": '{"status":"needs_review","summary":"done"}'}}]}}]}
+        client = ChatCompletionsClient("groq", "https://api.groq.com/openai/v1/chat/completions", "secret", "llama-3.3-70b-versatile")
+        with patch("llm_clients._request", return_value=tool_call) as request:
+            result = client.next_tool_call("task", [], TOOL_DEFINITIONS)
+        self.assertEqual(result, ToolCall("finish", {"status": "needs_review", "summary": "done"}))
+        body = request.call_args.args[1]
+        self.assertEqual(body["model"], "llama-3.3-70b-versatile")
+        self.assertEqual(body["tools"][0]["function"]["name"], "list_files")
+        self.assertFalse(body["parallel_tool_calls"])
+
+        error = urllib.error.HTTPError("https://example.test", 429, "busy", {"Retry-After": "4"}, io.BytesIO(b"Please retry in 7s"))
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(ProviderRequestError) as caught:
+                _request("https://example.test", {}, {}, provider="gemini", model="flash")
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.retry_after_seconds, 4.0)
+        error = urllib.error.HTTPError("https://example.test", 503, "busy", {}, io.BytesIO(b"Please retry in 7s"))
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(ProviderRequestError) as caught:
+                _request("https://example.test", {}, {}, provider="gemini", model="flash")
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(caught.exception.retry_after_seconds, 7.0)
+
+    def test_batched_browser_tool_schemas_are_bounded_and_closed(self) -> None:
+        AgentLoop._validate_arguments(ToolCall("browser_fill_form", {
+            "fields": [{"selector": "#email_input", "value": "[sandbox_email]"}]
+        }))
+        AgentLoop._validate_arguments(ToolCall("browser_action_sequence", {
+            "actions": [
+                {"tool": "browser_fill", "arguments": {"selector": "#email_input", "value": "[sandbox_email]"}},
+                {"tool": "browser_check", "arguments": {"selector": "#approval_verified"}},
+            ]
+        }))
+        with self.assertRaisesRegex(ValueError, "Unexpected tool arguments"):
+            AgentLoop._validate_arguments(ToolCall("browser_fill_form", {
+                "fields": [{"selector": "#email_input", "value": "x", "javascript": "alert(1)"}]
+            }))
+        with self.assertRaisesRegex(ValueError, "between 2 and 3"):
+            AgentLoop._validate_arguments(ToolCall("browser_action_sequence", {
+                "actions": [{"tool": "browser_open", "arguments": {"path": "/erp/login"}}]
+            }))
+        with self.assertRaisesRegex(ValueError, "allowed values"):
+            click_batch = ToolCall("browser_action_sequence", {
+                "actions": [
+                    {"tool": "browser_fill", "arguments": {"selector": "#vendor_input", "value": "Acme"}},
+                    {"tool": "browser_click", "arguments": {"selector": "#submit_btn"}},
+                ]
+            })
+            AgentLoop._validate_arguments(click_batch)
+        with TemporaryDirectory(prefix="centralign-batch-guard-") as temp_dir:
+            loop = AgentLoop(Path(temp_dir), "batch-guard", "test", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
+            with self.assertRaisesRegex(ValueError, "navigation and clicks are single-step"):
+                asyncio.run(loop._execute("browser_action_sequence", click_batch.arguments))
 
     def test_host_rejects_unlisted_tools_routes_and_unsafe_writes(self) -> None:
         with TemporaryDirectory(prefix="centralign-guards-") as temp_dir:
@@ -212,6 +371,11 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(first_run["status"], "complete", first_run.get("summary"))
                 self.assertIn("replay", next(event["payload"]["mode"] for event in first_run["events"] if event["event_type"] == "planner"))
                 self.assertTrue(any(event["event_type"] == "self_correction" for event in first_run["events"]))
+                actions = [event["payload"] for event in first_run["events"] if event["event_type"] == "action"]
+                self.assertTrue(any(action.get("tool") == "browser_fill_form" for action in actions))
+                fill_sequence = next(action for action in actions if action.get("tool") == "browser_action_sequence")
+                self.assertTrue(all(item.get("tool") in {"browser_fill", "browser_check", "browser_fill_form"} for item in fill_sequence["actions"]))
+                self.assertFalse(any(item.get("tool") == "browser_click" for item in fill_sequence["actions"]))
                 verification = next(event["payload"] for event in first_run["events"] if event["event_type"] == "verification")
                 self.assertEqual(verification["status"], "verified")
                 self.assertTrue(all(verification["matches"].values()))

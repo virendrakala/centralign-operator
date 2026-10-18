@@ -27,6 +27,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "browser_open", "description": "Open one of the local ERP routes in the Playwright browser.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "browser_snapshot", "description": "Inspect the current ERP page's simplified DOM, visible alerts, form values, and tables.", "parameters": {"type": "object", "properties": {}, "required": []}},
     {"name": "browser_fill", "description": "Fill a known ERP form control using a source field, observed vendor row, or sandbox credential placeholder.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
+    {"name": "browser_fill_form", "description": "Fill up to ten known ERP form controls in order; the host validates every field against the selected invoice and sandbox credentials.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
+    {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
     {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}},
     {"name": "browser_click", "description": "Click the ERP login or invoice-submit control after host preconditions pass.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}},
     {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["reason", "extracted_fields"]}},
@@ -67,7 +69,11 @@ class AgentLoop:
         self.emit = emit
         self.approval_handler = approval_handler
         self.approval_mode = approval_mode
-        self.client = client or make_client(offline=offline)
+        self.client = client or make_client(
+            offline=offline,
+            on_recovery=self._provider_recovery,
+            on_provider_turn=self._provider_answered,
+        )
         self.company = CompanyApp(self.data_dir)
         self.browser = BrowserTools(data_dir, run_id, base_url, emit)
         self.observations: list[dict[str, Any]] = []
@@ -84,10 +90,40 @@ class AgentLoop:
         self.finished: tuple[str, str] | None = None
 
     def _event_action(self, call: ToolCall) -> None:
-        safe_args = dict(call.arguments)
-        if call.name == "browser_fill" and safe_args.get("selector") in {"#password_input", "#approval_token", "#source_sha256_input"}:
-            safe_args["value"] = "[redacted]"
+        safe_args = self._redact_arguments(call.name, call.arguments)
         self.emit("action", {"tool": call.name, **safe_args})
+
+    def _provider_recovery(self, payload: dict[str, Any]) -> None:
+        self.emit("rate_limit_recovery", payload)
+        action = payload.get("action")
+        if action == "provider_fallback":
+            self.emit("planner", {"mode": "live", "provider": payload.get("provider"), "model": payload.get("model")})
+
+    def _provider_answered(self, payload: dict[str, Any]) -> None:
+        self.emit("provider_turn", payload)
+
+    @staticmethod
+    def _redact_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        safe = dict(arguments)
+        sensitive = {"#password_input", "#approval_token", "#source_sha256_input"}
+        if name == "browser_fill" and safe.get("selector") in sensitive:
+            safe["value"] = "[redacted]"
+        elif name == "browser_fill_form":
+            fields = safe.get("fields")
+            if isinstance(fields, list):
+                safe["fields"] = [
+                    {**field, "value": "[redacted]"} if isinstance(field, dict) and field.get("selector") in sensitive else field
+                    for field in fields
+                ]
+        elif name == "browser_action_sequence":
+            actions = safe.get("actions")
+            if isinstance(actions, list):
+                safe["actions"] = [
+                    {**item, "arguments": AgentLoop._redact_arguments(str(item.get("tool", "")), item.get("arguments", {}))}
+                    if isinstance(item, dict) and isinstance(item.get("arguments"), dict) else item
+                    for item in actions
+                ]
+        return safe
 
     def _invoice_by_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
         invoice_number = str(fields.get("invoice_number", ""))
@@ -144,6 +180,53 @@ class AgentLoop:
             if not self.selected_invoice and arguments.get("selector") not in {"#email_input", "#password_input"}:
                 raise ValueError("Choose and verify an invoice before filling the ERP form.")
             return await self.browser.browser_fill(_clean_text(arguments.get("selector"), 80), _clean_text(arguments.get("value"), 600))
+        if name == "browser_fill_form":
+            fields = arguments.get("fields")
+            if not isinstance(fields, list) or not 1 <= len(fields) <= 10:
+                raise ValueError("browser_fill_form requires one to ten field entries.")
+            steps = []
+            seen = set()
+            for field in fields:
+                if not isinstance(field, dict) or set(field) != {"selector", "value"}:
+                    raise ValueError("Each form field requires exactly selector and value.")
+                selector = _clean_text(field["selector"], 80)
+                if selector in seen:
+                    raise ValueError("A form control may appear only once in a fill batch.")
+                seen.add(selector)
+                call = ToolCall("browser_fill", {"selector": selector, "value": _clean_text(field["value"], 600)})
+                self._event_action(call)
+                try:
+                    result = await self._execute(call.name, call.arguments)
+                except Exception as exc:
+                    steps.append({"tool": call.name, "arguments": call.arguments, "result": {"status": "error", "message": f"{type(exc).__name__}: {exc}"}})
+                    return {"status": "error", "message": "The form batch stopped at the first rejected field.", "steps": steps}
+                steps.append({"tool": call.name, "arguments": call.arguments, "result": result})
+            return {"status": "filled_form", "fields_filled": len(steps), "steps": steps, "snapshot": steps[-1]["result"].get("snapshot", {})}
+        if name == "browser_action_sequence":
+            actions = arguments.get("actions")
+            if not isinstance(actions, list) or len(actions) not in {2, 3}:
+                raise ValueError("An action sequence must contain two or three actions.")
+            fill_actions = {"browser_fill", "browser_check", "browser_fill_form"}
+            validated_actions = []
+            for item in actions:
+                child = ToolCall(str(item.get("tool", "")), item.get("arguments", {}))
+                if child.name not in fill_actions:
+                    raise ValueError("A fill batch may contain only browser_fill, browser_check, and browser_fill_form; navigation and clicks are single-step actions.")
+                self._validate_arguments(child)
+                validated_actions.append(child)
+            steps = []
+            for child in validated_actions:
+                self._event_action(child)
+                try:
+                    result = await self._execute(child.name, child.arguments)
+                except Exception as exc:
+                    result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+                steps.append({"tool": child.name, "arguments": child.arguments, "result": result})
+                if result.get("status") == "error":
+                    return {"status": "error", "message": "The browser sequence stopped at the first rejected action.", "steps": steps}
+                if result.get("snapshot", {}).get("alert"):
+                    return {"status": "sequence_stopped", "reason": "A visible ERP alert requires a separate observation/action call.", "steps": steps}
+            return {"status": "sequence_complete", "steps": steps}
         if name == "browser_check":
             return await self.browser.browser_check(_clean_text(arguments.get("selector"), 80))
         if name == "browser_click":
@@ -257,9 +340,11 @@ class AgentLoop:
                 try:
                     call = await asyncio.to_thread(self.client.next_tool_call, self.task, self.observations, TOOL_DEFINITIONS)
                 except Exception as exc:
+                    provider_name = getattr(self.client, "name", type(self.client).__name__)
                     reason = f"{provider_name} decision failed at step {step}: {type(exc).__name__}: {exc}"
                     self.emit("run_error", {"error": reason})
                     return "needs_review", reason
+                provider_name = getattr(self.client, "name", type(self.client).__name__)
                 if call is None:
                     return "needs_review", f"{provider_name} stopped without calling finish; the run did not claim completion."
 
@@ -273,7 +358,8 @@ class AgentLoop:
                     except Exception as exc:
                         result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
                 self.observations.append({"tool": call.name, "arguments": call.arguments, "result": result})
-                self.emit("observation", {"tool": call.name, **result})
+                self._append_nested_observations(result)
+                self.emit("observation", {"tool": call.name, **self._redact_nested_result(result)})
                 if result.get("status") == "error":
                     self.tool_errors += 1
                     if self.tool_errors >= MAX_TOOL_ERRORS:
@@ -288,20 +374,65 @@ class AgentLoop:
     def _validate_arguments(call: ToolCall) -> None:
         definition = TOOL_BY_NAME[call.name]
         schema = definition["parameters"]
-        if not isinstance(call.arguments, dict):
-            raise ValueError("Tool arguments must be an object.")
-        properties = schema.get("properties", {})
-        required = set(schema.get("required", []))
-        if required - call.arguments.keys():
-            raise ValueError(f"Missing required tool arguments: {', '.join(sorted(required - call.arguments.keys()))}")
-        if call.arguments.keys() - properties.keys():
-            raise ValueError(f"Unexpected tool arguments: {', '.join(sorted(call.arguments.keys() - properties.keys()))}")
-        for key, value in call.arguments.items():
-            expected = properties[key].get("type")
-            if expected == "string" and not isinstance(value, str):
-                raise ValueError(f"Tool argument {key} must be a string.")
-            if expected == "object" and not isinstance(value, dict):
-                raise ValueError(f"Tool argument {key} must be an object.")
+        AgentLoop._validate_schema_value(call.arguments, schema, "Tool arguments")
+
+    @staticmethod
+    def _validate_schema_value(value: Any, schema: dict[str, Any], label: str) -> None:
+        expected = schema.get("type")
+        if expected == "object":
+            if not isinstance(value, dict):
+                raise ValueError(f"{label} must be an object.")
+            properties = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            if required - value.keys():
+                raise ValueError(f"Missing required tool arguments: {', '.join(sorted(required - value.keys()))}")
+            closed_object = schema.get("additionalProperties") is False or (
+                "properties" in schema and schema.get("additionalProperties") is not True
+            )
+            if closed_object and value.keys() - properties.keys():
+                raise ValueError(f"Unexpected tool arguments: {', '.join(sorted(value.keys() - properties.keys()))}")
+            for key, item in value.items():
+                if key in properties:
+                    AgentLoop._validate_schema_value(item, properties[key], f"Tool argument {key}")
+            return
+        if expected == "array":
+            if not isinstance(value, list):
+                raise ValueError(f"{label} must be an array.")
+            if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", 1000):
+                raise ValueError(f"{label} must contain between {schema.get('minItems', 0)} and {schema.get('maxItems', 1000)} items.")
+            for index, item in enumerate(value):
+                AgentLoop._validate_schema_value(item, schema.get("items", {}), f"{label}[{index}]")
+            return
+        if expected == "string" and not isinstance(value, str):
+            raise ValueError(f"{label} must be a string.")
+        if expected == "string" and schema.get("enum") and value not in schema["enum"]:
+            raise ValueError(f"{label} must be one of the allowed values.")
+
+    def _append_nested_observations(self, result: dict[str, Any]) -> None:
+        for step in result.get("steps", []):
+            if not isinstance(step, dict) or not isinstance(step.get("result"), dict):
+                continue
+            self.observations.append({
+                "tool": step.get("tool", ""),
+                "arguments": step.get("arguments", {}),
+                "result": step["result"],
+            })
+            self._append_nested_observations(step["result"])
+
+    @staticmethod
+    def _redact_nested_result(result: dict[str, Any]) -> dict[str, Any]:
+        safe = dict(result)
+        if isinstance(safe.get("steps"), list):
+            safe["steps"] = [
+                {
+                    **step,
+                    "arguments": AgentLoop._redact_arguments(str(step.get("tool", "")), step.get("arguments", {})),
+                    "result": AgentLoop._redact_nested_result(step.get("result", {})),
+                }
+                if isinstance(step, dict) and isinstance(step.get("result"), dict) else step
+                for step in safe["steps"]
+            ]
+        return safe
 
 
 async def run_computer_use_agent(
@@ -315,7 +446,7 @@ async def run_computer_use_agent(
     approval_mode: str = "policy_driven",
     offline: bool = False,
 ) -> tuple[str, str]:
-    """Run the common browser agent loop with a live provider or FakeLLM replay."""
+    """Run with a live provider, or FakeLLM replay when explicitly offline."""
     loop = AgentLoop(
         data_dir, run_id, task, base_url, emit, approval_handler,
         approval_mode=approval_mode, offline=offline,

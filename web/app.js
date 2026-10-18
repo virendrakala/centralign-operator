@@ -21,7 +21,7 @@ function setStatus(status, detail = "") {
 function setRunButton(running) { const button = $("#runButton"); button.disabled = running; button.replaceChildren(document.createTextNode(running ? "Running…" : "Run Operator ")); if (!running) { const arrow = node("span", "", "→"); arrow.setAttribute("aria-hidden", "true"); button.append(arrow); } }
 function eventTitle(event) {
   const payload = event.payload || {};
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
@@ -34,6 +34,8 @@ function eventSummary(event) {
     if (p.tool === "browser_open") return `Open the local ERP route ${p.path}.`;
     if (p.tool === "browser_snapshot") return "Inspect the visible ERP page and its alerts.";
     if (p.tool === "browser_fill") return `Fill ${p.selector} · ${p.value === "[redacted]" ? "sensitive value redacted" : p.value || ""}`;
+    if (p.tool === "browser_fill_form") return `Fill ${p.fields?.length || 0} validated form fields in one batch.`;
+    if (p.tool === "browser_action_sequence") return `Run ${p.actions?.length || 0} host-validated browser actions in sequence.`;
     if (p.tool === "browser_click") return `Click ${p.selector} with Playwright locator.click.`;
     if (p.tool === "browser_check") return `Check ${p.selector}.`;
     if (p.tool === "verify_ledger_row") return "Compare the live ERP ledger row with the selected source.";
@@ -50,6 +52,12 @@ function eventSummary(event) {
   if (event.event_type === "approval_requested") return p.reason || "A human decision is required.";
   if (event.event_type === "approval_decision") return p.token_minted ? `Approved. Runtime token ${p.token_preview} was minted and delivered to the worker.` : "Approval was declined or timed out.";
   if (event.event_type === "planner") return `${p.mode === "replay" ? "Replay" : "Live provider"} · ${p.provider} · ${p.model}`;
+  if (event.event_type === "provider_turn") return `${p.provider} · ${p.model}`;
+  if (event.event_type === "rate_limit_recovery") {
+    if (p.action === "retry_wait") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.provider} returned HTTP ${p.status_code}; waiting ${p.wait_seconds}s before retry ${p.retry}/${p.retry_limit}.`;
+    if (p.action === "retries_exhausted") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.provider} still returned HTTP ${p.status_code} after ${p.retry_count} retries.`;
+    if (p.action === "provider_fallback") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.previous_provider} retries failed; switching to live provider ${p.provider}.`;
+  }
   if (event.event_type === "verification") return p.status === "verified" ? `All ${Object.keys(p.matches || {}).length} fields match. Source ${p.source_file}.` : `Ledger verification status: ${p.status}.`;
   if (event.event_type === "task_finished") return p.summary || p.status || "";
   if (event.event_type === "run_error") return p.error || "The run stopped safely.";
@@ -65,7 +73,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "verification", "planner", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "verification", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);
@@ -155,8 +163,8 @@ async function loadRun(runId) {
 async function refreshState(showError = true) {
   try {
     const data = await requestJson("/api/state"); renderHistory(data.runs || []);
-    const labels = { offline: "Deterministic fallback", "offline-replay": "FakeLLM · offline replay", openai: `OpenAI · ${data.model}`, openai_responses: `OpenAI · ${data.model}`, openai_chat: `OpenAI · ${data.model}`, gemini: `Gemini · ${data.model}` };
-    $("#providerBadge").textContent = labels[data.provider] || "FakeLLM · offline replay";
+    const labels = { offline: "Offline replay", "offline-replay": "FakeLLM · offline replay", unconfigured: "Live API key required", openai: `OpenAI · ${data.model}`, openai_responses: `OpenAI · ${data.model}`, openai_chat: `OpenAI · ${data.model}`, gemini: `Gemini · ${data.model}`, groq: `Groq · ${data.model}`, openrouter: `OpenRouter · ${data.model}` };
+    $("#providerBadge").textContent = labels[data.provider] || "Provider unavailable";
   } catch (error) { if (showError) setStatus("needs_review", error.message); }
 }
 async function decideApproval(approved) {
