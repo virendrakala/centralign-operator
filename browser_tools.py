@@ -20,7 +20,8 @@ FORM_SELECTORS = {
     "#approval_token", "#source_file_input", "#source_sha256_input",
 }
 HOST_CREDENTIAL_SELECTORS = {"#email_input", "#password_input"}
-MODEL_FORM_SELECTORS = FORM_SELECTORS - HOST_CREDENTIAL_SELECTORS
+PROVENANCE_SELECTORS = {"#source_file_input", "#source_sha256_input"}
+MODEL_FORM_SELECTORS = FORM_SELECTORS - HOST_CREDENTIAL_SELECTORS - PROVENANCE_SELECTORS
 APPROVAL_CHECK_SELECTORS = {"#approval_verified"}
 CLICK_SELECTORS = {"#submit_btn"}
 LOGIN_BUTTON_SELECTOR = "#login_btn"
@@ -115,7 +116,7 @@ class BrowserTools:
             const label = clean(el.getAttribute('aria-label') || (el.labels?.[0]?.innerText || '') || el.getAttribute('placeholder') || id);
             const value = el.type === 'checkbox' || el.type === 'radio' ? (el.checked ? 'checked' : '') : (el.value || '');
             const secret = el.type === 'password' || ['email_input','approval_token','source_sha256_input'].includes(el.id);
-            return {selector: el.id ? `#${el.id}` : `[name=${el.name}]`, label, type: el.type || el.tagName.toLowerCase(), state: value ? 'filled' : 'empty', ...(secret || !value ? {} : {value: clean(value).slice(0, 120)})};
+            return {selector: el.id ? `#${el.id}` : `[name=${el.name}]`, label, type: el.type || el.tagName.toLowerCase(), state: value ? 'filled' : 'empty', required: Boolean(el.required), ...(secret || !value ? {} : {value: clean(value).slice(0, 120)})};
           });
           const alerts = [...body.querySelectorAll('[role=alert], .alert, #ui_error_banner, [aria-live=assertive]')]
             .filter(visible).map(el => clean(el.innerText || el.textContent)).filter(Boolean);
@@ -200,7 +201,7 @@ class BrowserTools:
         for field in compact["form_fields"]:
             if not isinstance(field, dict):
                 continue
-            safe_field = {key: str(value)[:120] for key, value in field.items() if key in {"selector", "label", "type", "state", "value"}}
+            safe_field = {key: (bool(value) if key == "required" else str(value)[:120]) for key, value in field.items() if key in {"selector", "label", "type", "state", "required", "value"}}
             if safe_field.get("selector") in HOST_CREDENTIAL_SELECTORS | {"#approval_token", "#source_sha256_input"} or safe_field.get("type") == "password":
                 safe_field.pop("value", None)
             sanitized_fields.append(safe_field)
@@ -309,8 +310,47 @@ class BrowserTools:
             raise ValueError(f"Invalid ERP route. Allowed routes: {_allowed_routes()}.")
         warning = await self._unsaved_form_warning(parsed.path)
         await self.page.goto(self.base_url + parsed.path, wait_until="domcontentloaded")
+        provenance_attached = False
+        if parsed.path == "/erp/invoices/new" and self.invoice:
+            await self._attach_invoice_provenance()
+            provenance_attached = True
         result = await self._observe("page.goto")
-        return {**result, "path": parsed.path, **({"warning": warning} if warning else {})}
+        return {
+            **result,
+            "path": parsed.path,
+            **({"warning": warning} if warning else {}),
+            **({"provenance_attached": {"source_file": True, "source_sha256": True}} if provenance_attached else {}),
+        }
+
+    async def _attach_invoice_provenance(self) -> None:
+        if not self.invoice or urlparse(self.page.url).path != "/erp/invoices/new":
+            return
+        await self.page.locator("#source_file_input").fill(str(self.invoice["source_file"]))
+        await self.page.locator("#source_sha256_input").fill(str(self.invoice["source_sha256"]))
+
+    @staticmethod
+    def describe_form_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+        path = str(snapshot.get("url_path") or urlparse(str(snapshot.get("url", ""))).path)
+        fields = [field for field in snapshot.get("form_fields", []) if isinstance(field, dict)]
+        required = [field for field in fields if field.get("required")]
+        missing = [str(field.get("selector") or field.get("label") or "unknown field") for field in required if field.get("state") != "filled"]
+        filled = [str(field.get("selector") or field.get("label") or "unknown field") for field in required if field.get("state") == "filled"]
+        if path != "/erp/invoices/new":
+            hint = f"Current page: {path}. Call browser_open with /erp/invoices/new first."
+        elif missing:
+            hint = "Missing required fields: " + ", ".join(missing) + ". Fill them before clicking #submit_btn."
+        elif required:
+            hint = "All required fields filled. Next: click #submit_btn."
+        else:
+            hint = "No required invoice fields are visible on this page. Call browser_open with /erp/invoices/new first."
+        return {
+            "current_page": path,
+            "required_fields": [str(field.get("selector") or field.get("label") or "unknown field") for field in required],
+            "filled_fields": filled,
+            "missing_fields": missing,
+            "all_required_filled": bool(required) and not missing,
+            "next_step": hint,
+        }
 
     async def _unsaved_form_warning(self, next_path: str) -> str | None:
         if self.page is None:
@@ -335,8 +375,9 @@ class BrowserTools:
             raise ValueError(f"Invalid ERP field. Allowed fields: {', '.join(sorted(MODEL_FORM_SELECTORS))}.")
         path = urlparse(self.page.url).path
         if path != "/erp/invoices/new":
-            invoice_fields = sorted(MODEL_FORM_SELECTORS)
-            raise ValueError(f"Invoice fields may only be filled on /erp/invoices/new. Allowed fields there: {', '.join(invoice_fields)}.")
+            raise ValueError(f"Current page: {path}. Call browser_open with /erp/invoices/new first.")
+        if selector in PROVENANCE_SELECTORS:
+            raise ValueError("Provenance fields are attached by the host from the selected document; do not fill them directly.")
         if self.invoice is None:
             raise ValueError("Read an invoice document before filling the ERP invoice form.")
 
@@ -345,9 +386,6 @@ class BrowserTools:
             if not self.approval_token or value != "[approved_token]":
                 raise ValueError("An approved runtime token is required for this field.")
             actual_value = self.approval_token
-        elif selector == "#source_sha256_input":
-            if value != self.invoice["source_sha256"]:
-                raise ValueError("The source hash must match the selected invoice file.")
         elif selector == "#vendor_input":
             if value != self.invoice["vendor"]:
                 legal = {row[2] for row in self.vendor_rows if len(row) >= 3}
@@ -361,7 +399,6 @@ class BrowserTools:
                 "#due_date_input": "due_date",
                 "#amount_input": "amount",
                 "#currency_input": "currency",
-                "#source_file_input": "source_file",
             }[selector]
             if value != str(self.invoice[expected]):
                 raise ValueError(f"{expected.replace('_', ' ').capitalize()} must come from the selected source document.")
@@ -408,8 +445,9 @@ class BrowserTools:
     async def browser_check(self, selector: str) -> dict[str, Any]:
         if selector not in APPROVAL_CHECK_SELECTORS:
             raise ValueError(f"Invalid ERP check selector. Allowed selectors: {', '.join(sorted(APPROVAL_CHECK_SELECTORS))}.")
-        if urlparse(self.page.url).path != "/erp/invoices/new":
-            raise ValueError("The manager approval control can only be checked on /erp/invoices/new.")
+        path = urlparse(self.page.url).path
+        if path != "/erp/invoices/new":
+            raise ValueError(f"Current page: {path}. Call browser_open with /erp/invoices/new first.")
         if not self.approval_token:
             raise ValueError("Manager approval is required before checking this control.")
         await self.page.locator(selector).check()
@@ -422,7 +460,7 @@ class BrowserTools:
             raise ValueError(f"Invalid ERP click selector. Allowed selectors: {', '.join(sorted(CLICK_SELECTORS))}.")
         path = urlparse(self.page.url).path
         if selector == "#submit_btn" and path != "/erp/invoices/new":
-            raise ValueError("The submit control is not available on this page.")
+            raise ValueError(f"Current page: {path}. Call browser_open with /erp/invoices/new first.")
         frame = await self._capture("click target", selector)
         await self.page.locator(selector).click()
         try:
@@ -438,11 +476,15 @@ class BrowserTools:
         return {"status": "clicked", "snapshot": snapshot}
 
     async def verify_ledger_row(self, invoice: dict[str, Any]) -> dict[str, Any]:
-        await self.browser_open("/erp/ledger")
+        navigation = await self.browser_open("/erp/ledger")
+        navigation_warning = navigation.get("warning")
         invoice_number = invoice["invoice_number"]
         row = self.page.locator("#ledger_table tbody tr").filter(has_text=invoice_number).first
         if not await row.count():
-            return {"status": "not_found", "invoice_number": invoice_number, "already_present": False, "matches": {}}
+            result = {"status": "not_found", "invoice_number": invoice_number, "already_present": False, "matches": {}}
+            if navigation_warning:
+                result["warning"] = navigation_warning
+            return result
         actual = await row.locator("[data-field]").evaluate_all("cells => Object.fromEntries(cells.map(cell => [cell.dataset.field, cell.innerText.trim()]))")
         expected_vendor = invoice.get("canonical_vendor") or invoice["vendor"]
         expected = {
@@ -478,5 +520,7 @@ class BrowserTools:
             "screenshot_index": self.frame_index,
             "screenshot_url": frame["screenshot_url"],
         }
+        if navigation_warning:
+            result["warning"] = navigation_warning
         self.emit("verification", result)
         return result

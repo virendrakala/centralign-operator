@@ -51,6 +51,8 @@ For HTTP 429 and 503, the active provider is retried up to four times after the 
 
 Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. When `erp_login` runs, the trace states that credentials were supplied by the host. The credentials are not part of the model's tool schema or observations.
 
+Invoice write tools report required form fields as filled or empty and give the next action when the form is ready. The model selects a source document by its extracted contents and may include the `read_document` path when copies are ambiguous; the host attaches that document's filename and SHA-256 to the ERP form and trace. A ledger check with no matching row reports whether a submit occurred and includes a recovery instruction. Three consecutive failures with the same tool, arguments, and error stop the run with `needs_input`; a different failure or a successful tool call resets that counter. The final summary states which parts of the invoice task were completed.
+
 Groq (default model `llama-3.3-70b-versatile`):
 
 ```bash

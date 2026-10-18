@@ -22,12 +22,14 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
   const p = event.payload || {};
   if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials are supplied by the host and never exposed to the model.";
+  if (event.event_type === "provenance_attached") return p.message || `Host attached source provenance for ${p.invoice_number || "the selected invoice"}.`;
+  if (event.event_type === "tool_retry_budget") return `${p.consecutive_identical_failures}/${p.limit} consecutive identical failures for ${p.tool}. Last error: ${p.error}`;
   if (event.event_type === "thought" || event.event_type === "self_correction") return p.text || "";
   if (event.event_type === "action") {
     if (p.tool === "list_files") return "List the available invoice sources and procurement policy.";
@@ -46,6 +48,7 @@ function eventSummary(event) {
     if (p.tool === "finish") return `Finish with status ${p.status || "unknown"}.`;
   }
   if (event.event_type === "observation") {
+    if (p.message) return p.warning ? `${p.message} ${p.warning}` : p.message;
     if (p.alert) return `ERP alert: ${p.alert}`;
     if (p.session_required) return p.session_required;
     if (p.warning) return p.warning;
@@ -79,7 +82,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "loop_guard_warning", "verification", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "loop_guard_warning", "verification", "provenance_attached", "tool_retry_budget", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);

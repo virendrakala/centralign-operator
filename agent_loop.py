@@ -17,7 +17,7 @@ from policy import approval_required
 
 
 MAX_STEPS = 64
-MAX_TOOL_ERRORS = 3
+MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES = 3
 MAX_TOOL_VALIDATION_RETRIES = 3
 MAX_SUBMIT_ATTEMPTS = 3
 LOOP_GUARD_WARN_AFTER = 3
@@ -39,8 +39,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
     {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
     {"name": "browser_click", "description": "Click the invoice-submit control after host preconditions pass. Login is performed only with erp_login.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["reason", "extracted_fields"]}},
-    {"name": "verify_ledger_row", "description": "Read a matching ERP ledger row from the live DOM and compare it to the selected source document.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}, "source_file": {"type": "string"}, "source_sha256": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"]}}, "required": ["invoice_number", "expected_fields"]}},
+    {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it. Identify the document by its invoice content; the host attaches source_file and SHA-256 provenance.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional path returned by read_document to disambiguate identical invoice content."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["reason", "extracted_fields"]}},
+    {"name": "verify_ledger_row", "description": "Read a matching ERP ledger row from the live DOM and compare it to the selected source document. Identify it by invoice content; the host attaches source_file and SHA-256 provenance.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional path returned by read_document to disambiguate identical invoice content."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["invoice_number", "expected_fields"]}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
 ]
 TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
@@ -94,7 +94,9 @@ class AgentLoop:
         self.duplicate_present = False
         self.verification: dict[str, Any] | None = None
         self.submit_attempts = 0
-        self.tool_errors = 0
+        self.submit_performed = False
+        self.last_tool_failure_signature: str | None = None
+        self.consecutive_identical_tool_failures = 0
         self.finished: tuple[str, str] | None = None
         self._last_page_snapshot: dict[str, Any] | None = None
         self._last_action_key: str | None = None
@@ -130,8 +132,9 @@ class AgentLoop:
             if invoice:
                 text = "invoice " + ", ".join(
                     f"{key}={invoice.get(key, '')}" for key in
-                    ("vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file")
+                    ("vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency")
                 )
+                text += f"; document_path={result.get('path', args.get('path', ''))}"
             else:
                 text = str(result.get("path", args.get("path", "document read")))
         elif tool == "read_policy":
@@ -256,17 +259,19 @@ class AgentLoop:
     def _redact_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         safe = dict(arguments)
         host_credentials = {"#email_input", "#password_input"}
-        sensitive = {"#approval_token", "#source_sha256_input"}
+        sensitive = {"#approval_token", "#source_sha256_input", "#source_file_input"}
         if name == "browser_fill" and safe.get("selector") in host_credentials:
             safe["value"] = "[ignored; use erp_login]"
         elif name == "browser_fill" and safe.get("selector") in sensitive:
-            safe["value"] = "[redacted]"
+            safe["value"] = "[attached by host]" if safe.get("selector") in {"#source_sha256_input", "#source_file_input"} else "[redacted]"
         elif name == "browser_fill_form":
             fields = safe.get("fields")
             if isinstance(fields, list):
                 safe["fields"] = [
                     {**field, "value": "[ignored; use erp_login]"}
                     if isinstance(field, dict) and field.get("selector") in host_credentials
+                    else {**field, "value": "[attached by host]"}
+                    if isinstance(field, dict) and field.get("selector") in {"#source_file_input", "#source_sha256_input"}
                     else {**field, "value": "[redacted]"}
                     if isinstance(field, dict) and field.get("selector") in sensitive
                     else field
@@ -287,19 +292,25 @@ class AgentLoop:
 
     def _invoice_by_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
         invoice_number = str(fields.get("invoice_number", ""))
-        source_file = str(fields.get("source_file", ""))
+        document_path = str(fields.get("document_path", ""))
         candidates = [
             document["invoice"] for document in self.documents.values()
             if document.get("invoice")
             and document["invoice"]["invoice_number"] == invoice_number
-            and document["invoice"]["source_file"] == source_file
+            and all(
+                key not in fields or str(fields[key]) == str(document["invoice"][key])
+                for key in ("vendor", "invoice_date", "due_date", "amount", "currency")
+            )
+            and (not document_path or str(document.get("path", "")) == document_path)
         ]
         if len(candidates) != 1:
-            raise ValueError("Select one invoice that was read from the current workspace.")
+            raise ValueError("Select one read invoice by its content; include its read_document path if identical documents are ambiguous.")
         invoice = candidates[0]
-        for key in ("vendor", "invoice_date", "due_date", "amount", "currency", "source_sha256"):
+        for key in ("vendor", "invoice_date", "due_date", "amount", "currency"):
             if str(fields.get(key, "")) != str(invoice[key]):
                 raise ValueError(f"{key.replace('_', ' ')} must match the selected source document.")
+        self.selected_invoice = invoice
+        self.browser.set_invoice(invoice)
         return invoice
 
     def _validate_vendor_evidence(self, legal_vendor: str) -> None:
@@ -326,7 +337,13 @@ class AgentLoop:
                 raise ValueError("Read only documents returned by list_files.")
             result = await asyncio.to_thread(read_document, self.data_dir, path)
             self.documents[path] = result
-            return result
+            model_result = {key: value for key, value in result.items() if key != "sha256"}
+            if isinstance(result.get("invoice"), dict):
+                model_result["invoice"] = {
+                    key: value for key, value in result["invoice"].items()
+                    if key not in {"source_file", "source_sha256"}
+                }
+            return model_result
         if name == "read_policy":
             result = await asyncio.to_thread(self.company.read_company_policy)
             self.policy = result
@@ -335,7 +352,20 @@ class AgentLoop:
             path = _clean_text(arguments.get("path"), 100)
             if path == "/erp/invoices/new" and self.selected_invoice and self._needs_approval() and not self.approval_granted:
                 raise ValueError("Procurement approval is required before opening the invoice write form.")
-            return await self.browser.browser_open(path)
+            if path == "/erp/invoices/new" and self.selected_invoice:
+                self.browser.set_invoice(self.selected_invoice)
+            result = await self.browser.browser_open(path)
+            if result.get("provenance_attached") and self.selected_invoice:
+                invoice = self.selected_invoice
+                document_path = next((doc_path for doc_path, doc in self.documents.items() if doc.get("invoice") is invoice), "")
+                self.emit("provenance_attached", {
+                    "message": "Host attached source_file and source SHA-256 from the selected read document.",
+                    "document_path": document_path,
+                    "source_file": invoice["source_file"],
+                    "source_sha256": invoice["source_sha256"],
+                    "invoice_number": invoice["invoice_number"],
+                })
+            return result
         if name == "erp_login":
             self.emit("credentials_supplied", {
                 "message": "Credentials supplied by host for ERP sign-in; the model never receives their values."
@@ -344,12 +374,16 @@ class AgentLoop:
         if name == "browser_snapshot":
             return await self.browser.browser_snapshot()
         if name == "browser_fill":
-            if not self.selected_invoice:
-                raise ValueError("Choose and verify an invoice before filling the ERP form.")
             selector = _clean_text(arguments.get("selector"), 80)
-            result = await self.browser.browser_fill(selector, _clean_text(arguments.get("value"), 600))
+            try:
+                result = await self.browser.browser_fill(selector, _clean_text(arguments.get("value"), 600))
+            except Exception as exc:
+                result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
             if include_snapshot:
-                result["snapshot"] = await self.browser.compact_snapshot("locator.fill", selector)
+                snapshot = await self.browser.compact_snapshot("locator.fill", selector)
+                result["snapshot"] = snapshot
+                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["next_step"] = result["form_state"]["next_step"]
             return result
         if name == "browser_fill_form":
             fields = arguments.get("fields")
@@ -393,6 +427,8 @@ class AgentLoop:
                 snapshot = await self.browser.compact_snapshot("browser_fill_form")
                 result["alert"] = alert or snapshot.get("alert")
                 result["snapshot"] = snapshot
+                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["next_step"] = result["form_state"]["next_step"]
             if error:
                 result["message"] = f"The form batch stopped at the first rejected field: {error}"
             return result
@@ -445,6 +481,9 @@ class AgentLoop:
                 "alert": alert or snapshot.get("alert"),
                 "snapshot": snapshot,
             }
+            if any(child.name in {"browser_fill", "browser_fill_form"} for child in validated_actions):
+                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["next_step"] = result["form_state"]["next_step"]
             if error:
                 result["message"] = f"The browser sequence stopped at the first rejected action: {error}."
             elif alert:
@@ -473,6 +512,9 @@ class AgentLoop:
                     raise ValueError("The ERP submit retry limit has been reached.")
                 self.submit_attempts += 1
             result = await self.browser.browser_click(selector)
+            if selector == "#submit_btn":
+                self.submit_performed = True
+                result["submit_performed"] = True
             if selector == "#submit_btn" and result.get("snapshot", {}).get("alert"):
                 alert = result["snapshot"]["alert"]
                 self.emit("observation", {"tool": "erp_submit_alert", "alert": alert})
@@ -522,6 +564,14 @@ class AgentLoop:
                 self.duplicate_checked, self.duplicate_present = True, True
             elif result.get("status") == "not_found":
                 self.duplicate_checked = True
+                result["submit_performed"] = self.submit_performed
+                if not self.submit_performed:
+                    result["message"] = (
+                        "No ledger row was found. No submit was performed. "
+                        "Open /erp/invoices/new, fill, click #submit_btn."
+                    )
+                else:
+                    result["message"] = "No ledger row was found after the invoice form was submitted. Inspect the ERP alert before retrying."
             elif result.get("status") == "mismatch":
                 self.duplicate_checked, self.duplicate_present = True, True
             return result
@@ -555,6 +605,54 @@ class AgentLoop:
         except ValueError:
             return False
         return _normalized(vendor) in {_normalized(item) for item in self.policy.get("approved_vendors", [])}
+
+    def _record_tool_failure(self, name: str, arguments: dict[str, Any], error: str) -> bool:
+        """Count only adjacent failures with the same tool, arguments, and error."""
+        signature = json.dumps([name, arguments, error], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if signature == self.last_tool_failure_signature:
+            self.consecutive_identical_tool_failures += 1
+        else:
+            self.last_tool_failure_signature = signature
+            self.consecutive_identical_tool_failures = 1
+        count = self.consecutive_identical_tool_failures
+        self.emit("tool_retry_budget", {
+            "tool": name,
+            "consecutive_identical_failures": count,
+            "limit": MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES,
+            "remaining": max(0, MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES - count),
+            "error": error,
+        })
+        return count >= MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES
+
+    def _clear_tool_failures(self) -> None:
+        self.last_tool_failure_signature = None
+        self.consecutive_identical_tool_failures = 0
+
+    def _tool_failure_summary(self, name: str, error: str) -> str:
+        done = []
+        not_done = []
+        if self.selected_invoice:
+            done.append(f"selected invoice {self.selected_invoice.get('invoice_number', '')}")
+        else:
+            not_done.append("invoice selection")
+        if self.approval_granted:
+            done.append("human approval")
+        elif self._needs_approval():
+            not_done.append("human approval")
+        if self.submit_performed:
+            done.append("invoice form submitted")
+        else:
+            not_done.append("invoice submission")
+        if self.verification and self.verification.get("status") == "verified":
+            done.append("ledger read-back verified")
+        else:
+            not_done.append("ledger read-back verification")
+        done_text = ", ".join(done) if done else "none"
+        not_done_text = ", ".join(not_done) if not_done else "none"
+        return (
+            f"Stopped after {MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES} consecutive identical failures "
+            f"in {name}. Last error: {error}. Done: {done_text}. Not done: {not_done_text}."
+        )
 
     async def run(self) -> tuple[str, str]:
         await self.browser.start()
@@ -646,7 +744,8 @@ class AgentLoop:
                         result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
                 safe_arguments = self._redact_arguments(call.name, call.arguments)
                 safe_result = self._redact_nested_result(result)
-                self.observations.append({"tool": call.name, "arguments": safe_arguments, "result": safe_result})
+                model_result = self._model_observation_result(safe_result)
+                self.observations.append({"tool": call.name, "arguments": safe_arguments, "result": model_result})
                 self.emit("observation", {"tool": call.name, **safe_result})
                 page_before = self._page_signature(self._last_page_snapshot)
                 observed_snapshot = self._snapshot_from_result(safe_result)
@@ -684,10 +783,13 @@ class AgentLoop:
                         self.emit("run_error", {"error": reason})
                         return "needs_review", reason
                 if result.get("status") == "error":
-                    self.tool_errors += 1
-                    if self.tool_errors >= MAX_TOOL_ERRORS:
-                        last_error = result.get("message", "repeated tool errors")
-                        return "needs_review", f"The tool retry limit was reached. Last tool error ({call.name}): {last_error}"
+                    last_error = str(result.get("message", "tool action failed"))
+                    if self._record_tool_failure(call.name, safe_arguments, last_error):
+                        reason = self._tool_failure_summary(call.name, last_error)
+                        self.emit("run_error", {"error": reason})
+                        return "needs_input", reason
+                else:
+                    self._clear_tool_failures()
                 if self.finished:
                     return self.finished
             return "needs_review", f"The agent reached the {MAX_STEPS}-step limit without calling finish."
@@ -765,6 +867,14 @@ class AgentLoop:
                 if isinstance(step, dict) and isinstance(step.get("result"), dict) else step
                 for step in safe["steps"]
             ]
+        return safe
+
+    @staticmethod
+    def _model_observation_result(result: dict[str, Any]) -> dict[str, Any]:
+        """Keep host-generated provenance in the trace, outside model conversation history."""
+        safe = dict(result)
+        safe.pop("source_file", None)
+        safe.pop("source_sha256", None)
         return safe
 
 

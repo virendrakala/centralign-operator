@@ -24,7 +24,7 @@ Read the procurement policy and list all candidate invoice documents. For the ve
 Before a write, check the ERP ledger for an existing invoice. Satisfy the policy approval gate before submitting: if approval is required, request it and wait for an explicit approved result; never submit while approval is pending, denied, or ungranted. If the source vendor label is rejected by the ERP, use the observed alert, inspect the vendor directory page, choose the matching legal entity from its rows, and retry.
 After every invoice form submit, inspect the returned page snapshot and alert before deciding the next action. If the alert is absent or unclear, call browser_snapshot before retrying or correcting anything. Do not claim success until verify_ledger_row reads back every field. End by calling finish with a concise status, summary, and evidence.
 When a snapshot says "Session required: call erp_login", call erp_login exactly as provided. The host reads credentials from company memory, fills and submits the login form, and returns the landing page and alert. Never handle login selectors or credentials; those fields are excluded from model-facing fill tools.
-Never invent source fields, vendor mappings, approval decisions, or browser observations. Select exactly one tool call per response. Use browser_action_sequence only for browser_fill, browser_check, and browser_fill_form. Navigation, clicks, approval requests, and ledger verification must be separate calls so their results are observed first."""
+Never invent source fields, vendor mappings, approval decisions, or browser observations. Identify a selected invoice by its content and optional read_document path; the host attaches source_file and source_sha256 from that selected document. Never provide or fill provenance fields yourself. After browser_fill or browser_fill_form, use the returned required-field state and next-step hint; click #submit_btn only when all required fields are filled. If verify_ledger_row says no row was found, follow its exact message and do not claim a write succeeded. Select exactly one tool call per response. Use browser_action_sequence only for browser_fill, browser_check, and browser_fill_form. Navigation, clicks, approval requests, and ledger verification must be separate calls so their results are observed first."""
 
 
 @dataclass(frozen=True)
@@ -406,34 +406,37 @@ class FakeLLM:
     @staticmethod
     def _invoice_for_task(task: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
         invoices = [
-            entry["result"]["invoice"]
+            (entry["result"]["invoice"], str(entry["result"].get("path") or entry.get("arguments", {}).get("path", "")))
             for entry in observations
             if entry.get("tool") == "read_document" and entry.get("result", {}).get("invoice")
         ]
         task_terms = _terms(task)
         ranked = []
-        for invoice in invoices:
+        for invoice, document_path in invoices:
             vendor_terms = _terms(invoice.get("vendor", ""))
             score = len(task_terms & vendor_terms)
             if score:
-                ranked.append((score, invoice))
+                ranked.append((score, invoice, document_path))
         if not ranked:
             return None
-        max_score = max(score for score, _ in ranked)
+        max_score = max(score for score, _, _ in ranked)
         vendors = {
             str(invoice["vendor"]).casefold()
-            for score, invoice in ranked if score == max_score
+            for score, invoice, _ in ranked if score == max_score
         }
         if len(vendors) != 1:
             return None
-        choices = [invoice for score, invoice in ranked if score == max_score]
-        return max(choices, key=lambda invoice: (invoice["invoice_date"], invoice["invoice_number"]))
+        choices = [(invoice, document_path) for score, invoice, document_path in ranked if score == max_score]
+        invoice, document_path = max(choices, key=lambda item: (item[0]["invoice_date"], item[0]["invoice_number"]))
+        return {**invoice, "_document_path": document_path}
 
     @staticmethod
     def _expected(invoice: dict[str, Any], canonical_vendor: str | None = None) -> dict[str, Any]:
         result = {key: invoice[key] for key in (
-            "vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency", "source_file", "source_sha256"
+            "vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"
         )}
+        if invoice.get("_document_path"):
+            result["document_path"] = invoice["_document_path"]
         if canonical_vendor:
             result["canonical_vendor"] = canonical_vendor
         return result
@@ -595,8 +598,6 @@ class FakeLLM:
             "due_date_input": invoice["due_date"],
             "amount_input": invoice["amount"],
             "currency_input": invoice["currency"],
-            "source_file_input": invoice["source_file"],
-            "source_sha256_input": invoice["source_sha256"],
         }
         if any(entry.get("tool") == "request_human_approval" and entry.get("result", {}).get("status") == "approved" for entry in observations):
             fields["approval_token"] = "[approved_token]"
@@ -611,14 +612,13 @@ class FakeLLM:
             "vendor_input": "#vendor_input", "invoice_number_input": "#invoice_number_input",
             "invoice_date_input": "#invoice_date_input", "due_date_input": "#due_date_input",
             "amount_input": "#amount_input", "currency_input": "#currency_input",
-            "source_file_input": "#source_file_input", "source_sha256_input": "#source_sha256_input",
             "approval_token": "#approval_token", "approval_verified": "#approval_verified",
         }
         fields_to_fill = []
         check_approval = False
         for field, value in fields.items():
             selector = selector_for_id[field]
-            if field in {"source_sha256_input", "approval_token", "approval_verified"}:
+            if field in {"approval_token", "approval_verified"}:
                 if selector not in fills_since_open:
                     if field == "approval_verified":
                         check_approval = True

@@ -263,7 +263,14 @@ class AgentLoopUnitTests(unittest.TestCase):
 
             async def compact_snapshot(self, *_args):
                 self.snapshots += 1
-                return {"url": "/erp/invoices/new", "inputs": {}, "tables": {}, "alert": None}
+                return {
+                    "url": "/erp/invoices/new", "url_path": "/erp/invoices/new", "inputs": {}, "tables": {}, "alert": None,
+                    "form_fields": [{"selector": "#invoice_number_input", "state": "filled", "required": True}],
+                }
+
+            @staticmethod
+            def describe_form_state(snapshot):
+                return BrowserTools.describe_form_state(snapshot)
 
         with TemporaryDirectory(prefix="centralign-fill-result-") as temp_dir:
             loop = AgentLoop(Path(temp_dir), "fill-result", "fill invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
@@ -276,6 +283,8 @@ class AgentLoopUnitTests(unittest.TestCase):
             ]}))
             self.assertEqual(browser.snapshots, 1)
             self.assertEqual(result["fields_set"], ["#invoice_number_input", "#amount_input"])
+            self.assertEqual(result["form_state"]["filled_fields"], ["#invoice_number_input"])
+            self.assertEqual(result["next_step"], "All required fields filled. Next: click #submit_btn.")
             self.assertNotIn("steps", result)
             browser.snapshots = 0
             sequence = asyncio.run(loop._execute("browser_action_sequence", {"actions": [
@@ -290,6 +299,122 @@ class AgentLoopUnitTests(unittest.TestCase):
             ]})
             self.assertNotIn("model-entered-secret", json.dumps(safe))
             self.assertTrue(all(field["value"] == "[ignored; use erp_login]" for field in safe["fields"]))
+
+    def test_fake_llm_fill_then_verify_without_submit_returns_actionable_message(self) -> None:
+        invoice = {
+            "vendor": "Acme Analytics", "invoice_number": "INV-NO-SUBMIT",
+            "invoice_date": "2026-10-01", "due_date": "2026-11-01",
+            "amount": "60000.00", "currency": "INR", "source_file": "inbox/invoice.txt",
+            "source_sha256": "a" * 64,
+        }
+
+        class FakeSequence:
+            name = "offline-replay"
+            model = "FakeLLM test sequence"
+
+            def __init__(self):
+                self.step = 0
+                self.verify_message = None
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.step += 1
+                if self.step == 1:
+                    return ToolCall("browser_fill_form", {"fields": [
+                        {"selector": "#invoice_number_input", "value": invoice["invoice_number"]},
+                    ]})
+                if self.step == 2:
+                    fields = {key: invoice[key] for key in ("vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency")}
+                    fields["document_path"] = "inbox/invoice.txt"
+                    return ToolCall("verify_ledger_row", {"invoice_number": invoice["invoice_number"], "expected_fields": fields})
+                verified = next(item for item in observations if item.get("tool") == "verify_ledger_row")
+                self.verify_message = verified["result"].get("message")
+                return ToolCall("finish", {"status": "needs_input", "summary": self.verify_message})
+
+        class StubBrowser:
+            async def start(self):
+                return None
+
+            async def close(self):
+                return None
+
+            def set_invoice(self, _invoice):
+                return None
+
+            async def browser_fill(self, selector, value):
+                return {"status": "filled", "field": selector, "value": value, "alert": None}
+
+            async def compact_snapshot(self, *_args):
+                return {
+                    "url_path": "/erp/invoices/new", "url": "/erp/invoices/new", "form_fields": [
+                        {"selector": "#invoice_number_input", "state": "filled", "required": True},
+                    ], "alert": None,
+                }
+
+            async def verify_ledger_row(self, _invoice):
+                return {
+                    "status": "not_found", "invoice_number": invoice["invoice_number"],
+                    "warning": "Navigating away will discard unsaved form fields: #invoice_number_input.",
+                }
+
+            describe_form_state = staticmethod(BrowserTools.describe_form_state)
+
+        with TemporaryDirectory(prefix="centralign-no-submit-verify-") as temp_dir:
+            client = FakeSequence()
+            loop = AgentLoop(Path(temp_dir), "no-submit", "record Acme invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            loop.browser = StubBrowser()
+            loop.documents["inbox/invoice.txt"] = {"path": "inbox/invoice.txt", "invoice": invoice}
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_input")
+        expected = "No ledger row was found. No submit was performed. Open /erp/invoices/new, fill, click #submit_btn."
+        self.assertEqual(client.verify_message, expected)
+        self.assertIn(expected, summary)
+        self.assertIn("Navigating away will discard unsaved form fields", json.dumps(loop.observations))
+        self.assertFalse(loop.submit_performed)
+
+    def test_fake_llm_wrong_page_fill_returns_navigation_hint_and_retry_budget_is_consecutive(self) -> None:
+        exact_error = "Current page: /erp/ledger. Call browser_open with /erp/invoices/new first."
+
+        class StubBrowser:
+            async def browser_fill(self, _selector, _value):
+                raise ValueError(exact_error)
+
+            async def compact_snapshot(self, *_args):
+                return {"url_path": "/erp/ledger", "url": "/erp/ledger", "form_fields": [], "alert": None}
+
+            describe_form_state = staticmethod(BrowserTools.describe_form_state)
+
+        class RepeatingFakeLLM:
+            name = "offline-replay"
+            model = "FakeLLM repeated wrong-page fill"
+
+            @staticmethod
+            def next_tool_call(*_args):
+                return ToolCall("browser_fill", {"selector": "#invoice_number_input", "value": "INV-1"})
+
+        with TemporaryDirectory(prefix="centralign-wrong-page-fill-") as temp_dir:
+            events = []
+            loop = AgentLoop(Path(temp_dir), "wrong-page-fill", "fill invoice", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=RepeatingFakeLLM())
+            loop.browser = StubBrowser()
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_input")
+        self.assertIn(exact_error, summary)
+        self.assertIn("Not done: invoice selection, invoice submission, ledger read-back verification", summary)
+        retry_events = [payload for kind, payload in events if kind == "tool_retry_budget"]
+        self.assertEqual([event["consecutive_identical_failures"] for event in retry_events], [1, 2, 3])
+        self.assertTrue(any(kind == "run_error" for kind, _ in events))
+
+        with TemporaryDirectory(prefix="centralign-consecutive-counter-") as temp_dir:
+            loop = AgentLoop(Path(temp_dir), "counter", "task", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=FakeLLM())
+            arguments = {"selector": "#invoice_number_input", "value": "INV-1"}
+            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "first error"))
+            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "different error"))
+            self.assertEqual(loop.consecutive_identical_tool_failures, 1)
+            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "different error"))
+            self.assertTrue(loop._record_tool_failure("browser_fill", arguments, "different error"))
 
     def test_login_credentials_are_absent_from_model_fill_schemas(self) -> None:
         for tool_name in ("browser_fill",):
@@ -851,13 +976,22 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertTrue(any(action.get("tool") == "erp_login" for action in actions))
                 self.assertFalse(any(action.get("selector") in {"#email_input", "#password_input"} for action in actions))
                 self.assertTrue(any(event["event_type"] == "credentials_supplied" for event in first_run["events"]))
+                provenance = next(event["payload"] for event in first_run["events"] if event["event_type"] == "provenance_attached")
+                self.assertIn("Host attached source_file and source SHA-256", provenance["message"])
+                self.assertEqual(len(provenance["source_sha256"]), 64)
+                read_observation = next(event["payload"] for event in first_run["events"] if event["event_type"] == "observation" and event["payload"].get("tool") == "read_document")
+                self.assertNotIn("source_sha256", json.dumps(read_observation))
                 self.assertTrue(any(action.get("tool") == "browser_fill_form" for action in actions))
+                self.assertFalse(any(selector in {"#source_file_input", "#source_sha256_input"} for action in actions if action.get("tool") == "browser_fill_form" for selector in [field.get("selector") for field in action.get("fields", [])]))
                 fill_sequence = next(action for action in actions if action.get("tool") == "browser_action_sequence")
                 self.assertTrue(all(item.get("tool") in {"browser_fill", "browser_check", "browser_fill_form"} for item in fill_sequence["actions"]))
                 self.assertFalse(any(item.get("tool") == "browser_click" for item in fill_sequence["actions"]))
                 verification = next(event["payload"] for event in first_run["events"] if event["event_type"] == "verification")
                 self.assertEqual(verification["status"], "verified")
                 self.assertTrue(all(verification["matches"].values()))
+                verify_observation = next(event["payload"] for event in first_run["events"] if event["event_type"] == "observation" and event["payload"].get("tool") == "verify_ledger_row")
+                self.assertNotIn("source_sha256", json.dumps(verify_observation))
+                self.assertEqual(verification["source_sha256"], provenance["source_sha256"])
                 self.assertEqual(verification["actual"]["vendor"], "Acme Analytics Pvt Ltd")
                 screenshot_status, screenshot, headers = http_request(base_url, verification["screenshot_url"])
                 self.assertEqual(screenshot_status, 200)
