@@ -26,7 +26,7 @@ The first startup copies the bundled text fixtures and policy into a new data di
 
 ## Agent loop
 
-The provider returns one tool call per decision. A call can batch a form fill or contain a two-to-three-step browser action sequence. Python validates each nested action, checks policy and run state, executes it in order, and returns the observations to the provider.
+Before browser startup, the active provider returns a schema-validated JSON task classification: `read_only`, `write_invoice_entry`, `unsupported`, or `ambiguous`. The host enforces that result and exposes only `read_ledger` and `finish` for read-only questions. Unsupported or unclear requests stop with a refusal or one clarifying question. For invoice entry, the provider returns one tool call per decision.
 
 ```text
 Task
@@ -38,6 +38,8 @@ Task
 ```
 
 The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover. Fill batches return a short list of fields set and one compact snapshot capped at 4,000 characters. Snapshots retain the URL path, page title, every visible alert, empty/filled form-field states, buttons, and capped table rows; passwords and other sensitive field values are never included.
+
+Invoice entry starts with `list_invoice_candidates(vendor_query)`. The host parses every inbox PDF/TXT using the same structured extractor and returns each path, written vendor, invoice number, invoice date, due date, amount, and currency. The model selects from that list. For `latest_by_invoice_date`, the host checks that selection against every discovered candidate for the vendor and names a newer invoice if the selection is stale. Explicit invoice-number and other user criteria are preserved and are not replaced with a latest-date rule. The final result records the selected invoice, all candidates and dates, the criterion, and a passed selection check alongside ledger verification evidence.
 
 Sign-in uses a dedicated `erp_login` tool. The host fills and submits credentials from `policies/company_memory.md`; the model cannot access the login selectors or password. Redirects to the login page state `Session required: call erp_login`. Navigating away from a populated form returns a warning listing the unsaved fields. If a tool with the same arguments repeats without changing page state, the agent warns after three repetitions and stops after five, including the last alert in its final message. Live providers receive the last six observations in full and one-line summaries of older observations; offline replay keeps its complete local state.
 
@@ -51,11 +53,11 @@ For HTTP 429 and 503, the active provider is retried up to four times after the 
 
 Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. When `erp_login` runs, the trace states that credentials were supplied by the host. The credentials are not part of the model's tool schema or observations.
 
-Invoice write tools report required form fields as filled or empty and give the next action when the form is ready. The model selects a source document by its extracted contents and may include the `read_document` path when copies are ambiguous; the host attaches that document's filename and SHA-256 to the ERP form and trace. A ledger check with no matching row reports whether a submit occurred and includes a recovery instruction. Three consecutive failures with the same tool, arguments, and error stop the run with `needs_input`; a different failure or a successful tool call resets that counter. The final summary states which parts of the invoice task were completed.
+Invoice write tools report required form fields as filled or empty and give the next action when the form is ready. The model selects a source from the candidate table and reads it; the host attaches the selected document's filename and SHA-256 to the ERP form and trace. Amounts and other source-backed form values must match the parsed structured fields. A ledger check with no matching row reports whether a submit occurred and includes a recovery instruction. Repeated failures are counted by tool and error across the full run; the trace warns at two and stops with `needs_input` at four. The final summary states which parts of the invoice task were completed.
 
 The host keeps approval tokens bound to the selected invoice and injects the token plus the verification checkbox immediately before submit. `#approval_token` is not available to model fill tools. If the policy gate is still pending, the run state and form feedback tell the model to call `request_human_approval` with the invoice number. Approval requests identify a single invoice by number or read-document path; ambiguous requests list the invoice candidates. An already-approved invoice returns `already_approved` without opening another human approval request. After a successful submit, host state says `submitted: <invoice_number>; next: verify_ledger_row`. Verification takes no required arguments: the host uses the submitted source document and returns per-field matches, the ledger row ID, and a row screenshot path. Passing verification ends the run with a structured result containing the action, ledger and approval evidence, source file/hash, and elapsed time.
 
-Live runs keep four recent observations in full and summarize older history. The trace reports approximate per-turn prompt size broken down into system prompt, tool schemas, host run state, and task/history. Estimates use serialized characters divided by four. Repeated failures are counted by tool and error text across the whole run; the trace warns at two and stops with `needs_input` at four, including the last error. Requests and tool waits exceeding 30 seconds produce start and completion trace events. Every run event is also appended to `data/runs/<run_id>.jsonl` with credentials, approval tokens, and common provider-key formats redacted.
+Live runs keep four recent observations in full and summarize older history. The trace reports approximate per-turn prompt size broken down into system prompt, tool schemas, host run state, and task/history. Estimates use serialized characters divided by four. Requests and tool waits exceeding 30 seconds produce start and completion trace events. Every run event is also appended to `data/runs/<run_id>.jsonl` with credentials, approval tokens, and common provider-key formats redacted.
 
 Groq (default model `llama-3.3-70b-versatile`):
 
@@ -96,7 +98,7 @@ python3 web_app.py
 
 `CENTRALIGN_PROVIDER` chooses the primary provider. If it is unset, the first configured provider is selected in this order: Groq, OpenRouter, Gemini, OpenAI. Set `CENTRALIGN_FALLBACK_PROVIDER` to at most one other configured provider to enable live failover. `CENTRALIGN_MODEL` overrides the primary provider's default model; a provider-specific model variable takes precedence when both are set. Gemini 2.5 Flash-Lite may not be enabled for every AI Studio account, so set `CENTRALIGN_GEMINI_MODEL` to a model available to your account if needed.
 
-When a live provider is enabled, the task and observations—including extracted source text—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials are used by the local host and are never supplied to the model.
+When a live provider is enabled, the task and observations—including extracted invoice text with detected instruction-like lines removed—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials and approval tokens stay on the local host and are never supplied to the model.
 
 ## Safety and verification
 
@@ -104,6 +106,7 @@ When a live provider is enabled, the task and observations—including extracted
 - The host checks invoice source and policy before a write, checks for a duplicate in the ERP ledger, blocks unapproved vendors, and enforces the approval gate.
 - Approval tokens expire after five minutes, are bound to the invoice number, legal vendor, amount, and currency, and can be consumed once.
 - Invoice and policy contents are treated as data. The model is told not to follow instructions embedded in source documents.
+- One canonical policy file, `data/policies/procurement_policy.txt`, supplies the INR and USD approval thresholds and approved-vendor rules. Instruction-like invoice content is flagged in the trace, stripped from the model-facing text, and cannot override parsed amount fields.
 - A run reports `complete` only after the ERP ledger DOM matches the source vendor/legal entity, invoice number, dates, amount, and currency. A row screenshot and source SHA-256 are retained as evidence under `data/evidence/<run-id>/`.
 - SQLite in `company_app.py` persists ERP bills, run history, and audit events. The agent's posting path is the Playwright-operated ERP form.
 
@@ -124,7 +127,7 @@ When a live provider is enabled, the task and observations—including extracted
 
 ## Checks
 
-The browser integration tests start isolated local servers and use Playwright. They cover host-managed sign-in success/failure, required snapshot state, unsaved-form navigation warnings, approval before invoice-form access, ERP-originated vendor recovery, live read-back, duplicate handling, denied approval, token binding, repeated-action loop detection, and tool/route guards.
+The tests cover strict task classification and write gating, read-only ledger lookups, unsupported and ambiguous tasks, candidate discovery and latest-date rejection, prompt injection, policy thresholds, host-managed sign-in, approval, ERP read-back, duplicate handling, token binding, loop detection, and tool/route guards.
 
 ```bash
 python3 -m compileall -q .
@@ -134,4 +137,4 @@ node --check web/app.js
 
 ## Current scope and known limitations
 
-This submission currently handles invoice-entry tasks through one shared tool loop. Task-intent classification and read-only invoice queries are not implemented yet, so use the demo only for explicit invoice-entry requests. The ERP form still has built-in INR/USD threshold checks, and both `.txt` and `.md` procurement policy files remain; consolidating those checks and files is a Phase 2 item. Unsupported-task handling, fault injection and recovery scenarios, a broader eval suite, and interview/demo documents are planned for later phases. The approval waiter is in-memory and is intended for a single-user local demo. Live LLM availability and behavior depend on the selected provider and network access.
+The approval waiter is in-memory and is intended for a single-user local demo. Live LLM availability and behavior depend on the selected provider and network access.

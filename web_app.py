@@ -425,7 +425,11 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
         currency = values.get("currency", "").strip().upper()
         if currency not in {"INR", "USD"}:
             return HTMLResponse(_invoice_form(values, "UI Validation Error: Currency must be INR or USD."), status_code=422)
-        threshold = Decimal("50000") if currency == "INR" else Decimal("1000")
+        thresholds = company.read_company_policy().get("thresholds", {})
+        threshold_text = thresholds.get(currency)
+        if threshold_text is None:
+            return HTMLResponse(_invoice_form(values, f"UI Validation Error: No approval threshold is configured for {currency} in procurement policy."), status_code=422)
+        threshold = Decimal(threshold_text)
         invoice_number = values.get("invoice_number", "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{3,80}", invoice_number):
             return HTMLResponse(_invoice_form(values, "UI Validation Error: Enter a valid invoice number."), status_code=422)

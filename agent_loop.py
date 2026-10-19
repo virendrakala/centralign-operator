@@ -13,8 +13,8 @@ from urllib.parse import urlparse
 
 from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, MODEL_FORM_SELECTORS, BrowserTools
 from company_app import CompanyApp
-from documents import list_workspace_files, read_document
-from llm_clients import LLMClient, ProviderRequestError, SYSTEM_INSTRUCTIONS, ToolCall, make_client
+from documents import list_invoice_candidates, list_workspace_files, read_document, remove_prompt_injection_lines
+from llm_clients import FakeLLM, LLMClient, ProviderRequestError, SYSTEM_INSTRUCTIONS, ToolCall, make_client
 from policy import approval_required
 
 
@@ -29,12 +29,31 @@ FULL_OBSERVATIONS_TO_KEEP = 4
 LONG_OPERATION_TRACE_SECONDS = 30
 STOP_STATUSES = {"complete", "needs_input", "needs_review", "stopped_by_user"}
 _ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP_ROUTES.items())
+_MONTHS = {
+    "january": "01", "february": "02", "march": "03", "april": "04", "may": "05", "june": "06",
+    "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12",
+}
+
+
+def _explicit_task_months(task: str) -> list[str]:
+    """Find month names used as invoice-date criteria, not incidental vendor words."""
+    return [
+        month for month in _MONTHS
+        if re.search(
+            rf"\b{month}\b(?:\s+[\w&.-]+){{0,2}}\s+(?:invoice|bill)\b"
+            rf"|\b(?:invoice|bill)\s+(?:from|in|for|dated)\s+(?:the\s+)?{month}\b"
+            rf"|\bmonth\s+of\s+{month}\b",
+            task, re.IGNORECASE,
+        )
+    ]
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "list_files", "description": "List invoice and policy files.", "parameters": {"type": "object", "properties": {}, "required": []}},
     {"name": "read_document", "description": "Read a listed invoice and extract its fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "read_policy", "description": "Read AP rules and approval thresholds.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "list_invoice_candidates", "description": "Parse every inbox PDF/TXT and list structured invoice candidates for the requested vendor. The model chooses one candidate.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
+    {"name": "read_ledger", "description": "Read-only lookup of posted ledger invoices for a vendor.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
     {"name": "browser_open", "description": "Open an allowed ERP route; warns about unsaved form fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
     {"name": "erp_login", "description": "Host signs in using company memory and returns the landing page and alert.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
     {"name": "browser_snapshot", "description": "Inspect URL, title, alerts, field states, buttons, and table rows. Secrets are redacted.", "parameters": {"type": "object", "properties": {}, "required": []}},
@@ -42,8 +61,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice fields.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowlisted invoice field."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
     {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
     {"name": "browser_check", "description": "Check the approval confirmation control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "browser_click", "description": "Click the invoice submit control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "request_human_approval", "description": "Request policy approval by invoice_number or read_document path. Include canonical_vendor from the observed directory when needed. The host injects source provenance and the approved token.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}}, "required": [], "additionalProperties": False}},
+    {"name": "browser_click", "description": "Submit the invoice. Declare the task's selection criterion and reason; the host checks them against the discovered candidates.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selector", "selection_criterion", "selection_reason"], "additionalProperties": False}},
+    {"name": "request_human_approval", "description": "Request policy approval for a read candidate. Declare how it matches the task; the host validates latest selections.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selection_criterion", "selection_reason"], "additionalProperties": False}},
     {"name": "verify_ledger_row", "description": "Verify the submitted source invoice in the ERP ledger. Optional invoice_number only.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": [], "additionalProperties": False}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
 ]
@@ -87,13 +106,18 @@ class AgentLoop:
             on_provider_turn=self._provider_answered,
         )
         self.company = CompanyApp(self.data_dir)
-        self.browser = BrowserTools(data_dir, run_id, base_url, emit)
+        self.browser = BrowserTools(data_dir, run_id, base_url, self._emit_browser_event)
         self.observations: list[dict[str, Any]] = []
         self.listed_files: set[str] = set()
         self.documents: dict[str, dict[str, Any]] = {}
         self.policy: dict[str, Any] | None = None
         self.selected_invoice: dict[str, Any] | None = None
         self.selected_invoice_path: str | None = None
+        self.task_intent: dict[str, Any] | None = None
+        self.candidate_invoices: list[dict[str, str]] = []
+        self.injection_flagged_paths: set[str] = set()
+        self.selection_criterion: str | None = None
+        self.selection_reason: str | None = None
         self.approval_tokens: dict[str, str] = {}
         self.denied_invoices: set[str] = set()
         self.prompt_tokens_before: list[int] = []
@@ -113,6 +137,16 @@ class AgentLoop:
         self._last_action_key: str | None = None
         self._last_action_page_signature: str | None = None
         self._same_action_no_change_count = 0
+
+    def _emit_browser_event(self, event: str, payload: dict[str, Any]) -> None:
+        if event == "verification" and self.selection_criterion:
+            payload = dict(payload)
+            payload["selection_check"] = {
+                "status": "passed",
+                "criterion": self.selection_criterion,
+                "reason": self.selection_reason,
+            }
+        self.emit(event, payload)
 
     def _event_action(self, call: ToolCall) -> None:
         safe_args = self._redact_arguments(call.name, call.arguments)
@@ -191,6 +225,7 @@ class AgentLoop:
         if approval_status == "required":
             approval_hint = f"Approval required: call request_human_approval with invoice_number {invoice['invoice_number']}."
         return {
+            "intent": dict(self.task_intent or {}),
             "logged_in": bool(getattr(self.browser, "logged_in", False)),
             "selected_invoice": selected,
             "legal_vendor": legal_vendor,
@@ -201,7 +236,137 @@ class AgentLoop:
             "next_action": next_action,
             "workflow_hint": workflow_hint,
             "last_erp_alert": str(alerts[-1])[:300] if alerts else None,
+            "selection_criterion": self.selection_criterion,
+            "selection_reason": self.selection_reason,
+            "candidate_count": len(self.candidate_invoices),
         }
+
+    async def _classify_task_intent(self) -> dict[str, Any]:
+        vendors = self.company.list_vendor_directory()
+        classifier = getattr(self.client, "classify_task_intent", None)
+        if callable(classifier):
+            result = await self._await_with_long_operation_trace(
+                "intent_classification",
+                asyncio.to_thread(classifier, self.task, vendors),
+                details={"provider": getattr(self.client, "name", type(self.client).__name__)},
+            )
+        else:
+            # Compatibility for injected test planners. All built-in live/offline adapters implement
+            # the schema-constrained classifier above.
+            result = FakeLLM().classify_task_intent(self.task, vendors)
+        required = {
+            "intent", "vendor_query", "invoice_number", "selection_criterion", "reason", "clarifying_question"
+        }
+        if not isinstance(result, dict) or set(result) != required:
+            raise ValueError("The intent classifier did not return the required strict-JSON fields.")
+        if result.get("intent") not in {"read_only", "write_invoice_entry", "unsupported", "ambiguous"}:
+            raise ValueError("The intent classifier returned an unsupported intent.")
+        if result.get("selection_criterion") not in {"latest_by_invoice_date", "specific_invoice_number", "other"}:
+            raise ValueError("The intent classifier returned an unsupported selection criterion.")
+        if not all(isinstance(result[key], str) for key in required):
+            raise ValueError("Intent classification fields must be strings.")
+        result = {key: result[key].strip() for key in required}
+        if result["intent"] == "write_invoice_entry":
+            explicit_number = re.search(r"\b(?:AC[-_][A-Z0-9_-]+|INV[-_][A-Z0-9_-]+)\b", self.task, re.IGNORECASE)
+            explicit_date = re.search(r"\b(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?\b", self.task)
+            explicit_months = _explicit_task_months(self.task)
+            if explicit_number:
+                result["invoice_number"] = explicit_number.group(0)
+                result["selection_criterion"] = "specific_invoice_number"
+                result["reason"] = f"The task explicitly names invoice {explicit_number.group(0)}."
+            elif explicit_date or len(explicit_months) == 1:
+                criterion_text = explicit_date.group(0) if explicit_date else explicit_months[0].capitalize()
+                result["selection_criterion"] = "other"
+                result["reason"] = f"The task explicitly requests the invoice dated {criterion_text}."
+        intent = result["intent"]
+        if intent in {"read_only", "write_invoice_entry"}:
+            query = result["vendor_query"]
+            if not query:
+                result["intent"] = "ambiguous"
+                result["clarifying_question"] = "Which vendor should I use?"
+            else:
+                matches = []
+                query_terms = set(re.findall(r"[a-z0-9]+", query.casefold()))
+                for vendor in vendors:
+                    aliases = (vendor.get("short_name", ""), vendor.get("legal_name", ""))
+                    if any(
+                        alias and (
+                            " ".join(query.casefold().split()) in " ".join(alias.casefold().split())
+                            or query_terms.issubset(set(re.findall(r"[a-z0-9]+", alias.casefold())))
+                        )
+                        for alias in aliases
+                    ):
+                        matches.append(vendor)
+                if len(matches) != 1:
+                    known = ", ".join(item["short_name"] for item in vendors)
+                    result["intent"] = "ambiguous"
+                    result["clarifying_question"] = (
+                        f"I couldn't identify '{query}' in the vendor directory. Which vendor did you mean: {known}?"
+                    )
+                else:
+                    result["vendor_query"] = matches[0]["short_name"]
+        if result["intent"] == "ambiguous" and not result["clarifying_question"]:
+            result["clarifying_question"] = "Please clarify the vendor and invoice you want me to use."
+        return result
+
+    def _require_write_intent(self) -> None:
+        if not self.task_intent or self.task_intent.get("intent") != "write_invoice_entry":
+            raise ValueError("Invoice write tools are unavailable unless the host classified this task as write_invoice_entry.")
+
+    def _validate_selection_declaration(self, criterion: str, reason: str) -> None:
+        self._require_write_intent()
+        if not self.selected_invoice or not self.selected_invoice_path:
+            raise ValueError("Read and select one invoice from list_invoice_candidates before declaring selection.")
+        if not any(item.get("path") == self.selected_invoice_path for item in self.candidate_invoices):
+            raise ValueError("The selected invoice must be one of the candidates returned by list_invoice_candidates.")
+        if not criterion or not reason.strip() or len(reason) > 240:
+            raise ValueError("Provide the selection criterion and a short reason of at most 240 characters.")
+        declared = str(self.task_intent.get("selection_criterion", "other"))
+        if criterion != declared:
+            raise ValueError(f"The task's declared selection criterion is {declared}; use that criterion for approval and submit.")
+        if criterion == "specific_invoice_number":
+            requested_number = str(self.task_intent.get("invoice_number", ""))
+            if not requested_number or requested_number.casefold() != str(self.selected_invoice.get("invoice_number", "")).casefold():
+                raise ValueError(f"The task specifies invoice {requested_number or '(no invoice number parsed)'}; the selected candidate does not match it.")
+        if criterion == "other":
+            explicit_date = re.search(r"\b(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?\b", self.task)
+            explicit_months = _explicit_task_months(self.task)
+            selected_date = str(self.selected_invoice.get("invoice_date", ""))
+            expected_month = explicit_date.group(2).zfill(2) if explicit_date else None
+            expected_year = explicit_date.group(1) if explicit_date else None
+            if not expected_month and len(explicit_months) == 1:
+                expected_month = _MONTHS[explicit_months[0]]
+            if expected_month and (
+                len(selected_date) < 7 or selected_date[5:7] != expected_month
+                or (expected_year and selected_date[:4] != expected_year)
+                or (explicit_date and explicit_date.group(3) and selected_date[8:10] != explicit_date.group(3).zfill(2))
+            ):
+                label = explicit_date.group(0) if explicit_date else explicit_months[0].capitalize()
+                raise ValueError(
+                    f"The task explicitly requests the {label} invoice; selected {self.selected_invoice.get('invoice_number')} "
+                    f"is dated {selected_date}. Choose a candidate that matches the requested date."
+                )
+        if criterion == "latest_by_invoice_date":
+            latest = max(
+                self.candidate_invoices,
+                key=lambda item: (item.get("invoice_date", ""), item.get("invoice_number", "")),
+                default=None,
+            )
+            if latest and latest.get("path") != self.selected_invoice_path:
+                raise ValueError(
+                    f"Latest-by-invoice-date selection rejected: {latest['invoice_number']} at {latest['path']} "
+                    f"dated {latest['invoice_date']} is newer than selected {self.selected_invoice['invoice_number']} "
+                    f"dated {self.selected_invoice['invoice_date']}."
+                )
+        self.selection_criterion = criterion
+        self.selection_reason = reason.strip()
+        self.emit("selection_check", {
+            "status": "passed",
+            "criterion": criterion,
+            "reason": reason.strip(),
+            "selected_invoice": self.selected_invoice.get("invoice_number"),
+            "candidate_count": len(self.candidate_invoices),
+        })
 
     def _form_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         state = self.browser.describe_form_state(snapshot)
@@ -219,22 +384,36 @@ class AgentLoop:
             state["approval_required"] = False
         return state
 
-    def _estimate_prompt_tokens(self, observations: list[dict[str, Any]]) -> tuple[int, int]:
+    def _tools_for_intent(self) -> list[dict[str, Any]]:
+        if not self.task_intent or self.task_intent.get("intent") in {"unsupported", "ambiguous"}:
+            return [TOOL_BY_NAME["finish"]]
+        if self.task_intent.get("intent") == "read_only":
+            allowed = {"read_ledger", "finish"}
+            return [tool for tool in TOOL_DEFINITIONS if tool["name"] in allowed]
+        if self.task_intent.get("intent") != "write_invoice_entry":
+            return [TOOL_BY_NAME["finish"]]
+        return TOOL_DEFINITIONS
+
+    def _estimate_prompt_tokens(
+        self, observations: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> tuple[int, int]:
         prompt = {
             "system": SYSTEM_INSTRUCTIONS,
             "task": self.task,
-            "tools": TOOL_DEFINITIONS,
+            "tools": tools or self._tools_for_intent(),
             "observations": observations,
         }
         chars = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
         return chars, math.ceil(chars / 4)
 
-    def _prompt_size_breakdown(self, observations: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    def _prompt_size_breakdown(
+        self, observations: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> dict[str, dict[str, int]]:
         state = next((item.get("result", {}) for item in observations if item.get("tool") == "host_run_state"), {})
         history = [item for item in observations if item.get("tool") != "host_run_state"]
         components = {
             "system_prompt": SYSTEM_INSTRUCTIONS,
-            "tool_schemas": TOOL_DEFINITIONS,
+            "tool_schemas": tools or self._tools_for_intent(),
             "run_state": state,
             "history": {"task": self.task, "observations": history},
         }
@@ -506,6 +685,8 @@ class AgentLoop:
     async def _execute(
         self, name: str, arguments: dict[str, Any], *, include_snapshot: bool = True
     ) -> dict[str, Any]:
+        if name in {"browser_fill", "browser_fill_form", "browser_action_sequence", "browser_check", "browser_click", "request_human_approval"}:
+            self._require_write_intent()
         if name == "list_files":
             files = await asyncio.to_thread(list_workspace_files, self.data_dir)
             self.listed_files = {item["path"] for item in files}
@@ -516,7 +697,25 @@ class AgentLoop:
                 raise ValueError("Read only documents returned by list_files.")
             result = await asyncio.to_thread(read_document, self.data_dir, path)
             self.documents[path] = result
+            if result.get("prompt_injection_detected") and path not in self.injection_flagged_paths:
+                self.injection_flagged_paths.add(path)
+                self.emit("prompt_injection_detected", {
+                    "path": path,
+                    "message": "Instruction-like invoice text was detected and ignored; structured invoice fields remain authoritative.",
+                })
+            selected_row = next((item for item in self.candidate_invoices if item.get("path") == path), None)
+            if selected_row and result.get("invoice"):
+                self.selected_invoice_path = path
+                self.selected_invoice = result["invoice"]
+                self.browser.set_invoice(self.selected_invoice)
+                if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                    self._validate_selection_declaration(
+                        str(self.task_intent.get("selection_criterion", "other")),
+                        str(self.task_intent.get("reason", "Selected from the discovered invoice candidates.")),
+                    )
             model_result = {key: value for key, value in result.items() if key != "sha256"}
+            model_result["content"] = remove_prompt_injection_lines(str(result.get("content", "")))
+            model_result.pop("prompt_injection_detected", None)
             if isinstance(result.get("invoice"), dict):
                 model_result["invoice"] = {
                     key: value for key, value in result["invoice"].items()
@@ -527,8 +726,47 @@ class AgentLoop:
             result = await asyncio.to_thread(self.company.read_company_policy)
             self.policy = result
             return {"status": "read", "policy": result}
+        if name == "list_invoice_candidates":
+            self._require_write_intent()
+            vendor_query = _clean_text(arguments.get("vendor_query"), 160)
+            if not vendor_query:
+                raise ValueError("Provide the vendor query from the task intent.")
+            if _normalized(vendor_query) != _normalized(str((self.task_intent or {}).get("vendor_query", ""))):
+                raise ValueError("vendor_query must match the vendor identified by the host intent classification.")
+            all_rows = await asyncio.to_thread(list_invoice_candidates, self.data_dir, vendor_query)
+            for row in all_rows:
+                path = row["path"]
+                self.listed_files.add(path)
+                document = await asyncio.to_thread(read_document, self.data_dir, path)
+                if document.get("invoice"):
+                    self.documents[path] = document
+                    if document.get("prompt_injection_detected") and path not in self.injection_flagged_paths:
+                        self.injection_flagged_paths.add(path)
+                        self.emit("prompt_injection_detected", {
+                            "path": path,
+                            "message": "Instruction-like invoice text was detected and ignored; structured invoice fields remain authoritative.",
+                        })
+            self.candidate_invoices = all_rows
+            return {"status": "listed", "vendor_query": vendor_query, "candidates": all_rows}
+        if name == "read_ledger":
+            if not self.task_intent or self.task_intent.get("intent") != "read_only":
+                raise ValueError("read_ledger is available only for a host-classified read_only task.")
+            vendor_query = _normalized(_clean_text(arguments.get("vendor_query"), 160))
+            bills = await asyncio.to_thread(self.company.list_bills)
+            matches = [
+                bill for bill in bills
+                if vendor_query and (
+                    vendor_query in _normalized(str(bill.get("vendor", "")))
+                    or _normalized(str(bill.get("vendor", ""))) in vendor_query
+                )
+            ]
+            return {"status": "read", "vendor_query": vendor_query, "bills": matches}
         if name == "browser_open":
             path = _clean_text(arguments.get("path"), 100)
+            if self.task_intent and self.task_intent.get("intent") == "read_only":
+                raise ValueError("Read-only tasks use read_ledger and cannot navigate the ERP write interface.")
+            if path == "/erp/invoices/new":
+                self._require_write_intent()
             if path == "/erp/invoices/new" and self.selected_invoice and self._needs_approval() and not self._invoice_is_approved():
                 raise ValueError(
                     "Approval required: call request_human_approval with invoice_number "
@@ -552,6 +790,7 @@ class AgentLoop:
                 })
             return result
         if name == "erp_login":
+            self._require_write_intent()
             self.emit("credentials_supplied", {
                 "message": "Credentials supplied by host for ERP sign-in; the model never receives their values."
             })
@@ -568,6 +807,14 @@ class AgentLoop:
             return result
         if name == "browser_fill":
             selector = _clean_text(arguments.get("selector"), 80)
+            if self.selected_invoice:
+                expected_fields = {
+                    "#invoice_number_input": "invoice_number", "#invoice_date_input": "invoice_date",
+                    "#due_date_input": "due_date", "#amount_input": "amount", "#currency_input": "currency",
+                }
+                expected_key = expected_fields.get(selector)
+                if expected_key and _clean_text(arguments.get("value"), 600) != str(self.selected_invoice.get(expected_key, "")):
+                    raise ValueError(f"{expected_key.replace('_', ' ').capitalize()} must come from the parsed structured fields of the selected invoice.")
             try:
                 result = await self.browser.browser_fill(selector, _clean_text(arguments.get("value"), 600))
             except Exception as exc:
@@ -693,6 +940,9 @@ class AgentLoop:
             if selector == "#submit_btn":
                 if not self.selected_invoice or not self.policy:
                     raise ValueError("Read the invoice and procurement policy before a ledger write.")
+                criterion = _clean_text(arguments.get("selection_criterion"), 60)
+                selection_reason = _clean_text(arguments.get("selection_reason"), 240)
+                self._validate_selection_declaration(criterion, selection_reason)
                 if not self.duplicate_checked:
                     raise ValueError("Read the ERP ledger for an existing invoice before a write.")
                 if self.duplicate_present:
@@ -730,6 +980,7 @@ class AgentLoop:
                     self.emit("self_correction", {"text": "The ERP rejected the submitted vendor value. Inspect the vendor directory and adapt from its observed row."})
             return result
         if name == "request_human_approval":
+            self._require_write_intent()
             if not self.policy:
                 raise ValueError("Read procurement policy before requesting approval.")
             invoice_number = _clean_text(arguments.get("invoice_number"), 100)
@@ -748,7 +999,12 @@ class AgentLoop:
                     + self._read_invoice_candidates()
                 )
             self.selected_invoice_path, invoice = candidates[0]
+            if not any(row.get("path") == self.selected_invoice_path for row in self.candidate_invoices):
+                raise ValueError("Approval can be requested only for an invoice selected from list_invoice_candidates.")
             self.selected_invoice = invoice
+            criterion = _clean_text(arguments.get("selection_criterion"), 60)
+            selection_reason = _clean_text(arguments.get("selection_reason"), 240)
+            self._validate_selection_declaration(criterion, selection_reason)
             invoice_key = self._invoice_key() or ""
             self.browser.set_invoice(invoice)
             if invoice_key in self.approval_tokens:
@@ -768,6 +1024,8 @@ class AgentLoop:
             payload = {
                 "reason": reason,
                 "policy_reasons": [reason],
+                "selection_criterion": criterion,
+                "selection_reason": selection_reason,
                 "invoice": {**invoice, "canonical_vendor": canonical},
                 "source_file": invoice["source_file"],
                 "source_sha256": invoice["source_sha256"],
@@ -780,6 +1038,8 @@ class AgentLoop:
                 "status": "approved" if token else "denied_or_timed_out",
                 "invoice_number": invoice["invoice_number"],
                 "reason": reason,
+                "selection_criterion": criterion,
+                "selection_reason": selection_reason,
             }
             if token:
                 self.approval_tokens[invoice_key] = str(token)
@@ -813,9 +1073,23 @@ class AgentLoop:
                 raise ValueError("Read an invoice source before calling verify_ledger_row.")
             else:
                 invoice = self.selected_invoice
+            if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                if not any(item.get("path") == self.selected_invoice_path for item in self.candidate_invoices):
+                    raise ValueError("Verification requires an invoice selected from list_invoice_candidates.")
+                if not self.selection_criterion:
+                    self._validate_selection_declaration(
+                        str(self.task_intent.get("selection_criterion", "other")),
+                        str(self.task_intent.get("reason", "Selected from the discovered invoice candidates.")),
+                    )
             self._attach_directory_vendor(invoice)
             self.browser.set_invoice(invoice)
             result = await self.browser.verify_ledger_row(invoice)
+            if self.selection_criterion:
+                result["selection_check"] = {
+                    "status": "passed",
+                    "criterion": self.selection_criterion,
+                    "reason": self.selection_reason,
+                }
             self.verification = result if result.get("status") in {"verified", "mismatch"} else None
             if result.get("status") == "verified" and result.get("already_present"):
                 self.duplicate_checked, self.duplicate_present = True, True
@@ -843,12 +1117,25 @@ class AgentLoop:
                 self.final_result = {
                     "status": "complete",
                     "what_was_done": what_was_done,
+                    "selected_invoice": {
+                        "invoice_number": invoice.get("invoice_number"),
+                        "vendor": invoice.get("vendor"),
+                        "invoice_date": invoice.get("invoice_date"),
+                        "due_date": invoice.get("due_date"),
+                        "amount": invoice.get("amount"),
+                        "currency": invoice.get("currency"),
+                        "path": self.selected_invoice_path,
+                    },
+                    "candidates_considered": self.candidate_invoices,
+                    "selection_criterion": self.selection_criterion,
+                    "selection_reason": self.selection_reason,
                     "evidence": {
                         "ledger_row_id": result.get("ledger_row_id"),
                         "ledger_screenshot_path": result.get("screenshot_path"),
                         "approval_record": approval_record,
                         "source_file": invoice.get("source_file"),
                         "source_sha256": invoice.get("source_sha256"),
+                        "selection_check": result.get("selection_check"),
                     },
                     "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
                 }
@@ -860,6 +1147,9 @@ class AgentLoop:
             summary = _clean_text(arguments.get("summary"), 1000)
             if status not in STOP_STATUSES or not summary:
                 raise ValueError("finish requires a supported stop status and a concise summary.")
+            if status == "complete" and self.task_intent and self.task_intent.get("intent") == "read_only":
+                self.finished = status, summary
+                return {"status": "finished", "final_status": status, "summary": summary, "evidence": {}}
             if status == "complete" and not (self.verification and self.verification.get("status") == "verified"):
                 raise ValueError("A complete run requires a matching read-back from the live ERP ledger DOM.")
             self.finished = status, summary
@@ -954,7 +1244,6 @@ class AgentLoop:
         return "needs_input", reason
 
     async def run(self) -> tuple[str, str]:
-        await self.browser.start()
         provider_name = getattr(self.client, "name", type(self.client).__name__)
         model_name = getattr(self.client, "model", "unknown")
         mode = "replay" if provider_name == "offline-replay" else "live"
@@ -962,14 +1251,32 @@ class AgentLoop:
         validation_retries = 0
         last_validation_error = ""
         try:
+            try:
+                self.task_intent = await self._classify_task_intent()
+            except Exception as exc:
+                reason = f"Task intent classification failed safely before any ERP action: {type(exc).__name__}: {exc}"
+                self.emit("run_error", {"error": reason})
+                return "needs_review", reason
+            self.emit("task_intent", self.task_intent)
+            if self.task_intent["intent"] == "unsupported":
+                refusal = "This sandbox supports invoice entry and ledger lookup only. It cannot pay invoices or contact vendors."
+                self.emit("task_finished", {"status": "needs_input", "summary": refusal})
+                return "needs_input", refusal
+            if self.task_intent["intent"] == "ambiguous":
+                question = self.task_intent["clarifying_question"]
+                self.emit("task_finished", {"status": "needs_input", "summary": question})
+                return "needs_input", question
+            if self.task_intent["intent"] == "write_invoice_entry":
+                await self.browser.start()
             for step in range(1, MAX_STEPS + 1):
                 try:
                     run_state = self._host_run_state()
                     turn_observations = self._conversation_observations(run_state)
+                    turn_tools = self._tools_for_intent()
                     self.emit("host_run_state", {"turn": step, **run_state})
-                    baseline_chars, baseline_tokens = self._estimate_prompt_tokens(turn_observations[1:])
-                    prompt_chars, prompt_tokens = self._estimate_prompt_tokens(turn_observations)
-                    prompt_breakdown = self._prompt_size_breakdown(turn_observations)
+                    baseline_chars, baseline_tokens = self._estimate_prompt_tokens(turn_observations[1:], turn_tools)
+                    prompt_chars, prompt_tokens = self._estimate_prompt_tokens(turn_observations, turn_tools)
+                    prompt_breakdown = self._prompt_size_breakdown(turn_observations, turn_tools)
                     self.prompt_tokens_before.append(baseline_tokens)
                     self.prompt_tokens_after.append(prompt_tokens)
                     self.prompt_breakdown_tokens.append({key: value["approx_tokens"] for key, value in prompt_breakdown.items()})
@@ -984,7 +1291,7 @@ class AgentLoop:
                     })
                     call = await self._await_with_long_operation_trace(
                         "provider_request",
-                        asyncio.to_thread(self.client.next_tool_call, self.task, turn_observations, TOOL_DEFINITIONS),
+                        asyncio.to_thread(self.client.next_tool_call, self.task, turn_observations, turn_tools),
                         details={"provider": provider_name, "turn": step},
                     )
                 except ProviderRequestError as exc:

@@ -22,20 +22,23 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_intent: "Host intent classification", prompt_injection_detected: "Prompt injection ignored", selection_check: "Invoice selection check", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
   const p = event.payload || {};
   if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials are supplied by the host and never exposed to the model.";
   if (event.event_type === "provenance_attached") return p.message || `Host attached source provenance for ${p.invoice_number || "the selected invoice"}.`;
-  if (event.event_type === "tool_retry_budget") return `${p.failure_count}/${p.limit} matching failures for ${p.tool} across this run. Last error: ${p.error}`;
-  if (event.event_type === "tool_retry_warning") return p.warning || `${p.failure_count}/${p.limit} repeated failures for ${p.tool}. ${p.error}`;
-  if (event.event_type === "approval_token_injected") return p.message || `Host injected approval for ${p.invoice_number}.`;
+  if (event.event_type === "tool_retry_budget") return `${p.failure_count ?? "?"}/${p.limit ?? "?"} matching failures for ${p.tool || "tool"} across this run. Last error: ${p.error || "No error detail provided."}`;
+  if (event.event_type === "tool_retry_warning") return p.warning || `${p.failure_count ?? "?"}/${p.limit ?? "?"} repeated failures for ${p.tool || "tool"}. ${p.error || "No error detail provided."}`;
+  if (event.event_type === "approval_token_injected") return p.message || `Host injected approval for ${p.invoice_number || "the selected invoice"}.`;
   if (event.event_type === "host_run_state") {
     const invoice = p.selected_invoice;
     return [p.logged_in ? "logged in" : "not logged in", invoice ? `invoice ${invoice.invoice_number} · ${invoice.amount} ${invoice.currency}` : "no invoice selected", `approval ${p.approval_status}`, `form ${p.form_status}`, p.workflow_hint || p.submission_status || "", !p.workflow_hint && p.next_action ? `next: ${p.next_action}` : "", p.legal_vendor ? `vendor ${p.legal_vendor}` : "", p.last_erp_alert ? `alert: ${p.last_erp_alert}` : ""].filter(Boolean).join(" · ");
   }
+  if (event.event_type === "task_intent") return `Classified as ${p.intent || "unknown"}${p.vendor_query ? ` · vendor ${p.vendor_query}` : ""}${p.selection_criterion ? ` · selection ${p.selection_criterion}` : ""}${p.reason ? ` · ${p.reason}` : ""}${p.clarifying_question ? ` · ${p.clarifying_question}` : ""}`;
+  if (event.event_type === "prompt_injection_detected") return `${p.message || "Instruction-like invoice text was ignored."} Source: ${p.path || "invoice"}.`;
+  if (event.event_type === "selection_check") return `Selection check ${p.status || "unknown"}: ${p.criterion || "criterion unavailable"} · ${p.selected_invoice || "invoice unavailable"}. ${p.reason || ""}`;
   if (event.event_type === "prompt_size") {
     const parts = Object.entries(p.breakdown || {}).map(([name, size]) => `${name} ${size.approx_tokens} tok`).join(" · ");
     return `Approx. ${p.approx_tokens} tokens (${p.approx_characters} chars; estimate). ${parts}`;
@@ -48,6 +51,8 @@ function eventSummary(event) {
   if (event.event_type === "thought" || event.event_type === "self_correction") return p.text || "";
   if (event.event_type === "action") {
     if (p.tool === "list_files") return "List the available invoice sources and procurement policy.";
+    if (p.tool === "list_invoice_candidates") return `Parse and compare ${p.vendor_query || "the requested vendor"} invoice candidates.`;
+    if (p.tool === "read_ledger") return `Read the posted ledger for ${p.vendor_query || "the requested vendor"}.`;
     if (p.tool === "read_document") return `Read ${p.path} as untrusted invoice data.`;
     if (p.tool === "read_policy") return "Read the procurement rules and approval threshold.";
     if (p.tool === "browser_open") return `Open the local ERP route ${p.path}.`;
@@ -71,12 +76,14 @@ function eventSummary(event) {
     if (p.warning) return p.warning;
     if (p.fields) return `${p.fields.invoice_number} · ${p.fields.vendor} · ${p.fields.amount} · due ${p.fields.due_date}`;
     if (p.files) return `${p.files.length} source and policy files available.`;
+    if (p.candidates) return `${p.candidates.length} parsed invoice candidate(s) for ${p.vendor_query || "the requested vendor"}.`;
+    if (p.bills) return `${p.bills.length} ledger invoice(s) returned for ${p.vendor_query || "the requested vendor"}.`;
     if (p.dom_tree) return p.summary || p.dom_tree.slice(0, 240);
     if (p.error) return p.error;
   }
   if (event.event_type === "loop_guard_warning") return p.warning || `Repeated ${p.tool || "action"} without a page-state change.`;
   if (event.event_type === "approval_requested") return p.reason || "A human decision is required.";
-  if (event.event_type === "approval_decision") return p.token_minted ? "Approved. A runtime token was minted and delivered to the host." : "Approval was declined or timed out.";
+  if (event.event_type === "approval_decision") return p.token_minted === true ? "Approved. A runtime token was minted and stored by the host." : p.token_minted === false ? "Approval was declined or timed out." : "Approval decision recorded; runtime token status unavailable.";
   if (event.event_type === "planner") return `${p.mode === "replay" ? "Replay" : "Live provider"} · ${p.provider} · ${p.model}`;
   if (event.event_type === "provider_turn") return `${p.provider} · ${p.model}`;
   if (event.event_type === "rate_limit_recovery") {
@@ -85,7 +92,7 @@ function eventSummary(event) {
     if (p.action === "provider_fallback") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.previous_provider} retries failed; switching to live provider ${p.provider}.`;
   }
   if (event.event_type === "verification") return p.status === "verified" ? `All ${Object.keys(p.matches || {}).length} fields match · row ${p.ledger_row_id} · ${p.screenshot_path || "screenshot unavailable"}.` : `Ledger verification status: ${p.status}.`;
-  if (event.event_type === "final_result") return `${p.what_was_done} Evidence: ledger row ${p.evidence?.ledger_row_id}, screenshot ${p.evidence?.ledger_screenshot_path}, source ${p.evidence?.source_file}; elapsed ${p.elapsed_seconds}s.`;
+  if (event.event_type === "final_result") return `${p.what_was_done} Selected ${p.selected_invoice?.invoice_number || "invoice unavailable"} (${p.selected_invoice?.invoice_date || "date unavailable"}); criterion ${p.selection_criterion || "unavailable"}. Evidence: ledger row ${p.evidence?.ledger_row_id}, screenshot ${p.evidence?.ledger_screenshot_path}, source ${p.evidence?.source_file}; elapsed ${p.elapsed_seconds}s.`;
   if (event.event_type === "task_finished") return p.summary || p.status || "";
   if (event.event_type === "run_error") return p.error || "The run stopped safely.";
   return "";
@@ -100,7 +107,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "loop_guard_warning", "tool_retry_warning", "verification", "final_result", "long_operation", "provenance_attached", "tool_retry_budget", "approval_token_injected", "host_run_state", "prompt_size", "prompt_size_summary", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "loop_guard_warning", "tool_retry_warning", "verification", "final_result", "long_operation", "provenance_attached", "tool_retry_budget", "approval_token_injected", "host_run_state", "prompt_size", "prompt_size_summary", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error", "task_intent", "prompt_injection_detected", "selection_check"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);
@@ -199,15 +206,16 @@ async function decideApproval(approved) {
   $("#approveButton").disabled = true; $("#rejectButton").disabled = true;
   try {
     const result = await requestJson(`/api/runs/${encodeURIComponent(state.runId)}/approval`, { method: "POST", body: JSON.stringify({ approved }) });
-    state.approvalToken = result.approval_token || null;
-    if (state.approvalToken) { $("#approvalTokenMessage").hidden = false; $("#approvalTokenMessage").textContent = `Cryptographic runtime token minted: ${state.approvalToken}. The worker will enter it into the ERP form.`; }
+    state.approvalToken = Boolean(result.approval_token);
+    if (state.approvalToken) { $("#approvalTokenMessage").hidden = false; $("#approvalTokenMessage").textContent = "Approval token created and held by the host. It will not be displayed here."; }
+    else { $("#approvalTokenMessage").hidden = true; $("#approvalTokenMessage").textContent = ""; }
     $("#approvalBanner").hidden = true; setStatus("running"); pollRun(state.runId);
   } catch (error) { $("#approveButton").disabled = false; $("#rejectButton").disabled = false; setStatus("needs_review", error.message); }
 }
 $("#taskForm").addEventListener("submit", async (event) => {
   event.preventDefault(); const task = $("#taskInput").value.trim(); if (!task) return;
   if (state.pollTimer) clearTimeout(state.pollTimer); state.finished = false; state.runId = null; state.lastFrame = null; state.approvalToken = null;
-  $("#traceRunId").textContent = "Starting…"; $("#traceList").replaceChildren(); $("#traceEmpty").hidden = false; $("#approvalBanner").hidden = true;
+  $("#traceRunId").textContent = "Starting…"; $("#traceList").replaceChildren(); $("#traceEmpty").hidden = false; $("#approvalBanner").hidden = true; $("#approvalTokenMessage").hidden = true; $("#approvalTokenMessage").textContent = "";
   $("#browserFrame").hidden = true; $("#browserPlaceholder").hidden = false; $("#browserUrl").textContent = "/erp/login"; $("#frameBadge").textContent = "Starting browser";
   $("#ledgerCrop").hidden = true; $("#cropPlaceholder").hidden = false; $("#cropStatus").textContent = "No capture";
   $("#evidenceBadge").textContent = "Not verified"; $("#evidenceBadge").className = "semantic-badge badge-neutral";

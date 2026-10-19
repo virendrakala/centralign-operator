@@ -20,6 +20,11 @@ _INVOICE_LABELS = {
     "due_date": r"due\s*date\s*:\s*(.+)",
     "amount_raw": r"amount\s*(?:due)?\s*:\s*(.+)",
 }
+_INJECTION_PATTERNS = (
+    re.compile(r"ignore\s+(?:all\s+)?previous\s+instructions", re.IGNORECASE),
+    re.compile(r"disregard\s+(?:all\s+)?(?:prior|previous)\s+instructions", re.IGNORECASE),
+    re.compile(r"\b(?:system prompt|developer instructions)\b", re.IGNORECASE),
+)
 
 
 def ensure_operator_assets(data_dir: Path) -> None:
@@ -214,4 +219,52 @@ def read_document(data_dir: Path, path: str) -> dict[str, Any]:
         "content": text,
         "sha256": digest,
         "invoice": parse_invoice_text(text, Path(path).name, digest),
+        "prompt_injection_detected": has_prompt_injection(text),
     }
+
+
+def has_prompt_injection(text: str) -> bool:
+    """Detect instruction-like text embedded in an invoice without treating it as data fields."""
+    return any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
+
+
+def remove_prompt_injection_lines(text: str) -> str:
+    """Keep invoice content useful to the planner while hiding detected instruction lines."""
+    kept = [
+        line for line in text.splitlines()
+        if not any(pattern.search(line) for pattern in _INJECTION_PATTERNS)
+    ]
+    return "\n".join(kept)
+
+
+def list_invoice_candidates(data_dir: Path, vendor_query: str) -> list[dict[str, str]]:
+    """Parse all inbox PDF/TXT files and return structured candidates for a vendor query."""
+    query_words = set(re.findall(r"[a-z0-9]+", vendor_query.casefold()))
+    query = " ".join(vendor_query.casefold().split())
+    if not query_words or len(vendor_query) > 160:
+        return []
+    candidates: list[dict[str, str]] = []
+    inbox = data_dir / "inbox"
+    for path in sorted(inbox.iterdir(), key=lambda item: item.name.casefold()) if inbox.exists() else []:
+        if not path.is_file() or path.suffix.casefold() not in {".pdf", ".txt"}:
+            continue
+        document = read_document(data_dir, f"inbox/{path.name}")
+        invoice = document.get("invoice")
+        if not invoice:
+            continue
+        vendor = str(invoice.get("vendor", ""))
+        vendor_normalized = " ".join(vendor.casefold().split())
+        vendor_words = set(re.findall(r"[a-z0-9]+", vendor_normalized))
+        # Prefer whole-name matches; allow a short directory alias such as "Acme".
+        if query not in vendor_normalized and vendor_normalized not in query and not query_words.issubset(vendor_words):
+            continue
+        candidates.append({
+            "path": f"inbox/{path.name}",
+            "vendor": vendor,
+            "invoice_number": str(invoice["invoice_number"]),
+            "invoice_date": str(invoice["invoice_date"]),
+            "due_date": str(invoice["due_date"]),
+            "amount": str(invoice["amount"]),
+            "currency": str(invoice["currency"]),
+        })
+    return sorted(candidates, key=lambda item: (item["invoice_date"], item["invoice_number"]), reverse=True)
