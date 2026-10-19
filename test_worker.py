@@ -1349,6 +1349,10 @@ class AgentLoopUnitTests(unittest.TestCase):
             loop = AgentLoop(Path(temp_dir), "no-submit", "record latest Acme invoice", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=client)
             loop.browser = StubBrowser()
             loop.documents["inbox/invoice.txt"] = {"path": "inbox/invoice.txt", "invoice": invoice}
+            loop.selected_invoice = invoice
+            loop.selected_invoice_path = "inbox/invoice.txt"
+            loop.selection_criterion = "latest_by_invoice_date"
+            loop.selection_reason = "The latest Acme invoice by invoice date."
             loop.candidate_invoices = [{
                 "path": "inbox/invoice.txt", "vendor": invoice["vendor"],
                 "invoice_number": invoice["invoice_number"], "invoice_date": invoice["invoice_date"],
@@ -2009,6 +2013,125 @@ class AgentLoopUnitTests(unittest.TestCase):
                 self.assertFalse(manager.consume_approval_token(token, form))
 
             asyncio.run(check_token())
+
+    def test_verify_before_select_is_rejected_and_loop_continues(self) -> None:
+        class VerifyBeforeSelectClient:
+            name = "offline-replay"
+            model = "test-verify-before-select"
+
+            def __init__(self):
+                self.turn = 0
+                self.verify_rejected = False
+                self.verify_succeeded = False
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.turn += 1
+                if self.turn == 1:
+                    return ToolCall("list_invoice_candidates", {"vendor_query": "Acme"})
+                if self.turn == 2:
+                    return ToolCall("verify_ledger_row", {"invoice_number": "INV-2026-2116"})
+                if self.turn == 3:
+                    last_obs = observations[-1]
+                    if last_obs.get("tool") == "verify_ledger_row" and "error" in last_obs.get("result", {}).get("status", ""):
+                        self.verify_rejected = True
+                    return ToolCall("read_document", {"path": "inbox/INV_2026_10_Acme.pdf"})
+                if self.turn == 4:
+                    return ToolCall("verify_ledger_row", {"invoice_number": "INV-2026-2116"})
+                if self.turn == 5:
+                    last_obs = observations[-1]
+                    if last_obs.get("tool") == "verify_ledger_row" and last_obs.get("result", {}).get("status") == "verified":
+                        self.verify_succeeded = True
+                    return ToolCall("finish", {"status": "complete", "summary": "Done after selection."})
+                return None
+
+        class StubBrowser:
+            async def start(self):
+                return None
+            async def close(self):
+                return None
+            def set_invoice(self, _invoice):
+                return None
+            async def verify_ledger_row(self, _invoice):
+                return {
+                    "status": "verified", "pass": True, "invoice_number": "INV-2026-2116",
+                    "already_present": True, "ledger_row_id": "#1", "matches": {"vendor": True},
+                }
+
+        with TemporaryDirectory(prefix="centralign-verify-before-select-") as temp_dir:
+            data_dir = Path(temp_dir)
+            ensure_operator_assets(data_dir)
+            client = VerifyBeforeSelectClient()
+            events = []
+            loop = AgentLoop(
+                data_dir, "verify-before-select", "Record latest Acme invoice in ledger",
+                "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None,
+                client=client,
+            )
+            loop.browser = StubBrowser()
+            status, summary = asyncio.run(loop.run())
+
+            self.assertTrue(client.verify_rejected)
+            self.assertTrue(client.verify_succeeded)
+            self.assertEqual(status, "complete")
+            rejected_obs = next(
+                obs for obs in loop.observations
+                if obs.get("tool") == "verify_ledger_row" and obs.get("result", {}).get("status") == "error"
+            )
+            self.assertIn("Select and read an invoice candidate from list_invoice_candidates before verifying ledger rows", rejected_obs["result"]["message"])
+            selection_event = next(payload for kind, payload in events if kind == "selection_check")
+            self.assertEqual(selection_event["status"], "passed")
+
+    def test_normal_order_selection_then_verification_succeeds(self) -> None:
+        class StubBrowser:
+            async def start(self):
+                return None
+            async def close(self):
+                return None
+            def set_invoice(self, _invoice):
+                return None
+            async def verify_ledger_row(self, _invoice):
+                return {"status": "verified", "pass": True, "invoice_number": "INV-2026-2116"}
+
+        with TemporaryDirectory(prefix="centralign-normal-order-") as temp_dir:
+            data_dir = Path(temp_dir)
+            ensure_operator_assets(data_dir)
+            loop = AgentLoop(
+                data_dir, "normal-order", "Record latest Acme invoice in ledger",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None,
+                offline=True,
+            )
+            loop.browser = StubBrowser()
+            loop.task_intent = _test_write_intent("", [])
+            loop.task_intent["selection_criterion"] = "latest_by_invoice_date"
+            loop.task_intent["reason"] = "The task requests the latest invoice by invoice date."
+            candidates = asyncio.run(loop._execute("list_invoice_candidates", {"vendor_query": "Acme"}))
+            self.assertGreaterEqual(len(candidates["candidates"]), 1)
+            # Before reading, verify is rejected
+            with self.assertRaisesRegex(ValueError, "Select and read an invoice candidate"):
+                asyncio.run(loop._execute("verify_ledger_row", {}))
+            # After read_document on the latest candidate, selection is established
+            read_res = asyncio.run(loop._execute("read_document", {"path": "inbox/INV_2026_10_Acme.pdf"}))
+            self.assertEqual(read_res["invoice"]["invoice_number"], "INV-2026-2116")
+            self.assertTrue(loop._has_passing_selection())
+            self.assertEqual(loop.selection_criterion, "latest_by_invoice_date")
+            # Now verify_ledger_row succeeds without error
+            verify_res = asyncio.run(loop._execute("verify_ledger_row", {}))
+            self.assertIn("status", verify_res)
+
+    def test_read_only_task_unaffected_by_selection_requirement(self) -> None:
+        with TemporaryDirectory(prefix="centralign-read-only-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "read-only-test", "What invoices are posted for Acme?",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None,
+                offline=True,
+            )
+            loop.task_intent = {
+                "intent": "read_only", "vendor_query": "Acme",
+                "requested_actions": [{"action": "read ledger", "capability": "read_ledger"}],
+            }
+            result = asyncio.run(loop._execute("read_ledger", {"vendor_query": "Acme"}))
+            self.assertEqual(result["status"], "read")
+            self.assertIn("bills", result)
 
 
 class BrowserAgentIntegrationTests(unittest.TestCase):

@@ -673,6 +673,14 @@ class AgentLoop:
             "candidate_count": len(self.candidate_invoices),
         })
 
+    def _has_passing_selection(self) -> bool:
+        return bool(
+            self.selected_invoice
+            and self.selected_invoice_path
+            and self.selection_criterion
+            and any(item.get("path") == self.selected_invoice_path for item in self.candidate_invoices)
+        )
+
     def _form_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         state = self.browser.describe_form_state(snapshot)
         invoice = self.selected_invoice
@@ -1264,6 +1272,12 @@ class AgentLoop:
             self.candidate_listed = True
             return {"status": "listed", "vendor_query": vendor_query, "candidates": all_rows}
         if name == "read_ledger":
+            if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                if not self._has_passing_selection():
+                    raise ValueError(
+                        "Select and read an invoice candidate from list_invoice_candidates before checking the ledger for duplicates."
+                    )
+                raise ValueError("read_ledger is available only for a host-classified read_only task; use verify_ledger_row for invoice entry verification.")
             if not self.task_intent or self.task_intent.get("intent") != "read_only":
                 raise ValueError("read_ledger is available only for a host-classified read_only task.")
             if not any(
@@ -1602,8 +1616,22 @@ class AgentLoop:
             self.browser.set_invoice(invoice)
             return {"status": "approved" if token else "denied_or_timed_out", "invoice_number": invoice["invoice_number"]}
         if name == "verify_ledger_row":
+            if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                if not self._has_passing_selection():
+                    raise ValueError(
+                        "Select and read an invoice candidate from list_invoice_candidates before verifying ledger rows."
+                    )
             invoice_number = _clean_text(arguments.get("invoice_number"), 100)
             if invoice_number:
+                if (
+                    self.task_intent
+                    and self.task_intent.get("intent") == "write_invoice_entry"
+                    and self.selected_invoice
+                    and invoice_number != str(self.selected_invoice.get("invoice_number"))
+                ):
+                    raise ValueError(
+                        f"Selected invoice is {self.selected_invoice.get('invoice_number')}; verify that invoice instead."
+                    )
                 candidates = [
                     (path, document["invoice"]) for path, document in self.documents.items()
                     if document.get("invoice") and str(document["invoice"].get("invoice_number")) == invoice_number
@@ -1629,11 +1657,6 @@ class AgentLoop:
             if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
                 if not any(item.get("path") == self.selected_invoice_path for item in self.candidate_invoices):
                     raise ValueError("Verification requires an invoice selected from list_invoice_candidates.")
-                if not self.selection_criterion:
-                    self._validate_selection_declaration(
-                        str(self.task_intent.get("selection_criterion", "other")),
-                        str(self.task_intent.get("reason", "Selected from the discovered invoice candidates.")),
-                    )
             self._attach_directory_vendor(invoice)
             self.browser.set_invoice(invoice)
             result = await self.browser.verify_ledger_row(invoice)
