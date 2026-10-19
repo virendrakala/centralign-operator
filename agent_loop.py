@@ -235,10 +235,16 @@ class AgentLoop:
             else "submit_attempted" if self.submit_performed else None
         )
         verification_passed = bool(self.verification and self.verification.get("status") == "verified" and self.verification.get("pass"))
+        already_present = bool(self.verification and self.verification.get("already_present"))
         next_action = "finish" if verification_passed else "verify_ledger_row" if posted else "inspect_submit_alert" if self.submit_performed else None
         workflow_hint = f"{submission_status}; next: {next_action}" if submission_status and next_action else None
         if verification_passed:
-            workflow_hint = "Ledger verification passed; next: finish."
+            if already_present:
+                row_label = str((self.verification or {}).get("ledger_row_id") or "").strip()
+                row_str = f"row {row_label}" if row_label.startswith("#") else f"row #{row_label}" if row_label else "existing row"
+                workflow_hint = f"The invoice was already in the ledger ({row_str}), no new entry was written, and the existing row was verified against the source invoice; next: finish."
+            else:
+                workflow_hint = "Ledger verification passed; next: finish."
         alerts = snapshot.get("alerts") or ([snapshot.get("alert")] if snapshot.get("alert") else [])
         approval_hint = None
         if approval_status == "required":
@@ -259,6 +265,8 @@ class AgentLoop:
             "selection_reason": self.selection_reason,
             "candidate_count": len(self.candidate_invoices),
             "verification_status": "verified" if verification_passed else str((self.verification or {}).get("status") or "pending"),
+            "already_present": already_present,
+            "duplicate_present": self.duplicate_present,
         }
 
     def _canonical_action_label(self, action: str) -> str:
@@ -858,6 +866,7 @@ class AgentLoop:
         result.update({
             "status": status,
             "summary": summary,
+            "already_present": bool(result.get("already_present") or (self.verification and self.verification.get("already_present"))),
             "requested_actions": list((self.task_intent or {}).get("requested_actions", [])),
             "not_done_actions": not_done,
             "not_done": "none" if not not_done else ", ".join(not_done),
@@ -1685,14 +1694,19 @@ class AgentLoop:
                 approval_record = self.approval_record or {
                     "status": "not_applicable_existing_ledger_row" if result.get("already_present") else "not_required"
                 }
-                what_was_done = (
-                    f"Verified existing ledger row for invoice {invoice['invoice_number']}."
-                    if result.get("already_present")
-                    else f"Submitted invoice {invoice['invoice_number']} and verified its ledger row."
-                )
+                if result.get("already_present"):
+                    row_label = str(result.get("ledger_row_id") or "").strip()
+                    row_str = f"row {row_label}" if row_label.startswith("#") else f"row #{row_label}" if row_label else "existing row"
+                    what_was_done = (
+                        f"The invoice was already in the ledger ({row_str}), no new entry was written, "
+                        "and the existing row was verified against the source invoice."
+                    )
+                else:
+                    what_was_done = f"Submitted invoice {invoice['invoice_number']} and verified its ledger row."
                 self.final_result = {
                     "status": "complete",
                     "what_was_done": what_was_done,
+                    "already_present": bool(result.get("already_present")),
                     "selected_invoice": {
                         "invoice_number": invoice.get("invoice_number"),
                         "vendor": invoice.get("vendor"),
@@ -1707,6 +1721,7 @@ class AgentLoop:
                     "selection_reason": self.selection_reason,
                     "evidence": {
                         "ledger_row_id": result.get("ledger_row_id"),
+                        "already_present": bool(result.get("already_present")),
                         "ledger_screenshot_path": result.get("screenshot_path"),
                         "approval_record": approval_record,
                         "source_file": invoice.get("source_file"),
@@ -1769,6 +1784,7 @@ class AgentLoop:
             result = self.final_result or {}
             return {
                 "status": "finished", "final_status": status, "summary": summary,
+                "already_present": bool((self.verification and self.verification.get("already_present")) or result.get("already_present")),
                 "answer": result.get("ledger_answer"), "evidence": result.get("evidence", self.verification or {}),
                 "not_done_actions": result.get("not_done_actions", []),
             }

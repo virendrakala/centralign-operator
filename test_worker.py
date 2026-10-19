@@ -2133,6 +2133,63 @@ class AgentLoopUnitTests(unittest.TestCase):
             self.assertEqual(result["status"], "read")
             self.assertIn("bills", result)
 
+    def test_duplicate_invoice_final_result_summary_and_evidence(self) -> None:
+        with TemporaryDirectory(prefix="centralign-duplicate-unit-") as temp_dir:
+            data_dir = Path(temp_dir)
+            loop = AgentLoop(
+                data_dir, "test-dup", "Record Acme invoice",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None,
+                offline=True,
+            )
+            loop.task_intent = {
+                "intent": "write_invoice_entry",
+                "vendor_query": "Acme",
+                "requested_actions": [{"action": "enter invoice", "capability": "write_invoice_entry"}],
+            }
+            loop.selected_invoice = {
+                "invoice_number": "INV-2026-2116",
+                "vendor": "Acme Analytics Pvt Ltd",
+                "canonical_vendor": "Acme Analytics Pvt Ltd",
+                "amount": "68500.00",
+                "currency": "INR",
+                "invoice_date": "2026-10-21",
+                "due_date": "2026-11-15",
+            }
+            loop.selected_invoice_path = "inbox/INV_2026_10_Acme.pdf"
+            loop.candidate_invoices = [{"path": "inbox/INV_2026_10_Acme.pdf", "invoice_number": "INV-2026-2116", "invoice_date": "2026-10-21"}]
+            loop.selection_criterion = "latest_by_invoice_date"
+            loop.selection_reason = "Chose latest Acme invoice"
+
+            class StubBrowser:
+                def set_invoice(self, _invoice):
+                    pass
+
+                async def verify_ledger_row(self, invoice: dict) -> dict:
+                    return {
+                        "status": "verified",
+                        "pass": True,
+                        "already_present": True,
+                        "ledger_row_id": "#1",
+                        "screenshot_path": "/tmp/ledger.png",
+                        "matches": {"vendor": True, "invoice_number": True, "amount": True},
+                    }
+
+            loop.browser = StubBrowser()
+            verify_res = asyncio.run(loop._execute("verify_ledger_row", {}))
+            self.assertEqual(verify_res["status"], "verified")
+            self.assertTrue(verify_res["already_present"])
+            self.assertTrue(loop.final_result["already_present"])
+            self.assertIn("The invoice was already in the ledger (row #1)", loop.final_result["what_was_done"])
+            self.assertIn("no new entry was written", loop.final_result["what_was_done"])
+
+            finish_res = asyncio.run(loop._execute("finish", {"status": "complete", "summary": "Finished the task"}))
+            self.assertEqual(finish_res["status"], "finished")
+            self.assertEqual(finish_res["final_status"], "complete")
+            self.assertTrue(finish_res["already_present"])
+            self.assertIn("The invoice was already in the ledger (row #1)", finish_res["summary"])
+            self.assertIn("no new entry was written", finish_res["summary"])
+            self.assertIn("Not done: none.", finish_res["summary"])
+
 
 class BrowserAgentIntegrationTests(unittest.TestCase):
     def test_erp_thresholds_are_loaded_from_the_single_policy_file(self) -> None:
@@ -2363,6 +2420,10 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 duplicate_evidence = next(event["payload"] for event in duplicate["events"] if event["event_type"] == "verification")
                 self.assertTrue(duplicate_evidence["already_present"])
                 duplicate_result = next(event["payload"] for event in duplicate["events"] if event["event_type"] == "final_result")
+                self.assertIn("The invoice was already in the ledger", duplicate_result["summary"])
+                self.assertIn("no new entry was written", duplicate_result["summary"])
+                self.assertIn("row #1", duplicate_result["summary"])
+                self.assertTrue(duplicate_result.get("already_present"))
                 self.assertIn("Not done: none.", duplicate_result["summary"])
                 self.assertEqual(duplicate_result["not_done_actions"], [])
                 self.assertEqual(len(json_request(base_url, "/api/state")[1]["bills"]), 1)

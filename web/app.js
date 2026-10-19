@@ -49,7 +49,13 @@
     if (tool === "browser_check") return "Checked an ERP field";
     if (tool === "verify_ledger_row") return "Verified the ERP ledger";
     if (tool === "request_human_approval") return "Requested human approval";
-    if (tool === "finish") return "Finished the task";
+    if (tool === "finish") {
+      const summary = String(p.summary || (p.arguments && p.arguments.summary) || "").toLowerCase();
+      if (p.already_present || (p.arguments && p.arguments.already_present) || /already in (the )?ledger/.test(summary)) {
+        return "Already in ledger \u2013 verified, no new write";
+      }
+      return "Finished the task";
+    }
     return String(tool).replaceAll("_", " ");
   }
   function actionResult(event, observation) {
@@ -245,6 +251,21 @@
           const passed = semantic.status === "verified" || (Object.keys(matches).length > 0 && Object.values(matches).every(Boolean));
           title = passed ? `Verified: all ${Object.keys(matches).length} fields match ledger row ${ledgerRowLabel(semantic.ledger_row_id)}` : "Ledger verification failed";
           summary = passed ? `The ledger row matches the selected invoice.${semantic.screenshot_path ? ` Evidence: ${semantic.screenshot_path.split(/[\\/]/).pop()}.` : ""}` : semantic.message || semantic.error || `Verification status: ${semantic.status || "not verified"}.`;
+        }
+        if (tool === "finish") {
+          const isDuplicate = Boolean(
+            p.already_present
+            || (p.arguments && p.arguments.already_present)
+            || observationPayload.already_present
+            || /already in (the )?ledger/i.test(p.summary || "")
+            || /already in (the )?ledger/i.test((p.arguments && p.arguments.summary) || "")
+            || /already in (the )?ledger/i.test(observationPayload.summary || "")
+            || events.some((e) => e.event_type === "final_result" && (payload(e).already_present || /already in (the )?ledger/i.test(payload(e).summary || "")))
+            || events.some((e) => e.event_type === "verification" && payload(e).already_present)
+          );
+          if (isDuplicate) {
+            title = "Already in ledger \u2013 verified, no new write";
+          }
         }
         if (tool === "verify_ledger_row" && failed && observationPayload.status === "not_found") title = "Ledger row not found";
         const notFound = tool === "verify_ledger_row" && observationPayload.status === "not_found";
@@ -662,7 +683,14 @@ function getRunFacts(run) {
   else if (status === "awaiting_approval") summary = "Review the selected invoice before it is submitted to the ERP.";
   else if (["needs_review", "incomplete", "failed"].includes(status)) summary = final.summary || eventPayload(errorEvent).error || "The task stopped before a verified result was available.";
   else if (status === "needs_input") summary = final.summary || eventPayload(events.find((event) => event.event_type === "task_intent"))?.clarifying_question || "More information is needed before this task can continue.";
-  else if (status === "complete" && !final.summary && !final.what_was_done && !final.ledger_answer && !final.candidate_answer) summary = proof.status === "verified" ? "The invoice was recorded and independently checked against the ERP ledger." : "The task completed successfully.";
+  else if (status === "complete" && !final.summary && !final.what_was_done && !final.ledger_answer && !final.candidate_answer) {
+    const isAlreadyPresent = Boolean(proof.already_present || final.already_present);
+    summary = isAlreadyPresent
+      ? "The invoice was already in the ledger, no new entry was written, and the existing row was verified against the source invoice."
+      : proof.status === "verified"
+      ? "The invoice was recorded and independently checked against the ERP ledger."
+      : "The task completed successfully.";
+  }
   let elapsed = final.elapsed_seconds;
   if (elapsed === undefined || elapsed === null) {
     const start = Date.parse(run.started_at || "");

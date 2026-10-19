@@ -9,7 +9,7 @@ const boundary = source.indexOf("\nconst $ =");
 assert.notEqual(boundary, -1, "summary helper stays at the top of app.js");
 const moduleStub = { exports: {} };
 vm.runInNewContext(source.slice(0, boundary), { module: moduleStub, window: {} });
-const { groupTraceEvents, progressSteps } = moduleStub.exports;
+const { groupTraceEvents, progressSteps, actionTitle } = moduleStub.exports;
 
 test("groups tool actions with observations and keeps selection and recovery meaningful", () => {
   const events = [
@@ -176,3 +176,29 @@ test("renders a four-step progress model from existing events", () => {
   assert.equal(verified.length, 4);
   assert.equal(verified[3].state, "done");
 });
+
+test("duplicate invoice finish timeline row displays 'Already in ledger – verified, no new write'", () => {
+  assert.equal(
+    actionTitle({ payload: { tool: "finish", already_present: true } }),
+    "Already in ledger \u2013 verified, no new write"
+  );
+  assert.equal(
+    actionTitle({ payload: { tool: "finish", arguments: { summary: "The invoice was already in the ledger (row #1)" } } }),
+    "Already in ledger \u2013 verified, no new write"
+  );
+
+  const result = groupTraceEvents([
+    { event_type: "action", sequence: 1, payload: { tool: "verify_ledger_row" } },
+    { event_type: "verification", sequence: 2, payload: { status: "verified", matches: { vendor: true, invoice_number: true }, ledger_row_id: 1, already_present: true } },
+    { event_type: "observation", sequence: 3, payload: { tool: "verify_ledger_row", status: "verified", already_present: true } },
+    { event_type: "action", sequence: 4, payload: { tool: "finish", status: "complete" } },
+    { event_type: "observation", sequence: 5, payload: { tool: "finish", status: "finished", already_present: true, summary: "The invoice was already in the ledger (row #1), no new entry was written, and the existing row was verified against the source invoice. Not done: none." } },
+    { event_type: "final_result", sequence: 6, payload: { status: "complete", already_present: true, summary: "The invoice was already in the ledger (row #1), no new entry was written, and the existing row was verified against the source invoice. Not done: none." } },
+  ]);
+  const finishRow = result.rows.find((row) => row.detail && row.detail.action && row.detail.action.tool === "finish");
+  assert.ok(finishRow, "finish row should be present");
+  assert.equal(finishRow.title, "Already in ledger \u2013 verified, no new write");
+  assert.match(finishRow.result, /The invoice was already in the ledger/);
+  assert.match(finishRow.result, /no new entry was written/);
+});
+
