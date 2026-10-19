@@ -20,8 +20,9 @@ FORM_SELECTORS = {
     "#approval_token", "#source_file_input", "#source_sha256_input",
 }
 HOST_CREDENTIAL_SELECTORS = {"#email_input", "#password_input"}
+HOST_APPROVAL_SELECTORS = {"#approval_token"}
 PROVENANCE_SELECTORS = {"#source_file_input", "#source_sha256_input"}
-MODEL_FORM_SELECTORS = FORM_SELECTORS - HOST_CREDENTIAL_SELECTORS - PROVENANCE_SELECTORS
+MODEL_FORM_SELECTORS = FORM_SELECTORS - HOST_CREDENTIAL_SELECTORS - HOST_APPROVAL_SELECTORS - PROVENANCE_SELECTORS
 APPROVAL_CHECK_SELECTORS = {"#approval_verified"}
 CLICK_SELECTORS = {"#submit_btn"}
 LOGIN_BUTTON_SELECTOR = "#login_btn"
@@ -59,6 +60,7 @@ class BrowserTools:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.invoice: dict[str, Any] | None = None
         self.approval_token: str | None = None
+        self.logged_in = False
         self.vendor_rows: list[list[str]] = []
         self.write_submitted = False
         memory = (data_dir / "policies" / "company_memory.md").read_text(encoding="utf-8")
@@ -154,6 +156,7 @@ class BrowserTools:
         if "vendor_directory" in tables:
             self.vendor_rows = tables["vendor_directory"]
         current = urlparse(self.page.url)
+        self.logged_in = current.path != "/erp/login"
         alerts = [str(text)[:300] for text in extracted["alerts"]]
         alert = alerts[0] if alerts else None
         form_fields = extracted["fields"]
@@ -352,6 +355,17 @@ class BrowserTools:
             "next_step": hint,
         }
 
+    async def inject_approval_token(self, token: str) -> None:
+        """Fill the host-owned approval token and verification control immediately before submit."""
+        if not token:
+            raise ValueError("Approval required: call request_human_approval with invoice_number.")
+        if self.page is None or urlparse(self.page.url).path != "/erp/invoices/new":
+            path = urlparse(self.page.url).path if self.page else "unknown"
+            raise ValueError(f"Current page: {path}. Call browser_open with /erp/invoices/new first.")
+        self.approval_token = token
+        await self.page.locator("#approval_token").fill(token)
+        await self.page.locator("#approval_verified").check()
+
     async def _unsaved_form_warning(self, next_path: str) -> str | None:
         if self.page is None:
             return None
@@ -371,6 +385,8 @@ class BrowserTools:
     async def browser_fill(self, selector: str, value: str) -> dict[str, Any]:
         if selector in HOST_CREDENTIAL_SELECTORS:
             raise ValueError("Login credentials are host-managed. Call erp_login; credential selectors are not available to the model.")
+        if selector in HOST_APPROVAL_SELECTORS:
+            raise ValueError("Approval tokens are host-managed and are injected when the approved invoice is submitted.")
         if selector not in MODEL_FORM_SELECTORS:
             raise ValueError(f"Invalid ERP field. Allowed fields: {', '.join(sorted(MODEL_FORM_SELECTORS))}.")
         path = urlparse(self.page.url).path
@@ -382,11 +398,7 @@ class BrowserTools:
             raise ValueError("Read an invoice document before filling the ERP invoice form.")
 
         actual_value = value
-        if selector == "#approval_token":
-            if not self.approval_token or value != "[approved_token]":
-                raise ValueError("An approved runtime token is required for this field.")
-            actual_value = self.approval_token
-        elif selector == "#vendor_input":
+        if selector == "#vendor_input":
             if value != self.invoice["vendor"]:
                 legal = {row[2] for row in self.vendor_rows if len(row) >= 3}
                 if value not in legal:

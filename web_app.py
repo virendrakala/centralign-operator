@@ -385,13 +385,6 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
         if currency not in {"INR", "USD"}:
             return HTMLResponse(_invoice_form(values, "UI Validation Error: Currency must be INR or USD."), status_code=422)
         threshold = Decimal("50000") if currency == "INR" else Decimal("1000")
-        if amount > threshold:
-            approved = values.get("approval_verified") == "on" and manager.consume_approval_token(values.get("approval_token", ""), {
-                "invoice_number": values.get("invoice_number", "").strip(), "vendor": vendor,
-                "amount": f"{amount:.2f}", "currency": currency,
-            })
-            if not approved:
-                return HTMLResponse(_invoice_form(values, "UI Validation Error: Manager approval token must be verified before posting invoices above policy threshold."), status_code=422)
         invoice_number = values.get("invoice_number", "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{3,80}", invoice_number):
             return HTMLResponse(_invoice_form(values, "UI Validation Error: Enter a valid invoice number."), status_code=422)
@@ -407,6 +400,13 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
             "source_sha256": values.get("source_sha256", ""),
             "source_fields": {"vendor": vendor, "invoice_number": invoice_number, "invoice_date": invoice_date, "due_date": due_date, "amount": f"{amount:.2f}", "currency": currency},
         }
+        if amount > threshold:
+            approved = values.get("approval_verified") == "on" and manager.consume_approval_token(values.get("approval_token", ""), {
+                "invoice_number": invoice_number, "vendor": vendor,
+                "amount": f"{amount:.2f}", "currency": currency,
+            })
+            if not approved:
+                return HTMLResponse(_invoice_form(values, "UI Validation Error: Manager approval token must be verified before posting invoices above policy threshold."), status_code=422)
         result = company.create_bill(invoice)
         return RedirectResponse(f"/erp/ledger?posted={result['status']}", status_code=303)
 

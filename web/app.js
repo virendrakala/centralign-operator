@@ -22,7 +22,7 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", verification: "Independent ledger verification", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
@@ -30,6 +30,13 @@ function eventSummary(event) {
   if (event.event_type === "credentials_supplied") return p.message || "ERP login credentials are supplied by the host and never exposed to the model.";
   if (event.event_type === "provenance_attached") return p.message || `Host attached source provenance for ${p.invoice_number || "the selected invoice"}.`;
   if (event.event_type === "tool_retry_budget") return `${p.consecutive_identical_failures}/${p.limit} consecutive identical failures for ${p.tool}. Last error: ${p.error}`;
+  if (event.event_type === "approval_token_injected") return p.message || `Host injected approval for ${p.invoice_number}.`;
+  if (event.event_type === "host_run_state") {
+    const invoice = p.selected_invoice;
+    return [p.logged_in ? "logged in" : "not logged in", invoice ? `invoice ${invoice.invoice_number} · ${invoice.amount} ${invoice.currency}` : "no invoice selected", `approval ${p.approval_status}`, `form ${p.form_status}`, p.legal_vendor ? `vendor ${p.legal_vendor}` : "", p.last_erp_alert ? `alert: ${p.last_erp_alert}` : ""].filter(Boolean).join(" · ");
+  }
+  if (event.event_type === "prompt_size") return `Approx. ${p.approx_tokens} tokens (${p.approx_characters} serialized characters; estimate). Without injected run state: ${p.without_run_state_tokens} tokens.`;
+  if (event.event_type === "prompt_size_summary") return `Average ${p.average_tokens_with_run_state} tokens/turn with run state; ${p.average_tokens_without_run_state} without it, across ${p.turns} turns (estimate).`;
   if (event.event_type === "thought" || event.event_type === "self_correction") return p.text || "";
   if (event.event_type === "action") {
     if (p.tool === "list_files") return "List the available invoice sources and procurement policy.";
@@ -49,6 +56,8 @@ function eventSummary(event) {
   }
   if (event.event_type === "observation") {
     if (p.message) return p.warning ? `${p.message} ${p.warning}` : p.message;
+    if (p.approval_hint) return p.approval_hint;
+    if (p.next_step) return p.next_step;
     if (p.alert) return `ERP alert: ${p.alert}`;
     if (p.session_required) return p.session_required;
     if (p.warning) return p.warning;
@@ -82,7 +91,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "loop_guard_warning", "verification", "provenance_attached", "tool_retry_budget", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "loop_guard_warning", "verification", "provenance_attached", "tool_retry_budget", "approval_token_injected", "host_run_state", "prompt_size", "prompt_size_summary", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);

@@ -53,6 +53,8 @@ Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments
 
 Invoice write tools report required form fields as filled or empty and give the next action when the form is ready. The model selects a source document by its extracted contents and may include the `read_document` path when copies are ambiguous; the host attaches that document's filename and SHA-256 to the ERP form and trace. A ledger check with no matching row reports whether a submit occurred and includes a recovery instruction. Three consecutive failures with the same tool, arguments, and error stop the run with `needs_input`; a different failure or a successful tool call resets that counter. The final summary states which parts of the invoice task were completed.
 
+The host keeps approval tokens bound to the selected invoice and injects the token plus the verification checkbox immediately before submit. `#approval_token` is not available to model fill tools. If the policy gate is still pending, the run state and form feedback tell the model to call `request_human_approval` with the invoice number. Approval requests identify a single invoice by number or read-document path; ambiguous requests list the invoice candidates. An already-approved invoice returns `already_approved` without opening another human approval request. The model receives a compact `host_run_state` observation on every turn, and the trace records that state plus approximate prompt size for the turn. The final trace event compares average prompt estimates with and without the injected state; token counts use serialized characters divided by four and are approximate.
+
 Groq (default model `llama-3.3-70b-versatile`):
 
 ```bash

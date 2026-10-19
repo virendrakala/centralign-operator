@@ -315,9 +315,12 @@ class AgentLoopUnitTests(unittest.TestCase):
             def __init__(self):
                 self.step = 0
                 self.verify_message = None
+                self.run_states = []
 
             def next_tool_call(self, _task, observations, _tools):
                 self.step += 1
+                state = next(item["result"] for item in observations if item.get("tool") == "host_run_state")
+                self.run_states.append(state)
                 if self.step == 1:
                     return ToolCall("browser_fill_form", {"fields": [
                         {"selector": "#invoice_number_input", "value": invoice["invoice_number"]},
@@ -360,17 +363,23 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         with TemporaryDirectory(prefix="centralign-no-submit-verify-") as temp_dir:
             client = FakeSequence()
-            loop = AgentLoop(Path(temp_dir), "no-submit", "record Acme invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            events = []
+            loop = AgentLoop(Path(temp_dir), "no-submit", "record Acme invoice", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=client)
             loop.browser = StubBrowser()
             loop.documents["inbox/invoice.txt"] = {"path": "inbox/invoice.txt", "invoice": invoice}
             status, summary = asyncio.run(loop.run())
 
-        self.assertEqual(status, "needs_input")
+        self.assertEqual(status, "needs_input", summary)
         expected = "No ledger row was found. No submit was performed. Open /erp/invoices/new, fill, click #submit_btn."
         self.assertEqual(client.verify_message, expected)
         self.assertIn(expected, summary)
         self.assertIn("Navigating away will discard unsaved form fields", json.dumps(loop.observations))
         self.assertFalse(loop.submit_performed)
+        self.assertEqual(len(client.run_states), client.step)
+        self.assertTrue(all({"logged_in", "selected_invoice", "legal_vendor", "approval_status", "form_status", "last_erp_alert"} <= state.keys() for state in client.run_states))
+        self.assertEqual(len([1 for kind, _ in events if kind == "prompt_size"]), client.step)
+        prompt_summary = next(payload for kind, payload in events if kind == "prompt_size_summary")
+        self.assertGreater(prompt_summary["average_tokens_with_run_state"], prompt_summary["average_tokens_without_run_state"])
 
     def test_fake_llm_wrong_page_fill_returns_navigation_hint_and_retry_budget_is_consecutive(self) -> None:
         exact_error = "Current page: /erp/ledger. Call browser_open with /erp/invoices/new first."
@@ -400,7 +409,7 @@ class AgentLoopUnitTests(unittest.TestCase):
             loop.browser.close = unittest.mock.AsyncMock()
             status, summary = asyncio.run(loop.run())
 
-        self.assertEqual(status, "needs_input")
+        self.assertEqual(status, "needs_input", summary)
         self.assertIn(exact_error, summary)
         self.assertIn("Not done: invoice selection, invoice submission, ledger read-back verification", summary)
         retry_events = [payload for kind, payload in events if kind == "tool_retry_budget"]
@@ -416,6 +425,100 @@ class AgentLoopUnitTests(unittest.TestCase):
             self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "different error"))
             self.assertTrue(loop._record_tool_failure("browser_fill", arguments, "different error"))
 
+    def test_approval_token_is_host_injected_and_survives_a_rejected_submit(self) -> None:
+        invoice = {
+            "vendor": "Acme Analytics", "canonical_vendor": "Acme Analytics Pvt Ltd",
+            "invoice_number": "INV-APPROVAL-1", "invoice_date": "2026-10-01",
+            "due_date": "2026-11-01", "amount": "60000.00", "currency": "INR",
+            "source_file": "invoice.txt", "source_sha256": "b" * 64,
+        }
+
+        class StubBrowser:
+            vendor_rows = [["ACM", "Acme Analytics", "Acme Analytics Pvt Ltd", "Approved"]]
+
+            def __init__(self):
+                self.injected = []
+                self.clicks = 0
+
+            async def inject_approval_token(self, token):
+                self.injected.append(token)
+
+            async def browser_click(self, _selector):
+                self.clicks += 1
+                alert = "UI Validation Error: Manager approval token must be verified before posting invoices above policy threshold." if self.clicks == 1 else None
+                return {"status": "clicked", "snapshot": {"alert": alert}}
+
+        with TemporaryDirectory(prefix="centralign-host-approval-token-") as temp_dir:
+            events = []
+            loop = AgentLoop(Path(temp_dir), "approval-token", "submit approved invoice", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, approval_mode="always_gate", offline=True)
+            browser = StubBrowser()
+            loop.browser = browser
+            loop.selected_invoice = invoice
+            loop.selected_invoice_path = "inbox/invoice.txt"
+            loop.approval_tokens["inbox/invoice.txt"] = "APR-SECRET-TOKEN"
+            loop.policy = {"approved_vendors": ["Acme Analytics Pvt Ltd"], "thresholds": {"INR": "50000.00"}}
+            loop.duplicate_checked = True
+            first = asyncio.run(loop._execute("browser_click", {"selector": "#submit_btn"}))
+            self.assertIn("Manager approval token must be verified", first["snapshot"]["alert"])
+            self.assertEqual(loop.approval_tokens["inbox/invoice.txt"], "APR-SECRET-TOKEN")
+            second = asyncio.run(loop._execute("browser_click", {"selector": "#submit_btn"}))
+
+        self.assertEqual(second["status"], "clicked")
+        self.assertEqual(browser.injected, ["APR-SECRET-TOKEN", "APR-SECRET-TOKEN"])
+        injection_events = [payload for kind, payload in events if kind == "approval_token_injected"]
+        self.assertEqual(len(injection_events), 2)
+        self.assertNotIn("APR-SECRET-TOKEN", json.dumps(injection_events))
+        token_schema = TOOL_BY_NAME["browser_fill"]["parameters"]["properties"]["selector"]["enum"]
+        self.assertNotIn("#approval_token", token_schema)
+        self.assertNotIn("#approval_token", TOOL_BY_NAME["browser_fill_form"]["parameters"]["properties"]["fields"]["items"]["properties"]["selector"]["enum"])
+
+    def test_approval_ambiguity_lists_read_invoices_and_repeat_returns_already_approved(self) -> None:
+        invoices = {
+            path: {"path": path, "invoice": {
+                "vendor": "Acme Analytics", "invoice_number": "INV-DUP",
+                "invoice_date": "2026-10-01", "due_date": "2026-11-01",
+                "amount": amount, "currency": "INR", "source_file": path,
+                "source_sha256": "c" * 64,
+            }}
+            for path, amount in (("inbox/one.txt", "60000.00"), ("inbox/two.txt", "61000.00"))
+        }
+
+        class StubBrowser:
+            vendor_rows = [["ACM", "Acme Analytics", "Acme Analytics Pvt Ltd", "Approved"]]
+
+            def set_invoice(self, _invoice):
+                pass
+
+        with TemporaryDirectory(prefix="centralign-approval-ambiguity-") as temp_dir:
+            handler = unittest.mock.AsyncMock(return_value="APR-SHOULD-NOT-BE-MINTED")
+            loop = AgentLoop(Path(temp_dir), "approval-target", "approve invoice", "http://127.0.0.1:8765", lambda *_: None, handler, approval_mode="always_gate", offline=True)
+            loop.browser = StubBrowser()
+            loop.policy = {"approved_vendors": ["Acme Analytics Pvt Ltd"], "thresholds": {"INR": "50000.00"}}
+            loop.documents = invoices
+            with self.assertRaises(ValueError) as ambiguous:
+                asyncio.run(loop._execute("request_human_approval", {"invoice_number": "INV-DUP", "canonical_vendor": "Acme Analytics Pvt Ltd"}))
+            message = str(ambiguous.exception)
+            self.assertIn("INV-DUP | inbox/one.txt | INR 60000.00", message)
+            self.assertIn("INV-DUP | inbox/two.txt | INR 61000.00", message)
+            handler.assert_not_awaited()
+
+            loop.documents = {"inbox/one.txt": invoices["inbox/one.txt"]}
+            loop.approval_tokens["inbox/one.txt"] = "APR-ALREADY"
+            result = asyncio.run(loop._execute("request_human_approval", {"invoice_number": "INV-DUP"}))
+
+        self.assertEqual(result["status"], "already_approved")
+        handler.assert_not_awaited()
+
+    def test_approval_form_hint_names_invoice_number(self) -> None:
+        with TemporaryDirectory(prefix="centralign-approval-hint-") as temp_dir:
+            loop = AgentLoop(Path(temp_dir), "approval-hint", "task", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, approval_mode="always_gate", offline=True)
+            loop.selected_invoice = {"invoice_number": "INV-HINT", "amount": "70000.00", "currency": "INR"}
+            loop.selected_invoice_path = "inbox/hint.txt"
+            loop.policy = {"thresholds": {"INR": "50000.00"}}
+            snapshot = {"url_path": "/erp/invoices/new", "form_fields": [{"selector": "#amount_input", "state": "filled", "required": True}]}
+            state = loop._form_state(snapshot)
+        self.assertEqual(state["next_step"], "Approval required: call request_human_approval with invoice_number INV-HINT.")
+
     def test_login_credentials_are_absent_from_model_fill_schemas(self) -> None:
         for tool_name in ("browser_fill",):
             schema = TOOL_BY_NAME[tool_name]["parameters"]["properties"]["selector"]
@@ -424,6 +527,8 @@ class AgentLoopUnitTests(unittest.TestCase):
         batch_schema = TOOL_BY_NAME["browser_fill_form"]["parameters"]["properties"]["fields"]["items"]["properties"]["selector"]
         self.assertNotIn("#email_input", batch_schema["enum"])
         self.assertNotIn("#password_input", batch_schema["enum"])
+        self.assertNotIn("#approval_token", schema["enum"])
+        self.assertNotIn("#approval_token", batch_schema["enum"])
         self.assertNotIn("#login_btn", TOOL_BY_NAME["browser_click"]["parameters"]["properties"]["selector"]["enum"])
         self.assertIn("erp_login", TOOL_BY_NAME)
         self.assertIn("host", TOOL_BY_NAME["erp_login"]["description"].casefold())
@@ -449,8 +554,9 @@ class AgentLoopUnitTests(unittest.TestCase):
                 for index in range(10)
             ]
             compact = loop._conversation_observations()
-            self.assertEqual(len(compact), 1 + 6)
-            summaries = compact[0]["result"]["summaries"]
+            self.assertEqual(len(compact), 2 + 6)
+            self.assertEqual(compact[0]["tool"], "host_run_state")
+            summaries = compact[1]["result"]["summaries"]
             self.assertEqual(len(summaries), 4)
             self.assertTrue(all("\\n" not in line and len(line) <= 240 for line in summaries))
             self.assertNotIn("long invoice body", json.dumps(summaries))
@@ -836,7 +942,7 @@ class AgentLoopUnitTests(unittest.TestCase):
                 }
                 loop.selected_invoice = invoice
                 loop.policy = await asyncio.to_thread(loop.company.read_company_policy)
-                with self.assertRaisesRegex(ValueError, "approval is required before opening"):
+                with self.assertRaisesRegex(ValueError, "Approval required: call request_human_approval"):
                     await loop._execute("browser_open", {"path": "/erp/invoices/new"})
 
             asyncio.run(check_guards())
@@ -983,9 +1089,15 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertNotIn("source_sha256", json.dumps(read_observation))
                 self.assertTrue(any(action.get("tool") == "browser_fill_form" for action in actions))
                 self.assertFalse(any(selector in {"#source_file_input", "#source_sha256_input"} for action in actions if action.get("tool") == "browser_fill_form" for selector in [field.get("selector") for field in action.get("fields", [])]))
-                fill_sequence = next(action for action in actions if action.get("tool") == "browser_action_sequence")
-                self.assertTrue(all(item.get("tool") in {"browser_fill", "browser_check", "browser_fill_form"} for item in fill_sequence["actions"]))
-                self.assertFalse(any(item.get("tool") == "browser_click" for item in fill_sequence["actions"]))
+                self.assertFalse(any(action.get("selector") == "#approval_token" for action in actions))
+                token_injection = next(event["payload"] for event in first_run["events"] if event["event_type"] == "approval_token_injected")
+                self.assertIn("Host injected the approved token", token_injection["message"])
+                self.assertNotIn("APR-", json.dumps(token_injection))
+                run_states = [event["payload"] for event in first_run["events"] if event["event_type"] == "host_run_state"]
+                self.assertTrue(run_states)
+                self.assertTrue(all({"logged_in", "selected_invoice", "legal_vendor", "approval_status", "form_status", "last_erp_alert"} <= state.keys() for state in run_states))
+                prompt_summary = next(event["payload"] for event in first_run["events"] if event["event_type"] == "prompt_size_summary")
+                self.assertGreater(prompt_summary["average_tokens_with_run_state"], prompt_summary["average_tokens_without_run_state"])
                 verification = next(event["payload"] for event in first_run["events"] if event["event_type"] == "verification")
                 self.assertEqual(verification["status"], "verified")
                 self.assertTrue(all(verification["matches"].values()))

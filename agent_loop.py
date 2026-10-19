@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -12,7 +13,7 @@ from urllib.parse import urlparse
 from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, MODEL_FORM_SELECTORS, BrowserTools
 from company_app import CompanyApp
 from documents import list_workspace_files, read_document
-from llm_clients import LLMClient, ProviderRequestError, ToolCall, make_client
+from llm_clients import LLMClient, ProviderRequestError, SYSTEM_INSTRUCTIONS, ToolCall, make_client
 from policy import approval_required
 
 
@@ -28,19 +29,19 @@ _ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {"name": "list_files", "description": "List invoice sources and the procurement policy available to this run.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "read_document", "description": "Read an allowed invoice document and inspect its extracted text and fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "read_policy", "description": "Read the procurement policy and parsed approval/vendor rules before deciding on a write.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_open", "description": "Open one of the local ERP pages. The result warns if navigating away discards unsaved form fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
-    {"name": "erp_login", "description": "Sign in to the local ERP using credentials supplied by the host from company memory. The host fills and submits the form and returns success/failure, landing page, and any alert. Never ask for or handle credentials.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
-    {"name": "browser_snapshot", "description": "Inspect the current ERP page. Snapshots include URL path, page title, all visible alerts, form field empty/filled state, buttons, and capped table rows without secret values. If the page says Session required: call erp_login, use that tool.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_fill", "description": "Fill an allowlisted invoice form field using source data, an observed vendor row, or a host approval placeholder. Login credentials are not model-accessible; use erp_login.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowed non-credential ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
-    {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice form fields; credential fields are not available. Use erp_login for sign-in.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowed non-credential ERP form field selector."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
+    {"name": "list_files", "description": "List invoice and policy files.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "read_document", "description": "Read a listed invoice and extract its fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "read_policy", "description": "Read AP rules and approval thresholds.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "browser_open", "description": "Open an allowed ERP route; warns about unsaved form fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
+    {"name": "erp_login", "description": "Host signs in using company memory and returns the landing page and alert.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+    {"name": "browser_snapshot", "description": "Inspect URL, title, alerts, field states, buttons, and table rows. Secrets are redacted.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "browser_fill", "description": "Fill one allowlisted invoice field with source data or an observed vendor.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowlisted invoice field."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
+    {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice fields.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowlisted invoice field."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
     {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
-    {"name": "browser_check", "description": "Check the manager-approval confirmation control after approval has been granted.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "browser_click", "description": "Click the invoice-submit control after host preconditions pass. Login is performed only with erp_login.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "request_human_approval", "description": "Pause and request approval for the selected invoice when procurement policy requires it. Identify the document by its invoice content; the host attaches source_file and SHA-256 provenance.", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "extracted_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional path returned by read_document to disambiguate identical invoice content."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "canonical_vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["reason", "extracted_fields"]}},
-    {"name": "verify_ledger_row", "description": "Read a matching ERP ledger row from the live DOM and compare it to the selected source document. Identify it by invoice content; the host attaches source_file and SHA-256 provenance.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional path returned by read_document to disambiguate identical invoice content."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["invoice_number", "expected_fields"]}},
+    {"name": "browser_check", "description": "Check the approval confirmation control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
+    {"name": "browser_click", "description": "Click the invoice submit control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
+    {"name": "request_human_approval", "description": "Request policy approval by invoice_number or read_document path. Include canonical_vendor from the observed directory when needed. The host injects source provenance and the approved token.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}}, "required": [], "additionalProperties": False}},
+    {"name": "verify_ledger_row", "description": "Read back the selected invoice from the ERP ledger and compare its fields.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional read_document path to disambiguate."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["invoice_number", "expected_fields"]}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
 ]
 TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
@@ -89,7 +90,11 @@ class AgentLoop:
         self.documents: dict[str, dict[str, Any]] = {}
         self.policy: dict[str, Any] | None = None
         self.selected_invoice: dict[str, Any] | None = None
-        self.approval_granted = False
+        self.selected_invoice_path: str | None = None
+        self.approval_tokens: dict[str, str] = {}
+        self.denied_invoices: set[str] = set()
+        self.prompt_tokens_before: list[int] = []
+        self.prompt_tokens_after: list[int] = []
         self.duplicate_checked = False
         self.duplicate_present = False
         self.verification: dict[str, Any] | None = None
@@ -107,20 +112,106 @@ class AgentLoop:
         safe_args = self._redact_arguments(call.name, call.arguments)
         self.emit("action", {"tool": call.name, **safe_args})
 
-    def _conversation_observations(self) -> list[dict[str, Any]]:
+    def _conversation_observations(self, run_state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Keep recent observations intact and compress earlier context to one-line summaries."""
         if getattr(self.client, "name", "") == "offline-replay":
             # FakeLLM is deterministic local replay, not a token-billed conversation model.
-            return self.observations
-        if len(self.observations) <= FULL_OBSERVATIONS_TO_KEEP:
-            return self.observations
-        older = self.observations[:-FULL_OBSERVATIONS_TO_KEEP]
-        summaries = [self._observation_one_line(item) for item in older]
-        return [{
-            "tool": "history_summary",
-            "arguments": {},
-            "result": {"summaries": summaries},
-        }, *self.observations[-FULL_OBSERVATIONS_TO_KEEP:]]
+            recent = self.observations
+        elif len(self.observations) <= FULL_OBSERVATIONS_TO_KEEP:
+            recent = self.observations
+        else:
+            older = self.observations[:-FULL_OBSERVATIONS_TO_KEEP]
+            summaries = [self._observation_one_line(item) for item in older]
+            recent = [{
+                "tool": "history_summary",
+                "arguments": {},
+                "result": {"summaries": summaries},
+            }, *self.observations[-FULL_OBSERVATIONS_TO_KEEP:]]
+        state = run_state or self._host_run_state()
+        return [{"tool": "host_run_state", "arguments": {}, "result": state}, *recent]
+
+    def _invoice_key(self) -> str | None:
+        return self.selected_invoice_path or (str(self.selected_invoice.get("source_file")) if self.selected_invoice else None)
+
+    def _invoice_is_approved(self) -> bool:
+        key = self._invoice_key()
+        return bool(key and key in self.approval_tokens)
+
+    def _host_run_state(self) -> dict[str, Any]:
+        snapshot = self._last_page_snapshot or {}
+        page_path = str(snapshot.get("url_path") or urlparse(str(snapshot.get("url", ""))).path)
+        invoice = self.selected_invoice or {}
+        selected = None
+        if invoice:
+            selected = {
+                "invoice_number": invoice.get("invoice_number"),
+                "document_path": self.selected_invoice_path,
+                "amount": invoice.get("amount"),
+                "currency": invoice.get("currency"),
+                "invoice_date": invoice.get("invoice_date"),
+                "due_date": invoice.get("due_date"),
+            }
+        legal_vendor = invoice.get("canonical_vendor")
+        observed_vendors = {row[2] for row in getattr(self.browser, "vendor_rows", []) if len(row) >= 3}
+        if legal_vendor not in observed_vendors:
+            legal_vendor = None
+        if not invoice:
+            approval_status = "not_selected"
+        elif self._invoice_is_approved():
+            approval_status = "approved"
+        elif self._invoice_key() in self.denied_invoices:
+            approval_status = "denied"
+        elif not self.policy:
+            approval_status = "policy_not_read"
+        else:
+            approval_status = "required" if self._needs_approval() else "not_required"
+        fields = snapshot.get("form_fields", [])
+        form_filled = any(isinstance(field, dict) and field.get("state") == "filled" for field in fields)
+        if self.submit_performed:
+            form_status = "submitted"
+        elif page_path == "/erp/invoices/new" and form_filled:
+            form_status = "filled"
+        else:
+            form_status = "empty"
+        alerts = snapshot.get("alerts") or ([snapshot.get("alert")] if snapshot.get("alert") else [])
+        approval_hint = None
+        if approval_status == "required":
+            approval_hint = f"Approval required: call request_human_approval with invoice_number {invoice['invoice_number']}."
+        return {
+            "logged_in": bool(getattr(self.browser, "logged_in", False)),
+            "selected_invoice": selected,
+            "legal_vendor": legal_vendor,
+            "approval_status": approval_status,
+            "approval_hint": approval_hint,
+            "form_status": form_status,
+            "last_erp_alert": str(alerts[-1])[:300] if alerts else None,
+        }
+
+    def _form_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        state = self.browser.describe_form_state(snapshot)
+        invoice = self.selected_invoice
+        if (
+            invoice and state["current_page"] == "/erp/invoices/new"
+            and self.policy and self._needs_approval() and not self._invoice_is_approved()
+        ):
+            state["approval_required"] = True
+            state["next_step"] = (
+                "Approval required: call request_human_approval with invoice_number "
+                f"{invoice['invoice_number']}."
+            )
+        else:
+            state["approval_required"] = False
+        return state
+
+    def _estimate_prompt_tokens(self, observations: list[dict[str, Any]]) -> tuple[int, int]:
+        prompt = {
+            "system": SYSTEM_INSTRUCTIONS,
+            "task": self.task,
+            "tools": TOOL_DEFINITIONS,
+            "observations": observations,
+        }
+        chars = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
+        return chars, math.ceil(chars / 4)
 
     @staticmethod
     def _observation_one_line(item: dict[str, Any]) -> str:
@@ -294,24 +385,35 @@ class AgentLoop:
         invoice_number = str(fields.get("invoice_number", ""))
         document_path = str(fields.get("document_path", ""))
         candidates = [
-            document["invoice"] for document in self.documents.values()
+            (path, document["invoice"]) for path, document in self.documents.items()
             if document.get("invoice")
             and document["invoice"]["invoice_number"] == invoice_number
             and all(
                 key not in fields or str(fields[key]) == str(document["invoice"][key])
                 for key in ("vendor", "invoice_date", "due_date", "amount", "currency")
             )
-            and (not document_path or str(document.get("path", "")) == document_path)
+            and (not document_path or path == document_path)
         ]
         if len(candidates) != 1:
             raise ValueError("Select one read invoice by its content; include its read_document path if identical documents are ambiguous.")
-        invoice = candidates[0]
+        self.selected_invoice_path, invoice = candidates[0]
         for key in ("vendor", "invoice_date", "due_date", "amount", "currency"):
             if str(fields.get(key, "")) != str(invoice[key]):
                 raise ValueError(f"{key.replace('_', ' ')} must match the selected source document.")
         self.selected_invoice = invoice
         self.browser.set_invoice(invoice)
         return invoice
+
+    def _read_invoice_candidates(self) -> str:
+        items = []
+        for path, document in self.documents.items():
+            invoice = document.get("invoice")
+            if invoice:
+                items.append(
+                    f"{invoice.get('invoice_number', '?')} | {path} | "
+                    f"{invoice.get('currency', '')} {invoice.get('amount', '')}".strip()
+                )
+        return "Invoices read so far (number | path | amount): " + ("; ".join(items) if items else "none") + "."
 
     def _validate_vendor_evidence(self, legal_vendor: str) -> None:
         observed = {row[2] for row in self.browser.vendor_rows if len(row) >= 3}
@@ -350,11 +452,17 @@ class AgentLoop:
             return {"status": "read", "policy": result}
         if name == "browser_open":
             path = _clean_text(arguments.get("path"), 100)
-            if path == "/erp/invoices/new" and self.selected_invoice and self._needs_approval() and not self.approval_granted:
-                raise ValueError("Procurement approval is required before opening the invoice write form.")
+            if path == "/erp/invoices/new" and self.selected_invoice and self._needs_approval() and not self._invoice_is_approved():
+                raise ValueError(
+                    "Approval required: call request_human_approval with invoice_number "
+                    f"{self.selected_invoice['invoice_number']}."
+                )
             if path == "/erp/invoices/new" and self.selected_invoice:
                 self.browser.set_invoice(self.selected_invoice)
             result = await self.browser.browser_open(path)
+            if result.get("snapshot") and path == "/erp/invoices/new":
+                result["form_state"] = self._form_state(result["snapshot"])
+                result["next_step"] = result["form_state"]["next_step"]
             if result.get("provenance_attached") and self.selected_invoice:
                 invoice = self.selected_invoice
                 document_path = next((doc_path for doc_path, doc in self.documents.items() if doc.get("invoice") is invoice), "")
@@ -372,7 +480,15 @@ class AgentLoop:
             })
             return await self.browser.erp_login()
         if name == "browser_snapshot":
-            return await self.browser.browser_snapshot()
+            result = await self.browser.browser_snapshot()
+            if self.selected_invoice and self.policy and self._needs_approval() and not self._invoice_is_approved():
+                result["approval_hint"] = (
+                    "Approval required: call request_human_approval with invoice_number "
+                    f"{self.selected_invoice['invoice_number']}."
+                )
+                if result.get("snapshot"):
+                    result["snapshot"]["approval_hint"] = result["approval_hint"]
+            return result
         if name == "browser_fill":
             selector = _clean_text(arguments.get("selector"), 80)
             try:
@@ -382,7 +498,7 @@ class AgentLoop:
             if include_snapshot:
                 snapshot = await self.browser.compact_snapshot("locator.fill", selector)
                 result["snapshot"] = snapshot
-                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["form_state"] = self._form_state(snapshot)
                 result["next_step"] = result["form_state"]["next_step"]
             return result
         if name == "browser_fill_form":
@@ -427,7 +543,7 @@ class AgentLoop:
                 snapshot = await self.browser.compact_snapshot("browser_fill_form")
                 result["alert"] = alert or snapshot.get("alert")
                 result["snapshot"] = snapshot
-                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["form_state"] = self._form_state(snapshot)
                 result["next_step"] = result["form_state"]["next_step"]
             if error:
                 result["message"] = f"The form batch stopped at the first rejected field: {error}"
@@ -482,7 +598,7 @@ class AgentLoop:
                 "snapshot": snapshot,
             }
             if any(child.name in {"browser_fill", "browser_fill_form"} for child in validated_actions):
-                result["form_state"] = self.browser.describe_form_state(snapshot)
+                result["form_state"] = self._form_state(snapshot)
                 result["next_step"] = result["form_state"]["next_step"]
             if error:
                 result["message"] = f"The browser sequence stopped at the first rejected action: {error}."
@@ -506,10 +622,25 @@ class AgentLoop:
                     raise ValueError("The invoice is already present in the ERP ledger; duplicate submission is blocked.")
                 if not self._vendor_is_approved():
                     raise ValueError("The selected legal vendor is not approved by procurement policy.")
-                if self._needs_approval() and not self.approval_granted:
-                    raise ValueError("A human approval decision is required before this invoice can be submitted.")
+                if self._needs_approval() and not self._invoice_is_approved():
+                    raise ValueError(
+                        "Approval required: call request_human_approval with invoice_number "
+                        f"{self.selected_invoice['invoice_number']}."
+                    )
                 if self.submit_attempts >= MAX_SUBMIT_ATTEMPTS:
                     raise ValueError("The ERP submit retry limit has been reached.")
+                if self._needs_approval():
+                    token = self.approval_tokens.get(self._invoice_key() or "")
+                    if not token:
+                        raise ValueError(
+                            "Approval required: call request_human_approval with invoice_number "
+                            f"{self.selected_invoice['invoice_number']}."
+                        )
+                    await self.browser.inject_approval_token(token)
+                    self.emit("approval_token_injected", {
+                        "invoice_number": self.selected_invoice["invoice_number"],
+                        "message": "Host injected the approved token and checked the verification control immediately before submit.",
+                    })
                 self.submit_attempts += 1
             result = await self.browser.browser_click(selector)
             if selector == "#submit_btn":
@@ -524,13 +655,35 @@ class AgentLoop:
         if name == "request_human_approval":
             if not self.policy:
                 raise ValueError("Read procurement policy before requesting approval.")
-            fields = arguments.get("extracted_fields")
-            if not isinstance(fields, dict):
-                raise ValueError("Approval requires extracted invoice fields.")
-            invoice = self._invoice_by_fields(fields)
-            canonical = str(fields.get("canonical_vendor", ""))
-            self._validate_vendor_evidence(canonical)
-            invoice["canonical_vendor"] = canonical
+            invoice_number = _clean_text(arguments.get("invoice_number"), 100)
+            document_path = _clean_text(arguments.get("document_path"), 500)
+            if not invoice_number and not document_path:
+                raise ValueError("Provide invoice_number or document_path. " + self._read_invoice_candidates())
+            candidates = [
+                (path, document["invoice"]) for path, document in self.documents.items()
+                if document.get("invoice")
+                and (not invoice_number or document["invoice"].get("invoice_number") == invoice_number)
+                and (not document_path or path == document_path)
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "Approval target is missing or ambiguous. Include invoice_number or a unique document_path. "
+                    + self._read_invoice_candidates()
+                )
+            self.selected_invoice_path, invoice = candidates[0]
+            self.selected_invoice = invoice
+            invoice_key = self._invoice_key() or ""
+            self.browser.set_invoice(invoice)
+            if invoice_key in self.approval_tokens:
+                return {"status": "already_approved", "invoice_number": invoice["invoice_number"]}
+            canonical = _clean_text(arguments.get("canonical_vendor"), 200)
+            if not canonical and invoice.get("vendor") in {row[2] for row in self.browser.vendor_rows if len(row) >= 3}:
+                canonical = invoice["vendor"]
+            if canonical:
+                self._validate_vendor_evidence(canonical)
+                invoice["canonical_vendor"] = canonical
+            else:
+                raise ValueError("Choose canonical_vendor from the observed ERP vendor directory before approval.")
             required, reason = self._approval_required(invoice)
             if not required and self.approval_mode != "always_gate":
                 return {"status": "not_required", "reason": "The selected invoice is below its configured policy threshold."}
@@ -543,9 +696,12 @@ class AgentLoop:
                 "source_sha256": invoice["source_sha256"],
             }
             token = await self.approval_handler(payload)
-            self.approval_granted = bool(token)
+            if token:
+                self.approval_tokens[invoice_key] = str(token)
+                self.denied_invoices.discard(invoice_key)
+            else:
+                self.denied_invoices.add(invoice_key)
             self.browser.set_invoice(invoice)
-            self.browser.set_approval_token(token)
             return {"status": "approved" if token else "denied_or_timed_out", "invoice_number": invoice["invoice_number"]}
         if name == "verify_ledger_row":
             fields = arguments.get("expected_fields")
@@ -635,7 +791,7 @@ class AgentLoop:
             done.append(f"selected invoice {self.selected_invoice.get('invoice_number', '')}")
         else:
             not_done.append("invoice selection")
-        if self.approval_granted:
+        if self._invoice_is_approved():
             done.append("human approval")
         elif self._needs_approval():
             not_done.append("human approval")
@@ -665,7 +821,22 @@ class AgentLoop:
         try:
             for step in range(1, MAX_STEPS + 1):
                 try:
-                    call = await asyncio.to_thread(self.client.next_tool_call, self.task, self._conversation_observations(), TOOL_DEFINITIONS)
+                    run_state = self._host_run_state()
+                    turn_observations = self._conversation_observations(run_state)
+                    self.emit("host_run_state", {"turn": step, **run_state})
+                    baseline_chars, baseline_tokens = self._estimate_prompt_tokens(turn_observations[1:])
+                    prompt_chars, prompt_tokens = self._estimate_prompt_tokens(turn_observations)
+                    self.prompt_tokens_before.append(baseline_tokens)
+                    self.prompt_tokens_after.append(prompt_tokens)
+                    self.emit("prompt_size", {
+                        "turn": step,
+                        "approx_characters": prompt_chars,
+                        "approx_tokens": prompt_tokens,
+                        "without_run_state_characters": baseline_chars,
+                        "without_run_state_tokens": baseline_tokens,
+                        "token_heuristic": "serialized characters divided by four; estimate only",
+                    })
+                    call = await asyncio.to_thread(self.client.next_tool_call, self.task, turn_observations, TOOL_DEFINITIONS)
                 except ProviderRequestError as exc:
                     if not self._is_recoverable_provider_tool_error(exc):
                         provider_name = getattr(self.client, "name", type(self.client).__name__)
@@ -794,6 +965,13 @@ class AgentLoop:
                     return self.finished
             return "needs_review", f"The agent reached the {MAX_STEPS}-step limit without calling finish."
         finally:
+            if self.prompt_tokens_after:
+                self.emit("prompt_size_summary", {
+                    "turns": len(self.prompt_tokens_after),
+                    "average_tokens_without_run_state": round(sum(self.prompt_tokens_before) / len(self.prompt_tokens_before), 1),
+                    "average_tokens_with_run_state": round(sum(self.prompt_tokens_after) / len(self.prompt_tokens_after), 1),
+                    "token_heuristic": "serialized characters divided by four; estimate only",
+                })
             await self.browser.close()
 
     def _safe_validation_error(self, error: str, body: str) -> str:
