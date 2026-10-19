@@ -366,7 +366,6 @@ class RunManager:
 
     def _start_host_only_finish(self, run_id: str, status: str, summary: str, pending: dict[str, Any], not_done: list[str]) -> None:
         unique_not_done = list(dict.fromkeys(str(item) for item in not_done if str(item).strip()))
-        summary = f"{summary.rstrip()} Not done: {', '.join(unique_not_done) if unique_not_done else 'none'}."
         result = {
             "status": status,
             "summary": summary,

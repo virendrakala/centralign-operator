@@ -750,10 +750,16 @@ class AgentLoop:
                 continue
             action = str(item.get("action") or "requested action").strip()
             capability = item.get("capability")
+            verification_is_part_of_entry = bool(
+                verified
+                and self.task_intent.get("intent") == "write_invoice_entry"
+                and capability == "read_ledger"
+                and re.search(r"\b(?:verify|verification|check|confirm|validate|read.?back)\b", action, re.IGNORECASE)
+            )
             unperformed = (
                 capability == "unsupported"
                 or (capability == "enter_invoice" and not verified)
-                or (capability == "read_ledger" and self.read_ledger_rows is None)
+                or (capability == "read_ledger" and self.read_ledger_rows is None and not verification_is_part_of_entry)
                 or (capability == "list_candidates" and not self.candidate_listed)
             )
             if capability == "enter_invoice" and self.confirmed_pending_context.get("confirmed"):
@@ -832,7 +838,12 @@ class AgentLoop:
                 summary = "The invoice entry did not pass ledger verification."
 
         not_done = self._not_done_action_labels()
-        summary = self._with_not_done_line(summary, not_done)
+        # Needs-input summaries are the user-facing message; the UI renders the
+        # structured not-done actions in their own box for these results.
+        if status == "needs_input":
+            summary = re.sub(r"(?im)\s*Not done:\s*.*$", "", summary).rstrip()
+        else:
+            summary = self._with_not_done_line(summary, not_done)
         result = dict(self.final_result or {})
         result.update({
             "status": status,

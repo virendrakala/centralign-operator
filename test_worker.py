@@ -166,6 +166,9 @@ class AgentLoopUnitTests(unittest.TestCase):
             ["read_only", "write_invoice_entry", "unsupported", "ambiguous"],
         )
         action_schema = schema["properties"]["requested_actions"]
+        capability_description = action_schema["items"]["properties"]["capability"]["description"]
+        self.assertIn("verify/check/confirm the submitted invoice", capability_description)
+        self.assertIn("independent lookup", capability_description)
         self.assertEqual(
             action_schema["items"]["properties"]["capability"]["enum"],
             ["enter_invoice", "read_ledger", "list_candidates", "unsupported"],
@@ -347,7 +350,7 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertIn("I can record the invoice in the ledger", summary)
         self.assertIn("cannot make payments or send email", summary)
         self.assertIn("Would you like me to proceed with just recording it?", summary)
-        self.assertIn("Not done: pay, email vendor.", summary)
+        self.assertNotIn("Not done:", summary)
         self.assertEqual(bills, [])
         self.assertEqual(loop.final_result["not_done_actions"], ["pay", "email vendor"])
         self.assertEqual(loop.final_result["requested_actions"], [
@@ -453,7 +456,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input")
         self.assertIn("cannot send email", summary)
-        self.assertIn("Not done: record invoice, email vendor.", summary)
+        self.assertNotIn("Not done:", summary)
         self.assertFalse(loop.intent_guard_result["write_allowed"])
         self.assertEqual(loop.task_intent["intent"], "unsupported")
         loop.browser.start.assert_not_awaited()
@@ -481,7 +484,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input")
         self.assertIn("does not explicitly ask me to enter, record, post, or log", summary)
-        self.assertIn("Not done: record invoice.", summary)
+        self.assertNotIn("Not done:", summary)
         self.assertEqual(loop.task_intent["intent"], "ambiguous")
         self.assertFalse(loop.intent_guard_result["write_allowed"])
         loop.browser.start.assert_not_awaited()
@@ -507,6 +510,23 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertIn("Not done: record invoice.", summary)
         self.assertEqual(loop.final_result["not_done_actions"], ["record invoice"])
         self.assertTrue(any(kind == "final_result" for kind, _ in events))
+
+    def test_verified_write_satisfies_misclassified_ledger_verification_action(self) -> None:
+        task = "Find the latest invoice from Acme, check policy compliance, enter it into the ERP portal, and verify it in the ledger"
+        with TemporaryDirectory(prefix="centralign-verify-action-not-done-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "verify-action-not-done", task, "http://127.0.0.1:8765",
+                lambda *_: None, lambda *_: None, client=FakeLLM(),
+            )
+            loop.task_intent = {
+                "intent": "write_invoice_entry",
+                "requested_actions": [
+                    {"action": "enter invoice in the ledger", "capability": "enter_invoice"},
+                    {"action": "verify it in the ledger", "capability": "read_ledger"},
+                ],
+            }
+            loop.verification = {"status": "verified", "pass": True}
+            self.assertEqual(loop._not_done_action_labels(), [])
 
     def test_prompt_injection_is_flagged_removed_and_cannot_override_parsed_amount(self) -> None:
         with TemporaryDirectory(prefix="centralign-injected-invoice-") as temp_dir:
@@ -901,7 +921,7 @@ class AgentLoopUnitTests(unittest.TestCase):
             })
             manager.event("prior-question", "final_result", {
                 "status": "needs_input",
-                "summary": "I can record the invoice in the ledger, but cannot make payments or send email. Would you like me to proceed with just recording it? Not done: pay, email vendor.",
+                "summary": "I can record the invoice in the ledger, but cannot make payments or send email. Would you like me to proceed with just recording it?",
             })
             manager._save_pending_question("ui-session", "prior-question", "Pay the Northstar invoice and email the vendor", "needs_input")
             pending = manager._pending_question_contexts["ui-session"]
@@ -975,7 +995,9 @@ class AgentLoopUnitTests(unittest.TestCase):
                 canceled = manager.get_run(cancel_id)
                 self.assertEqual(canceled["status"], "stopped_by_user")
                 self.assertIn("Canceled the proposal", canceled["summary"])
-                self.assertIn("Not done: pay, email vendor.", canceled["summary"])
+                self.assertNotIn("Not done:", canceled["summary"])
+                canceled_result = next(event["payload"] for event in canceled["events"] if event["event_type"] == "final_result")
+                self.assertEqual(canceled_result["not_done_actions"], ["pay", "email vendor"])
 
                 manager._pending_question_contexts["session"] = {
                     "original_task": "Prior request", "vendor": "Northstar", "proposed_reduced_action": "enter_invoice",
@@ -1375,7 +1397,8 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input", summary)
         self.assertIn(exact_error, summary)
-        self.assertIn("Not done: record invoice.", summary)
+        self.assertNotIn("Not done:", summary)
+        self.assertEqual(loop.final_result["not_done_actions"], ["record invoice"])
         retry_events = [payload for kind, payload in events if kind == "tool_retry_budget"]
         self.assertEqual([event["failure_count"] for event in retry_events], [1, 2, 3, 4])
         self.assertEqual(retry_events[-1]["limit"], 4)
@@ -2138,6 +2161,7 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 intent_event = next(event["payload"] for event in first_run["events"] if event["event_type"] == "task_intent")
                 self.assertEqual(intent_event["intent"], "write_invoice_entry")
                 self.assertIn({"action": "check policy compliance", "capability": "enter_invoice"}, intent_event["requested_actions"])
+                self.assertFalse(any(action["capability"] == "read_ledger" for action in intent_event["requested_actions"]))
                 self.assertTrue(any(event["event_type"] == "verification" and event["payload"].get("status") == "verified" for event in first_run["events"]))
                 self.assertTrue(any(event["event_type"] == "observation" and event["payload"].get("tool") == "read_policy" for event in first_run["events"]))
                 self.assertIn("replay", next(event["payload"]["mode"] for event in first_run["events"] if event["event_type"] == "planner"))
@@ -2175,6 +2199,8 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertTrue(Path(verification["screenshot_path"]).exists())
                 final_result = next(event["payload"] for event in first_run["events"] if event["event_type"] == "final_result")
                 self.assertEqual(final_result["status"], "complete")
+                self.assertIn("Not done: none.", final_result["summary"])
+                self.assertEqual(final_result["not_done_actions"], [])
                 self.assertEqual(final_result["evidence"]["ledger_row_id"], verification["ledger_row_id"])
                 self.assertEqual(final_result["evidence"]["approval_record"]["status"], "approved")
                 self.assertEqual(final_result["evidence"]["source_file"], verification["source_file"])
@@ -2208,13 +2234,14 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertIn(first_id, {run["id"] for run in history["runs"]})
 
                 # A repeat verifies the existing ERP row and does not post a second bill.
-                _, duplicate_start = json_request(base_url, "/api/runs", {
-                    "task": "Find the latest Acme invoice and record it in the ledger."
-                })
+                _, duplicate_start = json_request(base_url, "/api/runs", {"task": flagship_task})
                 duplicate = wait_for_run(base_url, duplicate_start["run_id"])
                 self.assertEqual(duplicate["status"], "complete", duplicate.get("summary"))
                 duplicate_evidence = next(event["payload"] for event in duplicate["events"] if event["event_type"] == "verification")
                 self.assertTrue(duplicate_evidence["already_present"])
+                duplicate_result = next(event["payload"] for event in duplicate["events"] if event["event_type"] == "final_result")
+                self.assertIn("Not done: none.", duplicate_result["summary"])
+                self.assertEqual(duplicate_result["not_done_actions"], [])
                 self.assertEqual(len(json_request(base_url, "/api/state")[1]["bills"]), 1)
 
                 # Declining a high-value Vertex invoice stops before opening the write form.
