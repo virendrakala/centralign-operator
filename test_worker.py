@@ -46,12 +46,13 @@ ROOT = Path(__file__).resolve().parent
 TERMINAL = {"complete", "needs_input", "needs_review", "stopped_by_user"}
 
 
-def _test_write_intent(_task: str, _vendors: list[dict[str, str]]) -> dict[str, str]:
+def _test_write_intent(_task: str, _vendors: list[dict[str, str]]) -> dict[str, Any]:
     """Explicit valid intent for injected planner test doubles that are not provider adapters."""
     return {
         "intent": "write_invoice_entry", "vendor_query": "Acme", "invoice_number": "",
         "selection_criterion": "other", "reason": "The test task selects an Acme invoice.",
         "clarifying_question": "",
+        "requested_actions": [{"action": "enter invoice in the ledger", "capability": "enter_invoice"}],
     }
 
 
@@ -136,6 +137,11 @@ class AgentLoopUnitTests(unittest.TestCase):
             schema["properties"]["intent"]["enum"],
             ["read_only", "write_invoice_entry", "unsupported", "ambiguous"],
         )
+        action_schema = schema["properties"]["requested_actions"]
+        self.assertEqual(
+            action_schema["items"]["properties"]["capability"]["enum"],
+            ["enter_invoice", "read_ledger", "list_candidates", "unsupported"],
+        )
         self.assertEqual(
             set(TOOL_BY_NAME["request_human_approval"]["parameters"]["required"]),
             {"selection_criterion", "selection_reason"},
@@ -148,7 +154,9 @@ class AgentLoopUnitTests(unittest.TestCase):
         classification = {
             "intent": "write_invoice_entry", "vendor_query": "Acme", "invoice_number": "",
             "selection_criterion": "latest_by_invoice_date", "reason": "The task requests the latest invoice.",
-            "clarifying_question": "",
+            "clarifying_question": "", "requested_actions": [
+                {"action": "record invoice in the ledger", "capability": "enter_invoice"},
+            ],
         }
         with patch("llm_clients._request", return_value={"output": [{
             "type": "function_call", "name": "classify_task_intent", "arguments": json.dumps(classification),
@@ -257,9 +265,28 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertEqual({tool["name"] for tool in loop._tools_for_intent()}, {"read_ledger", "finish"})
         self.assertFalse(any(event.get("tool") in {"browser_fill", "browser_click", "request_human_approval"} for event in loop.observations))
 
+    def test_candidate_listing_is_a_host_rendered_read_capability(self) -> None:
+        with TemporaryDirectory(prefix="centralign-list-candidates-read-") as temp_dir:
+            data_dir = Path(temp_dir)
+            ensure_operator_assets(data_dir)
+            loop = AgentLoop(
+                data_dir, "candidate-read", "List invoice candidates for Acme",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True,
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "complete")
+        self.assertIn("invoice candidate(s) for Acme", summary)
+        self.assertGreater(loop.final_result["candidate_answer"]["candidate_count"], 0)
+        self.assertEqual(loop.final_result["not_done_actions"], [])
+        self.assertEqual({tool["name"] for tool in loop._tools_for_intent()}, {"list_invoice_candidates", "finish"})
+        loop.browser.start.assert_not_awaited()
+
     def test_unsupported_ambiguous_and_unknown_vendor_stop_with_question_or_refusal(self) -> None:
         requests = [
-            ("Pay the Northstar invoice and email the vendor", "cannot pay invoices"),
+            ("Pay the Northstar invoice and email the vendor", "cannot make payments"),
             ("Enter the latest invoice", "Which vendor"),
             ("Enter the latest invoice from Mistral Systems", "couldn't identify"),
         ]
@@ -275,6 +302,129 @@ class AgentLoopUnitTests(unittest.TestCase):
                 self.assertEqual(status, "needs_input")
                 self.assertIn(expected.casefold(), summary.casefold())
                 loop.browser.start.assert_not_awaited()
+
+    def test_northstar_pay_and_email_request_is_blocked_and_lists_unperformed_actions(self) -> None:
+        with TemporaryDirectory(prefix="centralign-multi-action-unsupported-") as temp_dir:
+            events = []
+            loop = AgentLoop(
+                Path(temp_dir), "multi-action-unsupported", "Pay the Northstar invoice and email the vendor",
+                "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, offline=True,
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+            bills = loop.company.list_bills()
+
+        self.assertEqual(status, "needs_input")
+        self.assertIn("I can record the invoice in the ledger", summary)
+        self.assertIn("cannot make payments or send email", summary)
+        self.assertIn("Would you like me to proceed with just recording it?", summary)
+        self.assertIn("Not done: pay, email vendor.", summary)
+        self.assertEqual(bills, [])
+        self.assertEqual(loop.final_result["not_done_actions"], ["pay", "email vendor"])
+        self.assertEqual(loop.final_result["requested_actions"], [
+            {"action": "pay", "capability": "unsupported"},
+            {"action": "email vendor", "capability": "unsupported"},
+        ])
+        loop.browser.start.assert_not_awaited()
+        self.assertEqual({tool["name"] for tool in loop._tools_for_intent()}, {"finish"})
+        self.assertFalse(any(item.get("tool") in {"browser_fill", "browser_fill_form", "browser_click", "request_human_approval"} for item in loop.observations))
+        guard = next(payload for kind, payload in events if kind == "intent_guard")
+        self.assertEqual(guard["classifier_intent"], "unsupported")
+        self.assertFalse(guard["write_allowed"])
+
+    def test_explicit_enter_latest_acme_intent_passes_the_write_guard(self) -> None:
+        with TemporaryDirectory(prefix="centralign-write-intent-guard-") as temp_dir:
+            ensure_operator_assets(Path(temp_dir))
+            loop = AgentLoop(
+                Path(temp_dir), "write-intent-guard", "Enter the latest Acme invoice",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True,
+            )
+            intent = asyncio.run(loop._classify_task_intent())
+            loop.task_intent = intent
+
+        self.assertEqual(intent["intent"], "write_invoice_entry")
+        self.assertEqual(intent["requested_actions"][0]["capability"], "enter_invoice")
+        self.assertTrue(loop.intent_guard_result["explicit_entry_verb"])
+        self.assertTrue(loop.intent_guard_result["write_allowed"])
+        self.assertIn("browser_click", {tool["name"] for tool in loop._tools_for_intent()})
+
+    def test_enter_and_email_is_blocked_even_when_classifier_claims_write(self) -> None:
+        class WrongClassifierFake(FakeLLM):
+            def classify_task_intent(self, _task, _vendors):
+                return {
+                    "intent": "write_invoice_entry", "vendor_query": "Acme", "invoice_number": "",
+                    "selection_criterion": "latest_by_invoice_date", "reason": "Classified as a write.",
+                    "clarifying_question": "", "requested_actions": [
+                        {"action": "enter invoice in the ledger", "capability": "enter_invoice"},
+                    ],
+                }
+
+        with TemporaryDirectory(prefix="centralign-enter-email-guard-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "enter-email-guard", "Enter the latest Acme invoice and email the vendor",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=WrongClassifierFake(),
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_input")
+        self.assertIn("cannot send email", summary)
+        self.assertIn("Not done: enter invoice in the ledger, email vendor.", summary)
+        self.assertFalse(loop.intent_guard_result["write_allowed"])
+        self.assertEqual(loop.task_intent["intent"], "unsupported")
+        loop.browser.start.assert_not_awaited()
+
+    def test_host_guard_overrides_write_label_when_task_has_no_entry_verb(self) -> None:
+        class WrongClassifierFake(FakeLLM):
+            def classify_task_intent(self, _task, _vendors):
+                return {
+                    "intent": "write_invoice_entry", "vendor_query": "Northstar", "invoice_number": "",
+                    "selection_criterion": "latest_by_invoice_date", "reason": "Classifier guessed write.",
+                    "clarifying_question": "", "requested_actions": [
+                        {"action": "enter invoice", "capability": "enter_invoice"},
+                    ],
+                }
+
+        with TemporaryDirectory(prefix="centralign-host-write-guard-") as temp_dir:
+            ensure_operator_assets(Path(temp_dir))
+            loop = AgentLoop(
+                Path(temp_dir), "host-write-guard", "Show me the latest Northstar invoice",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=WrongClassifierFake(),
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_input")
+        self.assertIn("does not explicitly ask me to enter, record, post, or log", summary)
+        self.assertIn("Not done: enter invoice.", summary)
+        self.assertEqual(loop.task_intent["intent"], "ambiguous")
+        self.assertFalse(loop.intent_guard_result["write_allowed"])
+        loop.browser.start.assert_not_awaited()
+
+    def test_terminal_error_result_lists_requested_actions_that_were_not_done(self) -> None:
+        class BrokenProvider(FakeLLM):
+            def next_tool_call(self, _task, _observations, _tools):
+                raise RuntimeError("provider unavailable")
+
+        with TemporaryDirectory(prefix="centralign-final-result-not-done-") as temp_dir:
+            ensure_operator_assets(Path(temp_dir))
+            events = []
+            loop = AgentLoop(
+                Path(temp_dir), "final-result-not-done", "Enter the latest Acme invoice",
+                "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None,
+                client=BrokenProvider(),
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_review")
+        self.assertIn("Not done: enter invoice in the ledger.", summary)
+        self.assertEqual(loop.final_result["not_done_actions"], ["enter invoice in the ledger"])
+        self.assertTrue(any(kind == "final_result" for kind, _ in events))
 
     def test_prompt_injection_is_flagged_removed_and_cannot_override_parsed_amount(self) -> None:
         with TemporaryDirectory(prefix="centralign-injected-invoice-") as temp_dir:
@@ -668,7 +818,7 @@ class AgentLoopUnitTests(unittest.TestCase):
                 return BrowserTools.describe_form_state(snapshot)
 
         with TemporaryDirectory(prefix="centralign-fill-result-") as temp_dir:
-            loop = AgentLoop(Path(temp_dir), "fill-result", "fill invoice", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
+            loop = AgentLoop(Path(temp_dir), "fill-result", "Enter invoice to test the fill", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
             browser = StubBrowser()
             loop.browser = browser
             loop.task_intent = _test_write_intent("", [])
@@ -1017,7 +1167,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         with TemporaryDirectory(prefix="centralign-approval-ambiguity-") as temp_dir:
             handler = unittest.mock.AsyncMock(return_value="APR-SHOULD-NOT-BE-MINTED")
-            loop = AgentLoop(Path(temp_dir), "approval-target", "approve invoice", "http://127.0.0.1:8765", lambda *_: None, handler, approval_mode="always_gate", offline=True)
+            loop = AgentLoop(Path(temp_dir), "approval-target", "Enter invoice and request approval", "http://127.0.0.1:8765", lambda *_: None, handler, approval_mode="always_gate", offline=True)
             loop.browser = StubBrowser()
             loop.task_intent = _test_write_intent("", [])
             loop.policy = {"approved_vendors": ["Acme Analytics Pvt Ltd"], "thresholds": {"INR": "50000.00"}}
@@ -1398,7 +1548,7 @@ class AgentLoopUnitTests(unittest.TestCase):
             })
             AgentLoop._validate_arguments(click_batch)
         with TemporaryDirectory(prefix="centralign-batch-guard-") as temp_dir:
-            loop = AgentLoop(Path(temp_dir), "batch-guard", "test", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
+            loop = AgentLoop(Path(temp_dir), "batch-guard", "Record invoice for the test", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, offline=True)
             loop.task_intent = _test_write_intent("", [])
             with self.assertRaisesRegex(ValueError, "navigation and clicks are single-step"):
                 asyncio.run(loop._execute("browser_action_sequence", click_batch.arguments))

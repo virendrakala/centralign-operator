@@ -34,6 +34,19 @@ _MONTHS = {
     "january": "01", "february": "02", "march": "03", "april": "04", "may": "05", "june": "06",
     "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12",
 }
+_HOST_ENTRY_VERBS = re.compile(r"\b(?:enter|record|post|log|add|submit)\b", re.IGNORECASE)
+_HOST_INVOICE_TOPIC = re.compile(r"\b(?:invoice|invoices|bill|bills)\b", re.IGNORECASE)
+_HOST_UNSUPPORTED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("pay", re.compile(r"\b(?:pay|pays|paid|paying)\b|\b(?:make|initiate|process)\s+(?:a\s+)?payments?\b", re.IGNORECASE)),
+    ("approve payment", re.compile(r"\bapprove\s+(?:the\s+)?payments?\b", re.IGNORECASE)),
+    ("email vendor", re.compile(r"\b(?:email|e-mail)\b", re.IGNORECASE)),
+    ("send", re.compile(r"\bsend\b", re.IGNORECASE)),
+    ("transfer", re.compile(r"\b(?:transfer|wire)\b", re.IGNORECASE)),
+    ("delete", re.compile(r"\b(?:delete|remove)\b", re.IGNORECASE)),
+    ("refund", re.compile(r"\brefund\b", re.IGNORECASE)),
+    ("contact vendor", re.compile(r"\b(?:contact|notify)\b", re.IGNORECASE)),
+)
+_CAPABILITIES = {"enter_invoice", "read_ledger", "list_candidates", "unsupported"}
 
 
 def _explicit_task_months(task: str) -> list[str]:
@@ -47,6 +60,39 @@ def _explicit_task_months(task: str) -> list[str]:
             task, re.IGNORECASE,
         )
     ]
+
+
+def _deterministic_unsupported_actions(task: str) -> list[dict[str, str]]:
+    """Find requested unsupported actions without relying on the LLM classifier."""
+    lowered = task.casefold()
+    found: list[tuple[int, str]] = []
+    email = re.search(r"\b(?:email|e-mail)\b", lowered)
+    send = re.search(r"\bsend\b", lowered)
+    for label, pattern in _HOST_UNSUPPORTED_PATTERNS:
+        match = pattern.search(task)
+        if not match:
+            continue
+        canonical = label
+        if label == "email vendor":
+            if re.search(r"\b(?:vendor|supplier)\b", lowered):
+                canonical = "email vendor"
+            elif send and email:
+                canonical = "send email"
+            else:
+                canonical = "email"
+        elif label == "send" and email and re.search(r"\bsend\s+(?:an?\s+)?e-?mail\b", lowered):
+            # The email pattern already represents the single requested action.
+            continue
+        elif label == "contact vendor" and not re.search(r"\b(?:vendor|supplier)\b", lowered):
+            canonical = "contact"
+        found.append((match.start(), canonical))
+    actions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for _, label in sorted(found):
+        if label not in seen:
+            actions.append({"action": label, "capability": "unsupported"})
+            seen.add(label)
+    return actions
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -115,7 +161,9 @@ class AgentLoop:
         self.selected_invoice: dict[str, Any] | None = None
         self.selected_invoice_path: str | None = None
         self.task_intent: dict[str, Any] | None = None
+        self.intent_guard_result: dict[str, Any] | None = None
         self.candidate_invoices: list[dict[str, str]] = []
+        self.candidate_listed = False
         self.injection_flagged_paths: set[str] = set()
         self.selection_criterion: str | None = None
         self.selection_reason: str | None = None
@@ -132,6 +180,7 @@ class AgentLoop:
         self.tool_failure_counts: dict[tuple[str, str], int] = {}
         self.finished: tuple[str, str] | None = None
         self.final_result: dict[str, Any] | None = None
+        self._final_result_finalized = False
         self.read_ledger_rows: list[dict[str, Any]] | None = None
         self.read_ledger_vendor_query: str | None = None
         self.approval_record: dict[str, Any] | None = None
@@ -252,6 +301,113 @@ class AgentLoop:
             "verification_status": "verified" if verification_passed else str((self.verification or {}).get("status") or "pending"),
         }
 
+    @staticmethod
+    def _canonical_action_label(action: str) -> str:
+        action = " ".join(action.casefold().split())
+        if re.search(r"\bapprove\b.*\bpayments?\b", action):
+            return "approve payment"
+        if re.search(r"\b(?:pay|payment|paid|paying)\b", action):
+            return "pay"
+        if re.search(r"\b(?:email|e-mail)\b", action):
+            return "email vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "email"
+        if re.search(r"\b(?:wire|transfer)\b", action):
+            return "transfer"
+        if re.search(r"\b(?:delete|remove)\b", action):
+            return "delete"
+        if re.search(r"\brefund\b", action):
+            return "refund"
+        if re.search(r"\b(?:contact|notify)\b", action):
+            return "contact vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "contact"
+        if re.search(r"\bsend\b", action):
+            return "send"
+        return action[:120]
+
+    def _apply_host_intent_guard(self, result: dict[str, Any]) -> dict[str, Any]:
+        classifier_intent = result["intent"]
+        actions = [dict(item) for item in result["requested_actions"]]
+        unsupported = _deterministic_unsupported_actions(self.task)
+        entry_text = re.sub(r"\blog\s+in(?:to)?\b", " ", self.task, flags=re.IGNORECASE)
+        explicit_entry_verb = bool(
+            _HOST_ENTRY_VERBS.search(entry_text)
+            and _HOST_INVOICE_TOPIC.search(self.task)
+            and not re.search(
+                r"\b(?:do\s+not|don't|never|cannot|can't|should\s+not|must\s+not)\s+(?:enter|record|post|log|add|submit)\b",
+                entry_text,
+                re.IGNORECASE,
+            )
+        )
+        normalized_actions = []
+        for item in actions:
+            if item["capability"] == "unsupported":
+                item["action"] = self._canonical_action_label(item["action"])
+                if item["action"] in {"email", "email vendor"} and re.search(r"\b(?:vendor|supplier)\b", self.task, re.IGNORECASE):
+                    item["action"] = "email vendor"
+                if item["action"] == "send" and re.search(r"\bsend\s+(?:an?\s+)?e-?mail\b", self.task, re.IGNORECASE):
+                    item["action"] = "email vendor" if re.search(r"\b(?:vendor|supplier)\b", self.task, re.IGNORECASE) else "email"
+            if not any(
+                prior["capability"] == item["capability"] and prior["action"].casefold() == item["action"].casefold()
+                for prior in normalized_actions
+            ):
+                normalized_actions.append(item)
+        actions = normalized_actions
+        if explicit_entry_verb and not any(item["capability"] == "enter_invoice" for item in actions):
+            actions.append({"action": "enter invoice in the ledger", "capability": "enter_invoice"})
+        action_keys = {(item["capability"], item["action"].casefold()) for item in actions}
+        for item in unsupported:
+            key = (item["capability"], item["action"].casefold())
+            if key not in action_keys:
+                actions.append(item)
+                action_keys.add(key)
+
+        classifier_unsupported = any(item["capability"] == "unsupported" for item in actions)
+        if classifier_intent == "unsupported" and not classifier_unsupported:
+            actions.append({"action": "unsupported requested action", "capability": "unsupported"})
+            classifier_unsupported = True
+        unsupported_actions = [item["action"] for item in actions if item["capability"] == "unsupported"]
+        has_enter_capability = any(item["capability"] == "enter_invoice" for item in actions)
+        guard_allows_write = (
+            classifier_intent == "write_invoice_entry"
+            and explicit_entry_verb
+            and has_enter_capability
+            and not unsupported_actions
+        )
+
+        effective_intent = classifier_intent
+        clarifying_question = result["clarifying_question"]
+        if classifier_unsupported or unsupported:
+            effective_intent = "unsupported"
+            clarifying_question = ""
+        elif classifier_intent == "write_invoice_entry" and not guard_allows_write:
+            effective_intent = "ambiguous"
+            clarifying_question = (
+                "I can't start an invoice write because the task does not explicitly ask me to enter, record, post, or log an invoice. "
+                "Would you like me to record it in the ledger?"
+            )
+        elif explicit_entry_verb and classifier_intent == "read_only":
+            effective_intent = "ambiguous"
+            clarifying_question = (
+                "The task asks to enter or record an invoice, but the classifier did not authorize that write. "
+                "Should I record the invoice in the ledger?"
+            )
+
+        host_guard = {
+            "classifier_intent": classifier_intent,
+            "explicit_entry_verb": explicit_entry_verb,
+            "unsupported_actions": unsupported_actions,
+            "classifier_reported_unsupported": classifier_unsupported,
+            "write_allowed": guard_allows_write and effective_intent == "write_invoice_entry",
+            "effective_intent": effective_intent,
+        }
+        self.intent_guard_result = host_guard
+        result["requested_actions"] = actions
+        result["classifier_intent"] = classifier_intent
+        result["intent_guard"] = host_guard
+        result["intent"] = effective_intent
+        result["clarifying_question"] = clarifying_question
+        if effective_intent == "unsupported" and unsupported_actions:
+            result["unsupported_actions"] = unsupported_actions
+        return result
+
     async def _classify_task_intent(self) -> dict[str, Any]:
         vendors = self.company.list_vendor_directory()
         classifier = getattr(self.client, "classify_task_intent", None)
@@ -266,7 +422,8 @@ class AgentLoop:
             # the schema-constrained classifier above.
             result = FakeLLM().classify_task_intent(self.task, vendors)
         required = {
-            "intent", "vendor_query", "invoice_number", "selection_criterion", "reason", "clarifying_question"
+            "intent", "vendor_query", "invoice_number", "selection_criterion", "reason", "clarifying_question",
+            "requested_actions",
         }
         if not isinstance(result, dict) or set(result) != required:
             raise ValueError("The intent classifier did not return the required strict-JSON fields.")
@@ -274,9 +431,23 @@ class AgentLoop:
             raise ValueError("The intent classifier returned an unsupported intent.")
         if result.get("selection_criterion") not in {"latest_by_invoice_date", "specific_invoice_number", "other"}:
             raise ValueError("The intent classifier returned an unsupported selection criterion.")
-        if not all(isinstance(result[key], str) for key in required):
+        if not all(isinstance(result[key], str) for key in required - {"requested_actions"}):
             raise ValueError("Intent classification fields must be strings.")
-        result = {key: result[key].strip() for key in required}
+        if not isinstance(result["requested_actions"], list):
+            raise ValueError("Intent classification requested_actions must be a list.")
+        normalized_actions = []
+        for item in result["requested_actions"]:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"action", "capability"}
+                or not isinstance(item.get("action"), str)
+                or not item["action"].strip()
+                or item.get("capability") not in _CAPABILITIES
+            ):
+                raise ValueError("Intent classification contains an invalid requested action mapping.")
+            normalized_actions.append({"action": item["action"].strip(), "capability": item["capability"]})
+        result = {key: result[key].strip() for key in required - {"requested_actions"}}
+        result["requested_actions"] = normalized_actions
         if result["intent"] == "write_invoice_entry":
             explicit_number = re.search(r"\b(?:AC[-_][A-Z0-9_-]+|INV[-_][A-Z0-9_-]+)\b", self.task, re.IGNORECASE)
             explicit_date = re.search(r"\b(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?\b", self.task)
@@ -318,10 +489,18 @@ class AgentLoop:
                     result["vendor_query"] = matches[0]["short_name"]
         if result["intent"] == "ambiguous" and not result["clarifying_question"]:
             result["clarifying_question"] = "Please clarify the vendor and invoice you want me to use."
-        return result
+        return self._apply_host_intent_guard(result)
 
     def _require_write_intent(self) -> None:
-        if not self.task_intent or self.task_intent.get("intent") != "write_invoice_entry":
+        # Directly injected test planners may set a classification without going
+        # through _classify_task_intent; rerun the same host guard before writes.
+        if self.task_intent and self.intent_guard_result is None:
+            self.task_intent = self._apply_host_intent_guard(self.task_intent)
+        if (
+            not self.task_intent
+            or self.task_intent.get("intent") != "write_invoice_entry"
+            or not (self.intent_guard_result or {}).get("write_allowed")
+        ):
             raise ValueError("Invoice write tools are unavailable unless the host classified this task as write_invoice_entry.")
 
     def _validate_selection_declaration(self, criterion: str, reason: str) -> None:
@@ -423,13 +602,143 @@ class AgentLoop:
             text = f"No ledger invoices were found for {vendor}."
         return {"vendor": vendor, "invoice_count": len(invoices), "invoices": invoices, "text": text}
 
+    def _render_candidate_answer(self) -> dict[str, Any]:
+        vendor = self.read_ledger_vendor_query or str((self.task_intent or {}).get("vendor_query") or "the requested vendor")
+        candidates = [
+            {
+                "path": str(row.get("path", "")),
+                "vendor": str(row.get("vendor", "")),
+                "invoice_number": str(row.get("invoice_number", "")),
+                "invoice_date": str(row.get("invoice_date", "")),
+                "due_date": str(row.get("due_date", "")),
+                "amount": str(row.get("amount", "")),
+                "currency": str(row.get("currency", "")),
+            }
+            for row in self.candidate_invoices
+        ]
+        if candidates:
+            details = "; ".join(
+                f"{row['invoice_number']} dated {row['invoice_date']} for {row['currency']} {row['amount']} (due {row['due_date']})"
+                for row in candidates
+            )
+            text = f"Found {len(candidates)} invoice candidate(s) for {vendor}: {details}"
+        else:
+            text = f"No invoice candidates were found for {vendor}."
+        return {"vendor": vendor, "candidate_count": len(candidates), "candidates": candidates, "text": text}
+
+    def _not_done_action_labels(self) -> list[str]:
+        if self.task_intent is None:
+            return ["requested actions could not be classified"]
+        actions = (self.task_intent or {}).get("requested_actions", [])
+        not_done: list[str] = []
+        verified = bool(self.verification and self.verification.get("status") == "verified" and self.verification.get("pass"))
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "requested action").strip()
+            capability = item.get("capability")
+            unperformed = (
+                capability == "unsupported"
+                or (capability == "enter_invoice" and not verified)
+                or (capability == "read_ledger" and self.read_ledger_rows is None)
+                or (capability == "list_candidates" and not self.candidate_listed)
+            )
+            if unperformed and action and action not in not_done:
+                not_done.append(action)
+        return not_done
+
+    def _unsupported_task_summary(self) -> str:
+        unsupported = list((self.intent_guard_result or {}).get("unsupported_actions", []))
+        if not unsupported:
+            unsupported = [
+                item.get("action", "unsupported requested action")
+                for item in (self.task_intent or {}).get("requested_actions", [])
+                if isinstance(item, dict) and item.get("capability") == "unsupported"
+            ]
+        wording: list[str] = []
+        for action in unsupported:
+            label = str(action).casefold()
+            phrase = (
+                "make payments" if label in {"pay", "payment", "approve payment"} else
+                "send email" if label in {"email", "email vendor", "send email"} else
+                "transfer funds" if label == "transfer" else
+                "delete records" if label == "delete" else
+                "issue refunds" if label == "refund" else
+                "contact vendors" if label in {"contact", "contact vendor"} else
+                "send messages" if label == "send" else label
+            )
+            if phrase not in wording:
+                wording.append(phrase)
+        if not wording:
+            return str((self.task_intent or {}).get("clarifying_question") or "I need clarification before taking action. Would you like me to record the invoice in the ledger?")
+        if len(wording) == 1:
+            unsupported_text = wording[0]
+        elif len(wording) == 2:
+            unsupported_text = " or ".join(wording)
+        else:
+            unsupported_text = ", ".join(wording[:-1]) + f", or {wording[-1]}"
+        return (
+            f"I can record the invoice in the ledger, but cannot {unsupported_text}. "
+            "Would you like me to proceed with just recording it?"
+        )
+
+    @staticmethod
+    def _with_not_done_line(summary: str, not_done: list[str]) -> str:
+        line = "Not done: " + (", ".join(not_done) if not_done else "none") + "."
+        if re.search(r"(?im)^Not done:", summary):
+            summary = re.sub(r"(?im)^Not done:.*$", line, summary)
+            return summary
+        return f"{summary.rstrip()} {line}"
+
+    def _finalize_run_result(self, status: str, summary: str) -> tuple[str, str]:
+        """Attach requested/unperformed actions to every terminal run result."""
+        if self._final_result_finalized:
+            return self.finished or (status, summary)
+        if self.task_intent and self.task_intent.get("intent") == "unsupported":
+            status, summary = "needs_input", self._unsupported_task_summary()
+        elif self.task_intent and self.task_intent.get("intent") == "ambiguous":
+            status = "needs_input"
+            summary = str(self.task_intent.get("clarifying_question") or summary or "Please clarify the requested invoice action.")
+        if status == "complete" and self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+            if not (self.verification and self.verification.get("status") == "verified" and self.verification.get("pass")):
+                status = "needs_review"
+                summary = "The invoice entry did not pass ledger verification."
+
+        not_done = self._not_done_action_labels()
+        summary = self._with_not_done_line(summary, not_done)
+        result = dict(self.final_result or {})
+        result.update({
+            "status": status,
+            "summary": summary,
+            "requested_actions": list((self.task_intent or {}).get("requested_actions", [])),
+            "not_done_actions": not_done,
+            "not_done": "none" if not not_done else ", ".join(not_done),
+            "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
+        })
+        if not result.get("what_was_done"):
+            result["what_was_done"] = "No requested actions were completed." if not_done else "Completed the requested actions."
+        self.final_result = result
+        self.finished = (status, summary)
+        self._final_result_finalized = True
+        self.emit("final_result", self.final_result)
+        return self.finished
+
     def _tools_for_intent(self) -> list[dict[str, Any]]:
         if not self.task_intent or self.task_intent.get("intent") in {"unsupported", "ambiguous"}:
             return [TOOL_BY_NAME["finish"]]
         if self.task_intent.get("intent") == "read_only":
-            allowed = {"read_ledger", "finish"}
+            capabilities = {
+                item.get("capability")
+                for item in self.task_intent.get("requested_actions", [])
+                if isinstance(item, dict)
+            }
+            allowed = {"finish"}
+            if "read_ledger" in capabilities:
+                allowed.add("read_ledger")
+            if "list_candidates" in capabilities:
+                allowed.add("list_invoice_candidates")
             return [tool for tool in TOOL_DEFINITIONS if tool["name"] in allowed]
-        if self.task_intent.get("intent") != "write_invoice_entry":
+        if self.task_intent.get("intent") != "write_invoice_entry" or not (self.intent_guard_result or {}).get("write_allowed"):
             return [TOOL_BY_NAME["finish"]]
         return TOOL_DEFINITIONS
 
@@ -766,7 +1075,13 @@ class AgentLoop:
             self.policy = result
             return {"status": "read", "policy": result}
         if name == "list_invoice_candidates":
-            self._require_write_intent()
+            if self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                self._require_write_intent()
+            elif not any(
+                isinstance(item, dict) and item.get("capability") == "list_candidates"
+                for item in (self.task_intent or {}).get("requested_actions", [])
+            ):
+                raise ValueError("Candidate listing is available only for invoice entry or a host-classified list_candidates request.")
             vendor_query = _clean_text(arguments.get("vendor_query"), 160)
             if not vendor_query:
                 raise ValueError("Provide the vendor query from the task intent.")
@@ -786,10 +1101,16 @@ class AgentLoop:
                             "message": "Instruction-like invoice text was detected and ignored; structured invoice fields remain authoritative.",
                         })
             self.candidate_invoices = all_rows
+            self.candidate_listed = True
             return {"status": "listed", "vendor_query": vendor_query, "candidates": all_rows}
         if name == "read_ledger":
             if not self.task_intent or self.task_intent.get("intent") != "read_only":
                 raise ValueError("read_ledger is available only for a host-classified read_only task.")
+            if not any(
+                isinstance(item, dict) and item.get("capability") == "read_ledger"
+                for item in self.task_intent.get("requested_actions", [])
+            ):
+                raise ValueError("read_ledger is available only when the host classified that requested capability.")
             vendor_query = _normalized(_clean_text(arguments.get("vendor_query"), 160))
             classified_vendor = _normalized(str(self.task_intent.get("vendor_query", "")))
             if not vendor_query or vendor_query != classified_vendor:
@@ -1217,36 +1538,57 @@ class AgentLoop:
             summary = _clean_text(arguments.get("summary"), 1000)
             if status not in STOP_STATUSES or not summary:
                 raise ValueError("finish requires a supported stop status and a concise summary.")
-            if status == "complete" and self.task_intent and self.task_intent.get("intent") == "read_only":
-                if self.read_ledger_rows is None:
-                    raise ValueError("Read-only completion requires a host ledger lookup before finish.")
-                answer = self._render_read_ledger_answer()
-                summary = answer["text"]
-                self.final_result = {
-                    "status": "complete",
-                    "what_was_done": f"Read ledger entries for {answer['vendor']}.",
-                    "ledger_answer": answer,
-                    "evidence": {},
-                    "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
-                }
-                self.emit("final_result", self.final_result)
-                self.finished = status, summary
-                return {"status": "finished", "final_status": status, "summary": summary, "answer": answer, "evidence": {}}
-            if status == "complete" and not (self.verification and self.verification.get("status") == "verified"):
-                raise ValueError("A complete run requires a matching read-back from the live ERP ledger DOM.")
+
             if self.task_intent and self.task_intent.get("intent") == "unsupported":
                 status = "needs_input"
-                summary = "This sandbox supports invoice entry and ledger lookup only. It cannot pay invoices or contact vendors."
+                summary = self._unsupported_task_summary()
             elif self.task_intent and self.task_intent.get("intent") == "ambiguous":
                 status = "needs_input"
                 summary = str(self.task_intent.get("clarifying_question") or "Please clarify which vendor or invoice you mean.")
+
+            if status == "complete" and self.task_intent and self.task_intent.get("intent") == "read_only":
+                capabilities = {
+                    item.get("capability")
+                    for item in self.task_intent.get("requested_actions", [])
+                    if isinstance(item, dict)
+                }
+                if "read_ledger" in capabilities and self.read_ledger_rows is None:
+                    raise ValueError("Read-only completion requires a host ledger lookup before finish.")
+                if "list_candidates" in capabilities and not self.candidate_listed:
+                    raise ValueError("Candidate-list completion requires the host candidate lookup before finish.")
+                if not capabilities:
+                    raise ValueError("Read-only completion requires a host ledger or candidate lookup before finish.")
+                answers: dict[str, Any] = {}
+                if "read_ledger" in capabilities:
+                    answers["ledger_answer"] = self._render_read_ledger_answer()
+                if "list_candidates" in capabilities:
+                    answers["candidate_answer"] = self._render_candidate_answer()
+                summary = "; ".join(answer["text"] for answer in answers.values())
+                primary = next(iter(answers.values()))
+                self.final_result = {
+                    "status": "complete",
+                    "what_was_done": f"Read requested invoice data for {primary['vendor']}.",
+                    **answers,
+                    "evidence": {},
+                    "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
+                }
+            if (
+                status == "complete"
+                and not (self.task_intent and self.task_intent.get("intent") == "read_only")
+                and not (self.verification and self.verification.get("status") == "verified")
+            ):
+                raise ValueError("A complete run requires a matching read-back from the live ERP ledger DOM.")
             if status == "complete" and self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
-                if not self.verification.get("pass") or not self.final_result:
+                if not self.verification or not self.verification.get("pass") or not self.final_result:
                     raise ValueError("A complete invoice write requires a passed ledger verification before finish.")
                 summary = str(self.final_result["what_was_done"])
-                self.emit("final_result", self.final_result)
-            self.finished = status, summary
-            return {"status": "finished", "final_status": status, "summary": summary, "evidence": self.verification or {}}
+            status, summary = self._finalize_run_result(status, summary)
+            result = self.final_result or {}
+            return {
+                "status": "finished", "final_status": status, "summary": summary,
+                "answer": result.get("ledger_answer"), "evidence": result.get("evidence", self.verification or {}),
+                "not_done_actions": result.get("not_done_actions", []),
+            }
         raise ValueError(f"Tool is not in the runtime allowlist: {name}")
 
     def _approval_required(self, invoice: dict[str, Any]) -> tuple[bool, str | None]:
@@ -1362,6 +1704,12 @@ class AgentLoop:
         return "needs_input", reason
 
     async def run(self) -> tuple[str, str]:
+        status, summary = await self._run_loop()
+        if self._final_result_finalized:
+            return self.finished or (status, summary)
+        return self._finalize_run_result(status, summary)
+
+    async def _run_loop(self) -> tuple[str, str]:
         provider_name = getattr(self.client, "name", type(self.client).__name__)
         model_name = getattr(self.client, "model", "unknown")
         mode = "replay" if provider_name == "offline-replay" else "live"
@@ -1375,6 +1723,7 @@ class AgentLoop:
                 reason = f"Task intent classification failed safely before any ERP action: {type(exc).__name__}: {exc}"
                 self.emit("run_error", {"error": reason})
                 return "needs_review", reason
+            self.emit("intent_guard", self.intent_guard_result or {})
             self.emit("task_intent", self.task_intent)
             if self.task_intent["intent"] == "write_invoice_entry":
                 await self.browser.start()
