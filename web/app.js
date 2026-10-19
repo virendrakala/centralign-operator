@@ -21,6 +21,7 @@
     const from = dateMs(start);
     const to = dateMs(end);
     if (from === null || to === null || to < from) return "";
+    if (to - from < 1000) return "";
     const seconds = Math.round((to - from) / 1000);
     if (seconds < 60) return `${seconds}s`;
     return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
@@ -130,10 +131,48 @@
     }
     return "";
   }
+  function failedActionTitle(event, retrying) {
+    const tool = payload(event).tool;
+    const labels = {
+      browser_fill: "Invoice field fill",
+      browser_fill_form: "Invoice form fill",
+      browser_action_sequence: "Invoice form fill",
+      read_policy: "Procurement policy check",
+      list_invoice_candidates: "Invoice candidate search",
+      verify_ledger_row: "Ledger verification",
+      erp_login: "ERP login",
+      browser_open: "ERP navigation",
+      browser_snapshot: "ERP page check",
+    };
+    const label = tool === "browser_click" && /submit_btn/i.test(payload(event).selector || "")
+      ? "ERP submit"
+      : labels[tool] || actionTitle(event);
+    return `${label} failed${retrying ? ", retrying" : ""}`;
+  }
+  function shortError(value) {
+    const message = String(value || "The tool call failed.").replace(/\s+/g, " ").trim();
+    return message.length > 180 ? `${message.slice(0, 177)}…` : message;
+  }
+  function unsupportedActionReason(actions) {
+    const reasons = [...new Set((Array.isArray(actions) ? actions : []).map((action) => {
+      const value = String(action || "").trim().toLowerCase();
+      if (value === "email vendor") return "Emailing the vendor is not supported.";
+      if (value === "email") return "Email is not supported.";
+      if (["pay", "payment", "approve payment"].includes(value)) return "Making payments is not supported.";
+      if (["notify finance", "inform finance"] .includes(value)) return "Notifying finance is not supported.";
+      if (["notify vendor", "inform vendor"].includes(value)) return "Notifying the vendor is not supported.";
+      if (value === "transfer") return "Transferring funds is not supported.";
+      if (value === "delete") return "Deleting records is not supported.";
+      if (value === "refund") return "Issuing refunds is not supported.";
+      if (["send", "send message"].includes(value)) return "Sending messages is not supported.";
+      return value ? `${value[0].toUpperCase()}${value.slice(1)} is not supported.` : "";
+    }).filter(Boolean))];
+    return reasons.join(" ");
+  }
   function criterionLabel(value) {
     return ({ latest_by_invoice_date: "latest by invoice date", specific_invoice_number: "requested invoice number", other: "requested selection" })[value] || value || "requested selection";
   }
-  function pushRow(rows, { event, endEvent, title, result, status = "ok", rowType, detail }) {
+  function pushRow(rows, { event, endEvent, title, result, status = "ok", rowType, detail, sequence }) {
     rows.push({
       id: `${event.sequence ?? rows.length}-${event.event_type}`,
       status,
@@ -144,11 +183,20 @@
       timestamp: event.timestamp || "",
       rowType: rowType || event.event_type,
       detail: detail === undefined ? payload(endEvent || event) : detail,
+      sequence: sequence ?? (Number.isFinite(Number(event.sequence)) ? Number(event.sequence) : rows.length),
+      insertionOrder: rows.length,
     });
   }
 
   function groupTraceEvents(input) {
-    const events = (Array.isArray(input) ? input : []).filter((event) => event && event.event_type !== "browser_frame");
+    const events = (Array.isArray(input) ? input : []).map((event, index) => ({ event, index }))
+      .filter(({ event }) => event && event.event_type !== "browser_frame")
+      .sort((left, right) => {
+        const leftSequence = Number.isFinite(Number(left.event.sequence)) ? Number(left.event.sequence) : left.index;
+        const rightSequence = Number.isFinite(Number(right.event.sequence)) ? Number(right.event.sequence) : right.index;
+        return leftSequence - rightSequence || left.index - right.index;
+      })
+      .map(({ event }) => event);
     const rows = [];
     const consumed = new Set();
     const seenSelections = new Set();
@@ -199,16 +247,20 @@
           summary = passed ? `The ledger row matches the selected invoice.${semantic.screenshot_path ? ` Evidence: ${semantic.screenshot_path.split(/[\\/]/).pop()}.` : ""}` : semantic.message || semantic.error || `Verification status: ${semantic.status || "not verified"}.`;
         }
         if (tool === "verify_ledger_row" && failed && observationPayload.status === "not_found") title = "Ledger row not found";
-        if (failed) {
+        const notFound = tool === "verify_ledger_row" && observationPayload.status === "not_found";
+        if (notFound) {
+          title = "Ledger row not found";
+          summary = shortError(observationPayload.message || result);
+        } else if (failed) {
           const next = nextActionTitle(events, observationIndex >= 0 ? observationIndex : index);
-          if (/submit_btn/i.test(p.selector || "")) title = /approval/i.test(`${observationPayload.alert || ""} ${observationPayload.error || ""}`) ? "ERP rejected: approval required" : "ERP rejected invoice submission";
-          else if (observationPayload.alert) title = "ERP alert observed";
-          if (next) summary = `${result} Agent then ${next}.`;
-          else if (/submit_btn/i.test(p.selector || "")) summary = `${result} Agent requested approval or correction.`;
+          title = failedActionTitle(event, Boolean(next));
+          const error = shortError(observationPayload.error || observationPayload.alert || observationPayload.warning || result);
+          if (next) summary = `${error} Agent then ${next}.`;
+          else summary = error;
           if (next) correctedCalls += 1;
         }
         const running = !observation && index === events.map((item, eventIndex) => item.event_type === "action" ? eventIndex : -1).filter((value) => value >= 0).at(-1);
-        pushRow(rows, { event, endEvent: associated || observation, title, result: summary, status: failed ? "warning" : running ? "running" : "ok", detail: { action: p, observation: observationPayload, ...(associated ? { [associatedType]: semantic } : {}) } });
+        pushRow(rows, { event, endEvent: observation, title, result: summary, status: failed ? "warning" : running ? "running" : "ok", detail: { action: p, observation: observationPayload, ...(associated ? { [associatedType]: semantic } : {}) } });
         continue;
       }
 
@@ -282,7 +334,9 @@
       }
 
       if (type === "task_intent" && (p.intent === "unsupported" || p.intent === "ambiguous")) {
-        pushRow(rows, { event, title: p.intent === "unsupported" ? "Request needs a capability clarification" : "Request needs clarification", result: p.clarifying_question || p.reason || "The host stopped before taking action.", status: "warning" });
+        const guardedActions = p.unsupported_actions || p.intent_guard?.unsupported_actions;
+        const guardReason = p.intent === "unsupported" ? unsupportedActionReason(guardedActions) : "";
+        pushRow(rows, { event, title: p.intent === "unsupported" ? "Request needs a capability clarification" : "Request needs clarification", result: guardReason || p.clarifying_question || p.reason || "The host stopped before taking action.", status: "warning" });
         continue;
       }
 
@@ -310,8 +364,10 @@
       pushRow(rows, {
         event: systemEvents[systemEvents.length - 1], title: `Provider and system activity (${systemEvents.length})`,
         result, status: rateLimitWaits ? "warning" : "ok", rowType: "system_activity", detail: systemEvents,
+        sequence: Number.MAX_SAFE_INTEGER,
       });
     }
+    rows.sort((left, right) => left.sequence - right.sequence || left.insertionOrder - right.insertionOrder);
     return { rows, rateLimitWaits, correctedCalls, rateLimitNotes };
   }
 
@@ -511,7 +567,7 @@ function appendEvidenceLink(container, href, label) {
   link.rel = "noreferrer";
   container.append(link);
 }
-function traceDurationLabel(value) { return value || "—"; }
+function traceDurationLabel(value) { return value || ""; }
 
 function renderSummaryTrace(run) {
   const summary = window.CentrAlignTrace.groupTraceEvents(run.events || []);
@@ -544,7 +600,7 @@ function renderSummaryTrace(run) {
     top.append(node("h3", "summary-title", row.title));
     const side = node("span", "summary-side");
     side.append(node("time", "summary-time", row.timestamp ? new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(row.timestamp)) : ""));
-    side.append(node("span", "summary-duration", traceDurationLabel(row.duration)));
+    if (row.duration) side.append(node("span", "summary-duration", traceDurationLabel(row.duration)));
     top.append(side);
     content.append(top);
     if (row.result) {

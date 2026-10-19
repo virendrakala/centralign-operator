@@ -30,7 +30,8 @@ test("groups tool actions with observations and keeps selection and recovery mea
   assert.equal(result.rows[0].duration, "3s");
   assert.match(result.rows[1].title, /Chose INV-2026-2116/);
   assert.equal(result.rows[2].status, "warning");
-  assert.equal(result.rows[2].title, "ERP rejected: approval required");
+  assert.equal(result.rows[2].title, "ERP submit failed, retrying");
+  assert.match(result.rows[2].result, /Manager approval token must be verified/);
   assert.match(result.rows[2].result, /Agent then requested human approval/);
   assert.equal(result.rateLimitWaits, 1);
   assert.equal(result.rateLimitNotes[0], "Waiting 4s: groq rate limit");
@@ -91,6 +92,51 @@ test("does not duplicate a host refusal in the trace summary", () => {
   ]);
   assert.equal(result.rows.filter((row) => row.rowType !== "system_activity").length, 1);
   assert.equal(result.rows[0].title, "Request needs a capability clarification");
+});
+
+test("unsupported clarification detail comes from the host guard actions", () => {
+  for (const [action, expected] of [
+    ["email vendor", "Emailing the vendor is not supported."],
+    ["notify finance", "Notifying finance is not supported."],
+  ]) {
+    const result = groupTraceEvents([{
+      event_type: "task_intent", sequence: 4,
+      payload: {
+        intent: "unsupported",
+        reason: "The task requests the latest invoice by date.",
+        clarifying_question: "The request does not specify an invoice date.",
+        intent_guard: { unsupported_actions: [action] },
+      },
+    }]);
+    assert.equal(result.rows[0].result, expected);
+  }
+});
+
+test("failed tool calls are warning rows with short errors and successful retries keep success titles", () => {
+  const result = groupTraceEvents([
+    { event_type: "action", sequence: 1, timestamp: "2026-10-19T12:00:00.000Z", payload: { tool: "read_document", path: "inbox/bad.pdf" } },
+    { event_type: "observation", sequence: 2, timestamp: "2026-10-19T12:00:00.500Z", payload: { tool: "read_document", error: `${"x".repeat(260)} parser error` } },
+    { event_type: "action", sequence: 3, timestamp: "2026-10-19T12:00:00.600Z", payload: { tool: "read_document", path: "inbox/good.pdf" } },
+    { event_type: "observation", sequence: 4, timestamp: "2026-10-19T12:00:01.800Z", payload: { tool: "read_document", invoice: { invoice_number: "INV-OK", vendor: "Acme", amount: "10", currency: "INR" } } },
+  ]);
+  assert.equal(result.rows[0].title, "Read bad.pdf failed, retrying");
+  assert.equal(result.rows[0].status, "warning");
+  assert.ok(result.rows[0].result.length < 230);
+  assert.match(result.rows[0].result, /Agent then read good\.pdf/);
+  assert.equal(result.rows[0].duration, "", "sub-second action/observation durations are hidden");
+  assert.equal(result.rows[1].title, "Read good.pdf");
+  assert.equal(result.rows[1].status, "ok");
+  assert.equal(result.rows[1].duration, "1s");
+});
+
+test("summary rows follow event sequence even when timestamps tie and input order differs", () => {
+  const timestamp = "2026-10-19T12:00:00.000Z";
+  const result = groupTraceEvents([
+    { event_type: "verification", sequence: 12, timestamp, payload: { status: "verified", matches: { vendor: true }, ledger_row_id: 1 } },
+    { event_type: "selection_check", sequence: 7, timestamp, payload: { status: "passed", selected_invoice: "INV-2026-2116", criterion: "latest_by_invoice_date" } },
+  ]);
+  assert.match(result.rows[0].title, /^Chose INV-2026-2116/);
+  assert.match(result.rows[1].title, /^Verified:/);
 });
 
 test("renders a four-step progress model from existing events", () => {
