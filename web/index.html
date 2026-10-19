@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#F8FAFC">
     <meta name="description" content="CentrAlign autonomous browser operator workbench">
     <title>CentrAlign Operator</title>
-    <link rel="stylesheet" href="/styles.css">
-    <script src="/app.js" defer></script>
+    <link rel="stylesheet" href="/styles.css?v=20261019-4">
+    <script src="/app.js?v=20261019-4" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -31,10 +31,23 @@
         <span class="local-pill"><span aria-hidden="true"></span>Loopback sandbox</span>
       </div>
 
+      <section class="card workflow-card" aria-label="Invoice workflow progress">
+        <div class="card-heading"><div><h2>Workflow</h2><p>Follow the request from intent to verified ledger entry.</p></div></div>
+        <ol id="progressStepper" class="progress-stepper" aria-label="Task progress">
+          <li class="progress-step" data-state="upcoming" aria-label="Understand request: upcoming"><span class="progress-mark" aria-hidden="true">1</span><span class="progress-label">Understand request</span></li>
+          <li class="progress-step" data-state="upcoming" aria-label="Select invoice: upcoming"><span class="progress-mark" aria-hidden="true">2</span><span class="progress-label">Select invoice</span></li>
+          <li class="progress-step" data-state="upcoming" aria-label="Approve: upcoming"><span class="progress-mark" aria-hidden="true">3</span><span class="progress-label">Approve</span></li>
+          <li class="progress-step" data-state="upcoming" aria-label="Submit and verify: upcoming"><span class="progress-mark" aria-hidden="true">4</span><span class="progress-label">Submit &amp; verify</span></li>
+        </ol>
+      </section>
+
       <div class="workbench-grid">
         <section class="left-pane" aria-label="Task and run summary">
           <article class="card composer-card">
-            <div class="card-heading"><div><h2>Start a task</h2><p>Describe the invoice operation or ledger question.</p></div></div>
+            <div class="card-heading">
+              <div><h2>Start a task</h2><p>Describe the invoice operation or ledger question.</p></div>
+              <div class="format-chips" aria-label="Supported input sources"><span>PDF</span><span>TXT</span><span>ERP</span></div>
+            </div>
             <form id="taskForm">
               <label class="field-label" for="taskInput">Task</label>
               <textarea id="taskInput" maxlength="2000" required>Find the latest invoice from Acme, check policy compliance, enter it into the ERP portal, and verify it in the ledger</textarea>
@@ -48,13 +61,23 @@
           </article>
 
           <article id="resultCard" class="card result-card" aria-live="polite">
-            <div class="result-main">
-              <div class="result-status-line"><span id="resultIcon" class="result-icon icon-neutral" aria-hidden="true">•</span><div><p class="eyebrow">RUN RESULT</p><h2 id="resultStatus">Ready</h2></div><span id="resultElapsed" class="result-elapsed"></span></div>
-              <p id="resultSummary" class="result-summary">Start a task to see its outcome and evidence here.</p>
-              <div id="selectedInvoice" class="selected-invoice" hidden></div>
-              <div id="notDone" class="not-done" hidden></div>
+            <div class="result-tabs" role="tablist" aria-label="Run result views">
+              <button id="summaryViewButton" class="view-button is-active" type="button" role="tab" aria-controls="summaryPanel" aria-selected="true">Summary</button>
+              <button id="diagnosticsViewButton" class="view-button" type="button" role="tab" aria-controls="diagnosticsPanel" aria-selected="false">Diagnostics</button>
             </div>
-            <div id="resultEvidence" class="result-evidence" hidden></div>
+            <section id="summaryPanel" class="result-panel" role="tabpanel" aria-labelledby="summaryViewButton">
+              <div class="result-main">
+                <div class="result-status-line"><span id="resultIcon" class="result-icon icon-neutral" aria-hidden="true">✓</span><div><p class="eyebrow">RUN RESULT</p><h2 id="resultStatus">Ready</h2></div><span id="resultElapsed" class="result-elapsed"></span></div>
+                <p id="resultSummary" class="result-summary">Start a task to see its outcome and evidence here.</p>
+                <div id="selectedInvoice" class="selected-invoice" hidden></div>
+                <div id="notDone" class="not-done" hidden></div>
+                <div id="resultEvidence" class="result-evidence" hidden></div>
+              </div>
+            </section>
+            <section id="diagnosticsPanel" class="result-panel diagnostics-panel" role="tabpanel" aria-labelledby="diagnosticsViewButton" hidden>
+              <div id="diagnosticsEmpty" class="empty-state"><strong>No diagnostics yet</strong><span>Provider requests and raw event details appear here during a run.</span></div>
+              <ol id="diagnosticsList" class="diagnostics-list" aria-live="polite"></ol>
+            </section>
           </article>
 
           <article class="card trace-card">
@@ -62,7 +85,6 @@
               <div><h2>Run progress</h2><p id="traceSubtitle">A clear account of what the operator did.</p></div>
               <span class="trace-run">Run <span id="traceRunId" class="truncate-value">—</span></span>
             </div>
-            <ol id="progressStepper" class="progress-stepper" aria-label="Task progress"></ol>
             <section id="approvalBanner" class="approval-banner" hidden aria-live="polite">
               <div class="approval-head"><span class="approval-icon" aria-hidden="true">!</span><div><span class="approval-label">ACTION REQUIRED</span><h3 id="approvalTitle">Review invoice before ERP entry</h3></div></div>
               <div id="approvalFacts" class="approval-facts"></div>
@@ -71,11 +93,8 @@
               <p id="approvalTokenMessage" class="token-message" hidden></p>
             </section>
             <div class="trace-toolbar">
-              <div class="view-switch" role="group" aria-label="Trace view">
-                <button id="summaryViewButton" type="button" class="view-button is-active" aria-pressed="true">Summary</button>
-                <button id="diagnosticsViewButton" type="button" class="view-button" aria-pressed="false">Diagnostics</button>
-              </div>
               <div id="traceCounts" class="trace-counts" aria-label="Run notices"></div>
+              <div id="rateLimitNotes" class="rate-limit-notes" aria-live="polite"></div>
               <label class="follow-toggle"><input id="followLatest" type="checkbox" checked><span>Follow latest</span></label>
             </div>
             <div id="traceScroll" class="trace-scroll" tabindex="0" aria-label="Run trace">
@@ -91,7 +110,7 @@
           </details>
         </section>
 
-        <aside class="right-pane" aria-label="Live browser and verification evidence">
+        <aside class="right-pane" aria-label="Live browser">
           <article class="card viewport-card">
             <div class="card-heading viewport-heading"><div><h2>Live browser</h2><p>Latest view of the local ERP sandbox.</p></div><span id="frameBadge" class="frame-badge">Waiting for a run</span></div>
             <div class="browser-chrome"><span class="browser-lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="browser-origin">127.0.0.1</span><code id="browserUrl">/erp/login</code></div>
@@ -101,8 +120,7 @@
             </div>
             <div class="viewport-foot"><span id="frameAction">No browser action yet</span><span id="frameDimensions">16:10 · 1280 × 800</span></div>
           </article>
-
-          <article class="card evidence-card">
+          <article id="evidencePanel" class="card evidence-card evidence-panel" aria-label="Verification evidence">
             <div class="card-heading evidence-heading"><div><h2>Verification evidence</h2><p>Source values checked against the ERP ledger.</p></div><span id="evidenceBadge" class="semantic-badge badge-neutral">Not verified</span></div>
             <div id="evidenceMeta" class="evidence-meta"><span>Source file</span><span id="evidenceSource" class="copy-value">—</span><span>SHA-256</span><span id="evidenceHash" class="copy-value">—</span></div>
             <div class="table-wrap"><table class="evidence-table"><thead><tr><th>Field</th><th>Invoice source</th><th>Ledger row</th><th>Result</th></tr></thead><tbody id="evidenceBody"><tr><td colspan="4" class="empty-cell">No ledger read-back yet.</td></tr></tbody></table></div>

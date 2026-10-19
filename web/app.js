@@ -8,6 +8,9 @@
     "planner_fallback", "task_intent", "intent_guard", "long_operation", "credentials_supplied",
     "provenance_attached", "approval_token_injected", "pending_question_stored", "finish_nudge",
   ]);
+  const SYSTEM_ACTIVITY_EVENTS = new Set([
+    ...META_EVENTS, "tool_retry_budget", "provider_turn", "rate_limit_recovery", "long_operation",
+  ]);
 
   function payload(event) { return event && event.payload && typeof event.payload === "object" ? event.payload : {}; }
   function dateMs(event) {
@@ -58,6 +61,11 @@
       const invoice = p.invoice;
       return [invoice.vendor, invoice.invoice_number, displayAmount(invoice), invoice.invoice_date && `dated ${invoice.invoice_date}`].filter(Boolean).join(" · ");
     }
+    if (action.tool === "read_policy" && p.policy) {
+      const thresholds = p.policy.thresholds || p.policy.approval_thresholds || {};
+      const summary = Object.entries(thresholds).map(([currency, amount]) => `${currency} ${amount}`).join(" · ");
+      return summary ? `Approval thresholds: ${summary}.` : "Procurement policy was read by the host.";
+    }
     if (action.tool === "list_invoice_candidates" && Array.isArray(p.candidates)) return `${p.candidates.length} invoice candidates found${action.vendor_query ? ` for ${action.vendor_query}` : ""}.`;
     if (action.tool === "read_ledger" && Array.isArray(p.bills)) return `${p.bills.length} ledger invoice${p.bills.length === 1 ? "" : "s"} found.`;
     if (p.fields && typeof p.fields === "object") return `${p.fields.invoice_number || "Invoice"} · ${p.fields.vendor || "vendor"} · ${p.fields.amount || "amount"} · due ${p.fields.due_date || "date unavailable"}`;
@@ -78,12 +86,42 @@
     for (let index = actionIndex + 1; index < events.length; index += 1) {
       const current = events[index];
       if (current.event_type === "action") break;
+      if (current.event_type === "final_result" && tool === "finish") continue;
       if (current.event_type === "final_result" || current.event_type === "run_error") break;
       if (current.event_type !== "observation") continue;
       const p = payload(current);
       if (p.tool === tool || p.tool === "tool_validation_feedback" || p.tool === "tool_use_failed" || p.error || p.alert) return index;
     }
     return -1;
+  }
+  function matchFillBatch(events, actionIndex) {
+    const children = [];
+    for (let index = actionIndex + 1; index < events.length; index += 1) {
+      const current = events[index];
+      if (current.event_type === "action") {
+        if (payload(current).tool === "browser_fill") { children.push(index); continue; }
+        break;
+      }
+      if (current.event_type === "final_result" || current.event_type === "run_error") break;
+      if (current.event_type !== "observation") continue;
+      const p = payload(current);
+      if (p.tool === "browser_fill_form" || p.tool === "tool_validation_feedback" || p.tool === "tool_use_failed" || p.error) return { observationIndex: index, children };
+    }
+    return { observationIndex: -1, children };
+  }
+  function isFillBatchChild(events, actionIndex) {
+    for (let index = actionIndex - 1; index >= 0; index -= 1) {
+      const current = events[index];
+      if (current.event_type !== "action") continue;
+      const tool = payload(current).tool;
+      if (tool === "browser_fill") continue;
+      return tool === "browser_fill_form";
+    }
+    return false;
+  }
+  function ledgerRowLabel(value) {
+    const id = String(value ?? "?");
+    return id.startsWith("#") ? id : `#${id}`;
   }
   function nextActionTitle(events, startIndex) {
     for (let index = startIndex + 1; index < events.length; index += 1) {
@@ -113,8 +151,11 @@
     const events = (Array.isArray(input) ? input : []).filter((event) => event && event.event_type !== "browser_frame");
     const rows = [];
     const consumed = new Set();
+    const seenSelections = new Set();
     let rateLimitWaits = 0;
     let correctedCalls = 0;
+    const rateLimitNotes = [];
+    const systemEvents = events.filter((event) => SYSTEM_ACTIVITY_EVENTS.has(event.event_type));
 
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index];
@@ -123,7 +164,10 @@
       const type = event.event_type;
 
       if (type === "action") {
-        const observationIndex = matchObservation(events, index);
+        if (p.tool === "browser_fill" && isFillBatchChild(events, index)) continue;
+        const batch = p.tool === "browser_fill_form" ? matchFillBatch(events, index) : null;
+        const observationIndex = batch ? batch.observationIndex : matchObservation(events, index);
+        for (const childIndex of batch?.children || []) consumed.add(childIndex);
         const observation = observationIndex >= 0 ? events[observationIndex] : null;
         if (observationIndex >= 0) consumed.add(observationIndex);
         const tool = p.tool;
@@ -140,7 +184,7 @@
         const observationPayload = payload(observation);
         const result = actionResult(event, observation);
         const semantic = payload(associated);
-        const failed = Boolean(observationPayload.error || observationPayload.warning || observationPayload.alert || observationPayload.success === false || ["error", "failed", "rejected"].includes(observationPayload.status) || semantic.status === "mismatch" || semantic.pass === false);
+        const failed = Boolean(observationPayload.error || observationPayload.warning || observationPayload.alert || observationPayload.success === false || observationPayload.pass === false || ["error", "failed", "rejected", "not_found"].includes(observationPayload.status) || semantic.status === "mismatch" || semantic.pass === false);
         let summary = result;
         let title = actionTitle(event);
         if (associatedType === "approval_requested" && associated) {
@@ -151,9 +195,10 @@
         if (associatedType === "verification" && associated) {
           const matches = semantic.matches || {};
           const passed = semantic.status === "verified" || (Object.keys(matches).length > 0 && Object.values(matches).every(Boolean));
-          title = passed ? `Verified: all ${Object.keys(matches).length} fields match ledger row #${semantic.ledger_row_id ?? "?"}` : "Ledger verification failed";
+          title = passed ? `Verified: all ${Object.keys(matches).length} fields match ledger row ${ledgerRowLabel(semantic.ledger_row_id)}` : "Ledger verification failed";
           summary = passed ? `The ledger row matches the selected invoice.${semantic.screenshot_path ? ` Evidence: ${semantic.screenshot_path.split(/[\\/]/).pop()}.` : ""}` : semantic.message || semantic.error || `Verification status: ${semantic.status || "not verified"}.`;
         }
+        if (tool === "verify_ledger_row" && failed && observationPayload.status === "not_found") title = "Ledger row not found";
         if (failed) {
           const next = nextActionTitle(events, observationIndex >= 0 ? observationIndex : index);
           if (/submit_btn/i.test(p.selector || "")) title = /approval/i.test(`${observationPayload.alert || ""} ${observationPayload.error || ""}`) ? "ERP rejected: approval required" : "ERP rejected invoice submission";
@@ -168,6 +213,9 @@
       }
 
       if (type === "selection_check") {
+        const selectionKey = `${p.selected_invoice || p.invoice_number || ""}|${p.criterion || ""}|${p.status || ""}`;
+        if (seenSelections.has(selectionKey)) continue;
+        seenSelections.add(selectionKey);
         const chosen = p.selected_invoice || p.invoice_number || "invoice";
         const criterion = criterionLabel(p.criterion);
         const passed = p.status === "passed";
@@ -193,7 +241,7 @@
       if (type === "verification") {
         const count = Object.keys(p.matches || {}).length;
         const passed = p.status === "verified" || (count > 0 && Object.values(p.matches).every(Boolean));
-        const title = passed ? `Verified: all ${count} fields match ledger row #${p.ledger_row_id ?? "?"}` : "Ledger verification failed";
+        const title = passed ? `Verified: all ${count} fields match ledger row ${ledgerRowLabel(p.ledger_row_id)}` : "Ledger verification failed";
         const result = passed ? `The ledger row matches the selected invoice.${p.screenshot_path ? ` Evidence: ${basename(p.screenshot_path)}.` : ""}` : p.message || `Verification status: ${p.status || "not verified"}.`;
         pushRow(rows, { event, title, result, status: passed ? "ok" : "error" });
         continue;
@@ -203,11 +251,7 @@
         const action = p.action || "recovery";
         if (action === "retry_wait") {
           rateLimitWaits += 1;
-          pushRow(rows, { event, title: `Rate limit wait · ${p.provider || "provider"}`, result: `HTTP ${p.status_code || 429}. Waited ${p.wait_seconds ?? "?"} seconds, then retried the same provider.`, status: "warning" });
-        } else if (action === "provider_fallback") {
-          pushRow(rows, { event, title: "Provider recovery", result: `Retries failed on ${p.previous_provider || "the provider"}; continuing with ${p.provider || "another live provider"}.`, status: "warning" });
-        } else if (action === "retries_exhausted") {
-          pushRow(rows, { event, title: "Provider retries exhausted", result: p.response_body || `${p.provider || "Provider"} returned HTTP ${p.status_code || "error"} after ${p.retry_count ?? "several"} retries.`, status: "error" });
+          rateLimitNotes.push(`Waiting ${p.wait_seconds ?? "?"}s: ${p.provider || "provider"} rate limit`);
         }
         continue;
       }
@@ -256,7 +300,19 @@
     const budgetEvents = events.filter((event) => event.event_type === "tool_retry_budget");
     const feedbackEvents = events.filter((event) => event.event_type === "observation" && ["tool_validation_feedback", "tool_use_failed"].includes(payload(event).tool));
     correctedCalls = Math.max(correctedCalls, budgetEvents.length, feedbackEvents.length);
-    return { rows, rateLimitWaits, correctedCalls };
+    if (systemEvents.length) {
+      const providers = [...new Set(systemEvents.map((event) => payload(event).provider).filter(Boolean))];
+      const result = [
+        `${systemEvents.length} provider and host events`,
+        providers.length ? `providers: ${providers.join(", ")}` : "",
+        rateLimitWaits ? `${rateLimitWaits} rate-limit ${rateLimitWaits === 1 ? "wait" : "waits"}` : "",
+      ].filter(Boolean).join(" · ");
+      pushRow(rows, {
+        event: systemEvents[systemEvents.length - 1], title: `Provider and system activity (${systemEvents.length})`,
+        result, status: rateLimitWaits ? "warning" : "ok", rowType: "system_activity", detail: systemEvents,
+      });
+    }
+    return { rows, rateLimitWaits, correctedCalls, rateLimitNotes };
   }
 
   function progressSteps(run) {
@@ -269,7 +325,8 @@
     const refused = ["unsupported", "ambiguous"].includes(intent) || payload(finalEvent).status === "needs_input";
     const approved = events.some((event) => event.event_type === "approval_decision" && (payload(event).decision === "approved" || payload(event).token_minted === true));
     const requested = types.has("approval_requested");
-    const selected = types.has("selection_check") || events.some((event) => event.event_type === "action" && ["read_document", "list_invoice_candidates"].includes(payload(event).tool));
+    const selected = events.some((event) => event.event_type === "selection_check" && payload(event).status === "passed")
+      || events.some((event) => event.event_type === "action" && payload(event).tool === "read_document");
     const proof = [...events].reverse().find((event) => event.event_type === "verification");
     const verified = payload(proof).status === "verified";
     const hostStates = events.filter((event) => event.event_type === "host_run_state").map(payload);
@@ -278,24 +335,36 @@
     const writing = !readOnly && (intent === "write_invoice_entry" || selected || submitted || requested || verified);
     const completeRead = readOnly && ["complete", "verified"].includes(run.status);
     const terminal = !["running", "awaiting_approval"].includes(run.status) && !run.awaiting_approval;
-    const steps = [{ key: "understand", title: "Understand request", state: "done" }];
+    const failed = ["needs_review", "incomplete", "failed"].includes(run.status) || types.has("run_error");
+    const steps = [
+      { key: "understand", title: "Understand request", state: "done" },
+      { key: "select", title: "Select invoice", state: selected ? "done" : "upcoming" },
+      { key: "approve", title: "Approve", state: requested ? (approved ? "done" : run.awaiting_approval ? "current" : terminal ? "skipped" : "upcoming") : "skipped" },
+      { key: "submit_verify", title: "Submit & verify", state: verified ? "done" : submitted ? (failed ? "error" : "current") : "upcoming" },
+    ];
 
     if (!writing && (readOnly || refused)) {
       steps[0].state = refused ? "warning" : "done";
       if (readOnly && completeRead) steps[0].detail = "Read-only request";
-      return steps.concat([
-        { key: "select", title: "Select invoice", state: "skipped" },
-        { key: "approve", title: "Approve", state: "skipped" },
-        { key: "submit", title: "Submit", state: "skipped" },
-        { key: "verify", title: "Verify", state: "skipped" },
-      ]);
+      steps[1].state = "skipped";
+      steps[2].state = "skipped";
+      steps[3].state = "skipped";
+      return steps;
     }
 
-    steps.push({ key: "select", title: "Select invoice", state: selected ? "done" : run.status === "running" ? "current" : terminal ? "skipped" : "upcoming" });
-    if (requested) steps.push({ key: "approve", title: "Approve", state: approved ? "done" : run.awaiting_approval ? "current" : terminal && !approved ? "skipped" : "upcoming" });
-    else steps.push({ key: "approve", title: "Approve", state: (host.approval_status && !["not_selected", "policy_not_read", "pending"].includes(host.approval_status)) ? "done" : run.status === "complete" ? "skipped" : "skipped" });
-    steps.push({ key: "submit", title: "Submit", state: submitted ? "done" : run.awaiting_approval ? "upcoming" : terminal ? "skipped" : "current" });
-    steps.push({ key: "verify", title: "Verify", state: verified ? "done" : submitted && !terminal ? "current" : run.status === "running" && submitted ? "current" : terminal ? "skipped" : "upcoming" });
+    if (failed) {
+      if (!selected) steps[1].state = "error";
+      else if (requested && !approved) steps[2].state = "error";
+      else steps[3].state = "error";
+    } else if (!selected && !terminal) steps[1].state = "current";
+    else if (!requested && selected && ["required", "policy_not_read"].includes(host.approval_status) && !terminal) steps[2].state = "current";
+    else if (selected && !requested && !submitted && !terminal) steps[3].state = host.approval_status === "not_required" ? "current" : "upcoming";
+    else if (selected && approved && !submitted && !terminal) steps[3].state = "current";
+    else if (submitted && !verified && !terminal) steps[3].state = "current";
+    if (terminal && !verified && !failed) {
+      if (!selected) steps[1].state = "skipped";
+      if (!submitted) steps[3].state = "skipped";
+    }
     return steps;
   }
 
@@ -303,7 +372,7 @@
 });
 
 const $ = (selector, root = document) => root.querySelector(selector);
-const state = { runId: null, pollTimer: null, finished: true, run: null, view: "summary" };
+const state = { runId: null, pollTimer: null, finished: true, run: null, view: "summary", approvalSeen: false };
 
 async function requestJson(url, options = {}) {
   const response = await fetch(url, { ...options, headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) } });
@@ -449,11 +518,23 @@ function renderSummaryTrace(run) {
   const list = $("#traceList");
   list.replaceChildren();
   $("#traceCounts").replaceChildren();
+  $("#rateLimitNotes").replaceChildren();
   const counts = $("#traceCounts");
   if (summary.rateLimitWaits) counts.append(node("span", "count-badge count-blue", `${summary.rateLimitWaits} rate-limit ${summary.rateLimitWaits === 1 ? "wait" : "waits"}`));
   if (summary.correctedCalls) counts.append(node("span", "count-badge count-amber", `${summary.correctedCalls} corrected ${summary.correctedCalls === 1 ? "tool call" : "tool calls"}`));
+  for (const note of summary.rateLimitNotes || []) $("#rateLimitNotes").append(node("span", "rate-limit-note", note));
   $("#traceEmpty").hidden = summary.rows.length > 0;
   for (const row of summary.rows) {
+    if (row.rowType === "system_activity") {
+      const item = node("li", "system-activity-event");
+      const details = node("details", "system-activity-details");
+      const heading = node("summary", "system-activity-summary", row.title);
+      heading.title = row.result;
+      details.append(heading, node("pre", "diagnostic-payload", JSON.stringify(row.detail || [], null, 2)));
+      item.append(details);
+      list.append(item);
+      continue;
+    }
     const item = node("li", "summary-event");
     item.dataset.status = row.status;
     const mark = node("span", `summary-mark mark-${row.status}`, row.icon);
@@ -475,12 +556,10 @@ function renderSummaryTrace(run) {
     list.append(item);
   }
 }
-function renderDiagnosticsTrace(run) {
-  const list = $("#traceList");
+function renderDiagnosticsTrace(run, list = $("#diagnosticsList")) {
   list.replaceChildren();
-  $("#traceCounts").replaceChildren();
   const events = (run.events || []).filter((event) => event.event_type !== "browser_frame");
-  $("#traceEmpty").hidden = events.length > 0;
+  $("#diagnosticsEmpty").hidden = events.length > 0;
   for (const event of events) {
     const item = node("li", "diagnostic-event");
     item.dataset.type = event.event_type;
@@ -506,13 +585,11 @@ function renderTrace(run) {
   const scroll = $("#traceScroll");
   const previousTop = scroll.scrollTop;
   const follow = $("#followLatest").checked;
-  const events = (run.events || []).filter((event) => event.event_type !== "browser_frame");
-  $("#traceEmpty").hidden = events.length > 0;
-  if (state.view === "diagnostics") renderDiagnosticsTrace(run);
-  else renderSummaryTrace(run);
+  renderSummaryTrace(run);
+  renderDiagnosticsTrace(run);
   if (follow) requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
   else scroll.scrollTop = previousTop;
-  $("#traceSubtitle").textContent = state.view === "diagnostics" ? `${events.length} raw events · provider, host, and tool detail.` : "Actions and their results, grouped into the steps that matter.";
+  $("#traceSubtitle").textContent = "Actions and their results, grouped into the steps that matter.";
 }
 function getRunFacts(run) {
   const events = run.events || [];
@@ -530,6 +607,7 @@ function getRunFacts(run) {
   const readOnly = events.some((event) => event.event_type === "task_intent" && eventPayload(event).intent === "read_only");
   const status = run.awaiting_approval ? "awaiting_approval" : run.status || "running";
   let summary = final.summary || final.what_was_done || final.ledger_answer?.text || final.candidate_answer?.text || "The operator is working through the request.";
+  summary = summary.replace(/\s*Not done:\s*none\.?$/i, "");
   if (status === "running") summary = "The operator is working through the request.";
   else if (status === "awaiting_approval") summary = "Review the selected invoice before it is submitted to the ERP.";
   else if (["needs_review", "incomplete", "failed"].includes(status)) summary = final.summary || eventPayload(errorEvent).error || "The task stopped before a verified result was available.";
@@ -565,7 +643,7 @@ function renderResult(run) {
     icon = facts.readOnly && facts.proof.status !== "verified" ? "✓" : "✓";
     iconClass = "icon-success";
   } else if (facts.status === "awaiting_approval") { label = "Awaiting approval"; icon = "!"; iconClass = "icon-warning"; }
-  else if (facts.status === "needs_input") { label = "Needs input"; icon = "?"; iconClass = "icon-warning"; }
+  else if (facts.status === "needs_input") { label = "Needs input"; icon = "!"; iconClass = "icon-warning"; }
   else if (["needs_review", "incomplete", "failed"].includes(facts.status)) { label = "Failed"; icon = "×"; iconClass = "icon-error"; }
   else if (facts.status === "stopped_by_user") { label = "Stopped"; icon = "—"; iconClass = "icon-neutral"; }
   $("#resultStatus").textContent = label;
@@ -595,7 +673,10 @@ function renderResult(run) {
   if (!resultEvidence.hidden) {
     resultEvidence.append(node("span", "selected-label", "Evidence"));
     const evidenceLines = node("div", "result-evidence-lines");
-    if (facts.ledgerRowId !== undefined) evidenceLines.append(node("span", "evidence-summary", `Ledger row #${facts.ledgerRowId}`));
+    if (facts.ledgerRowId !== undefined) {
+      const ledgerId = String(facts.ledgerRowId);
+      evidenceLines.append(node("span", "evidence-summary", `Ledger row ${ledgerId.startsWith("#") ? ledgerId : `#${ledgerId}`}`));
+    }
     if (facts.sourceFile) { const source = node("span", "result-evidence-path"); appendCopyValue(source, facts.sourceFile, { path: true, label: "Copy source file path" }); evidenceLines.append(source); }
     if (facts.sourceHash) { const hash = node("span", "result-evidence-path"); appendCopyValue(hash, facts.sourceHash, { path: true, label: "Copy source SHA-256" }); evidenceLines.append(hash); }
     appendEvidenceLink(evidenceLines, facts.screenshotUrl, "Open ledger screenshot ↗");
@@ -609,8 +690,9 @@ function renderProgress(run) {
   for (const [index, step] of steps.entries()) {
     const item = node("li", "progress-step");
     item.dataset.state = step.state;
-    const mark = node("span", "progress-mark", step.state === "done" ? "✓" : step.state === "current" ? "•" : step.state === "warning" ? "!" : step.state === "skipped" ? "–" : String(index + 1));
+    const mark = node("span", "progress-mark", step.state === "done" ? "✓" : step.state === "current" ? "●" : step.state === "warning" ? "⚠" : step.state === "error" ? "×" : step.state === "skipped" ? "–" : String(index + 1));
     mark.setAttribute("aria-hidden", "true");
+    item.setAttribute("aria-label", `${step.title}: ${step.state}`);
     item.append(mark, node("span", "progress-label", step.title));
     if (step.state === "skipped") item.append(node("span", "progress-skipped", "Skipped"));
     list.append(item);
@@ -640,6 +722,11 @@ function renderApproval(run) {
   $("#approvalDetail").textContent = payload.reason || (payload.policy_reasons || []).join(" ") || "Policy requires a human decision before the invoice is submitted.";
   $("#approveButton").disabled = false;
   $("#rejectButton").disabled = false;
+  if (!state.approvalSeen) {
+    state.approvalSeen = true;
+    const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+    requestAnimationFrame(() => $("#approvalBanner").scrollIntoView({ block: "start", behavior }));
+  }
 }
 function renderEvidence(run) {
   const proofEvent = [...(run.events || [])].reverse().find((event) => event.event_type === "verification");
@@ -672,8 +759,19 @@ function renderEvidence(run) {
     const row = node("tr");
     const fieldLabel = key === "invoice_number" ? "invoice #" : key.replaceAll("_", " ");
     row.append(node("td", "field-name", fieldLabel));
-    row.append(node("td", "", key === "vendor" ? `${proof.source_vendor || fields.vendor || "—"}${proof.canonical_vendor ? ` → ${proof.canonical_vendor}` : ""}` : fields[key] || "—"));
-    row.append(node("td", "", actual[key] || "—"));
+    for (const [value, label] of [
+      [key === "vendor" ? `${proof.source_vendor || fields.vendor || "—"}${proof.canonical_vendor ? ` → ${proof.canonical_vendor}` : ""}` : fields[key] || "—", `Copy invoice source ${fieldLabel}`],
+      [actual[key] || "—", `Copy ledger ${fieldLabel}`],
+    ]) {
+      const cell = node("td");
+      cell.title = value;
+      if (String(value).length > 27) {
+        const copy = node("span", "copy-value");
+        appendCopyValue(copy, value, { label });
+        cell.append(copy);
+      } else cell.textContent = value;
+      row.append(cell);
+    }
     const statusCell = node("td");
     statusCell.append(node("span", `proof-badge${matches[key] ? "" : " mismatch"}`, matches[key] ? "Match" : "Mismatch"));
     row.append(statusCell); body.append(row);
@@ -720,7 +818,9 @@ function renderHistory(runs) {
     const button = node("button", "history-row");
     button.type = "button";
     button.setAttribute("aria-current", String(run.id === state.runId));
-    button.append(node("span", "history-task", run.task || "Invoice task"), node("span", "history-state", friendlyStatus(run.status)));
+    button.title = run.task || "Invoice task";
+    const statusTone = run.status === "complete" ? "success" : run.status === "awaiting_approval" || run.status === "needs_input" ? "warning" : ["needs_review", "incomplete", "failed"].includes(run.status) ? "error" : "neutral";
+    button.append(node("span", "history-task", run.task || "Invoice task"), node("span", `history-state history-state-${statusTone}`, friendlyStatus(run.status)));
     const time = node("span", "history-time", `${run.id || ""} · ${run.started_at ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(run.started_at)) : ""}`);
     button.append(time);
     button.addEventListener("click", () => loadRun(run.id));
@@ -742,6 +842,22 @@ function renderRun(run) {
   if (run.awaiting_approval) { state.finished = false; setStatus("awaiting_approval"); setRunButton(true); }
   else if (run.status === "running") { state.finished = false; setStatus("running"); setRunButton(true); }
   else { state.finished = true; setRunButton(false); setStatus(run.status || "needs_review"); if (state.pollTimer) clearTimeout(state.pollTimer); refreshState(false); }
+}
+function setResultTab(view) {
+  state.view = view;
+  const tabs = [
+    ["summary", "summaryViewButton", "summaryPanel"],
+    ["diagnostics", "diagnosticsViewButton", "diagnosticsPanel"],
+  ];
+  for (const [key, buttonId, panelId] of tabs) {
+    const active = key === view;
+    const button = $(`#${buttonId}`);
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    $(`#${panelId}`).hidden = !active;
+  }
+  if (view === "diagnostics" && state.run) renderDiagnosticsTrace(state.run);
 }
 async function pollRun(runId) {
   try {
@@ -794,9 +910,12 @@ async function decideApproval(approved) {
 function clearRunPanel() {
   if (state.pollTimer) clearTimeout(state.pollTimer);
   state.finished = false; state.runId = null; state.run = null;
+  state.approvalSeen = false;
+  setResultTab("summary");
   $("#traceRunId").textContent = "Starting…";
   $("#traceRunId").title = "";
   $("#traceList").replaceChildren();
+  $("#diagnosticsList").replaceChildren(); $("#diagnosticsEmpty").hidden = false;
   $("#traceEmpty").hidden = false;
   $("#traceLoading").hidden = false;
   $("#approvalBanner").hidden = true;
@@ -810,7 +929,7 @@ function clearRunPanel() {
   $("#resultStatus").textContent = "Running"; $("#resultIcon").textContent = "◌"; $("#resultIcon").className = "result-icon icon-neutral";
   $("#resultSummary").textContent = "Starting the operator and connecting to the ERP sandbox."; $("#resultElapsed").textContent = "";
   $("#selectedInvoice").replaceChildren(); $("#selectedInvoice").hidden = true; $("#notDone").replaceChildren(); $("#notDone").hidden = true; $("#resultEvidence").replaceChildren(); $("#resultEvidence").hidden = true;
-  $("#traceCounts").replaceChildren(); $("#progressStepper").replaceChildren();
+  $("#traceCounts").replaceChildren(); $("#rateLimitNotes").replaceChildren(); $("#progressStepper").replaceChildren();
   setStatus("running"); setRunButton(true);
 }
 $("#taskForm").addEventListener("submit", async (event) => {
@@ -841,15 +960,16 @@ for (const button of document.querySelectorAll(".scenario-chip")) button.addEven
 });
 $("#approveButton").addEventListener("click", () => decideApproval(true));
 $("#rejectButton").addEventListener("click", () => decideApproval(false));
-$("#summaryViewButton").addEventListener("click", () => {
-  state.view = "summary"; $("#summaryViewButton").classList.add("is-active"); $("#diagnosticsViewButton").classList.remove("is-active");
-  $("#summaryViewButton").setAttribute("aria-pressed", "true"); $("#diagnosticsViewButton").setAttribute("aria-pressed", "false");
-  if (state.run) renderTrace(state.run);
-});
-$("#diagnosticsViewButton").addEventListener("click", () => {
-  state.view = "diagnostics"; $("#diagnosticsViewButton").classList.add("is-active"); $("#summaryViewButton").classList.remove("is-active");
-  $("#diagnosticsViewButton").setAttribute("aria-pressed", "true"); $("#summaryViewButton").setAttribute("aria-pressed", "false");
-  if (state.run) renderTrace(state.run);
+$("#summaryViewButton").addEventListener("click", () => setResultTab("summary"));
+$("#diagnosticsViewButton").addEventListener("click", () => setResultTab("diagnostics"));
+document.querySelector(".result-tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  const buttons = Array.from(document.querySelectorAll(".result-tabs [role=tab]"));
+  const index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = (index + (event.key === "ArrowRight" ? 1 : buttons.length - 1)) % buttons.length;
+  buttons[next].focus(); buttons[next].click();
 });
 $("#resetDemoButton").addEventListener("click", async () => {
   if (!window.confirm("Clear the demo ledger and run history? Invoice files and policy will stay in place.")) return;
@@ -873,5 +993,6 @@ document.addEventListener("click", async (event) => {
 document.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") $("#taskForm").requestSubmit(); });
 $("#followLatest").addEventListener("change", () => { if ($("#followLatest").checked) $("#traceScroll").scrollTop = $("#traceScroll").scrollHeight; });
 setStatus("idle");
+setResultTab("summary");
 setRunLoading(false);
 refreshState();
