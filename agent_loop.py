@@ -144,6 +144,8 @@ class AgentLoop:
         self.approval_record: dict[str, Any] | None = None
         self._plain_text_nudge_used = False
         self.started_monotonic = time.monotonic()
+        self.provider_rate_limit_wait_seconds = 0.0
+        self._provider_wait_summary_emitted = False
         self._last_page_snapshot: dict[str, Any] | None = None
         self._last_action_key: str | None = None
         self._last_action_page_signature: str | None = None
@@ -1019,10 +1021,27 @@ class AgentLoop:
         return f"{name}({json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))})"
 
     def _provider_recovery(self, payload: dict[str, Any]) -> None:
+        if payload.get("action") == "retry_wait":
+            try:
+                wait_seconds = float(payload.get("wait_seconds", 0))
+            except (TypeError, ValueError):
+                wait_seconds = 0.0
+            if math.isfinite(wait_seconds) and wait_seconds > 0:
+                self.provider_rate_limit_wait_seconds += wait_seconds
         self.emit("rate_limit_recovery", payload)
         action = payload.get("action")
         if action == "provider_fallback":
             self.emit("planner", {"mode": "live", "provider": payload.get("provider"), "model": payload.get("model")})
+
+    def _emit_provider_wait_summary(self) -> None:
+        if self._provider_wait_summary_emitted or self.provider_rate_limit_wait_seconds <= 60:
+            return
+        self._provider_wait_summary_emitted = True
+        seconds = round(self.provider_rate_limit_wait_seconds, 1)
+        self.emit("provider_wait_summary", {
+            "total_wait_seconds": seconds,
+            "message": f"Provider rate limits added {seconds:g}s of waiting to this run.",
+        })
 
     def _provider_answered(self, payload: dict[str, Any]) -> None:
         self.emit("provider_turn", payload)
@@ -2091,6 +2110,7 @@ class AgentLoop:
                     return self.finished
             return "needs_review", f"The agent reached the {MAX_STEPS}-step limit without calling finish."
         finally:
+            self._emit_provider_wait_summary()
             if self.prompt_tokens_after:
                 breakdown_keys = self.prompt_breakdown_tokens[0].keys()
                 self.emit("prompt_size_summary", {
@@ -2119,10 +2139,15 @@ class AgentLoop:
         return f"Tool validation retry limit reached after {MAX_TOOL_VALIDATION_RETRIES} retries. Last tool error{label}: {last_error}"
 
     @staticmethod
-    def _validate_arguments(call: ToolCall) -> None:
+    def _validate_arguments(call: ToolCall) -> dict[str, Any]:
         definition = TOOL_BY_NAME[call.name]
         schema = definition["parameters"]
-        AgentLoop._validate_schema_value(call.arguments, schema, "Tool arguments")
+        arguments = call.arguments
+        if schema.get("type") == "object" and not schema.get("properties"):
+            if arguments is None or arguments == {"arguments": {}} or arguments == {"arguments": None}:
+                arguments = {}
+        AgentLoop._validate_schema_value(arguments, schema, "Tool arguments")
+        return arguments
 
     @staticmethod
     def _validate_schema_value(value: Any, schema: dict[str, Any], label: str) -> None:
