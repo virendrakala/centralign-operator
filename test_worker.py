@@ -371,7 +371,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input")
         self.assertIn("cannot send email", summary)
-        self.assertIn("Not done: enter invoice in the ledger, email vendor.", summary)
+        self.assertIn("Not done: record invoice, email vendor.", summary)
         self.assertFalse(loop.intent_guard_result["write_allowed"])
         self.assertEqual(loop.task_intent["intent"], "unsupported")
         loop.browser.start.assert_not_awaited()
@@ -399,7 +399,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input")
         self.assertIn("does not explicitly ask me to enter, record, post, or log", summary)
-        self.assertIn("Not done: enter invoice.", summary)
+        self.assertIn("Not done: record invoice.", summary)
         self.assertEqual(loop.task_intent["intent"], "ambiguous")
         self.assertFalse(loop.intent_guard_result["write_allowed"])
         loop.browser.start.assert_not_awaited()
@@ -422,8 +422,8 @@ class AgentLoopUnitTests(unittest.TestCase):
             status, summary = asyncio.run(loop.run())
 
         self.assertEqual(status, "needs_review")
-        self.assertIn("Not done: enter invoice in the ledger.", summary)
-        self.assertEqual(loop.final_result["not_done_actions"], ["enter invoice in the ledger"])
+        self.assertIn("Not done: record invoice.", summary)
+        self.assertEqual(loop.final_result["not_done_actions"], ["record invoice"])
         self.assertTrue(any(kind == "final_result" for kind, _ in events))
 
     def test_prompt_injection_is_flagged_removed_and_cannot_override_parsed_amount(self) -> None:
@@ -698,6 +698,235 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertNotIn("demo-password", serialized)
         self.assertNotIn("APR-ABCDEF123456", serialized)
         self.assertNotIn("gsk_12345678901234567890", serialized)
+
+    def test_intent_gate_finishes_without_any_provider_calls(self) -> None:
+        class CountingFakeLLM(FakeLLM):
+            def __init__(self):
+                self.classify_calls = 0
+                self.planner_calls = 0
+
+            def classify_task_intent(self, task, vendors):
+                self.classify_calls += 1
+                return super().classify_task_intent(task, vendors)
+
+            def next_tool_call(self, task, observations, tools):
+                self.planner_calls += 1
+                return super().next_tool_call(task, observations, tools)
+
+        tasks = [
+            "Pay the Northstar invoice and email the vendor",
+            "Enter the latest invoice",
+            "Enter an invoice from Northstar",
+            "Enter the latest invoice from Mistral Systems",
+        ]
+        for index, task in enumerate(tasks):
+            with self.subTest(task=task), TemporaryDirectory(prefix="centralign-gate-no-provider-") as temp_dir:
+                client = CountingFakeLLM()
+                loop = AgentLoop(Path(temp_dir), f"gate-{index}", task, "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+                loop.browser.start = unittest.mock.AsyncMock()
+                loop.browser.close = unittest.mock.AsyncMock()
+                status, _ = asyncio.run(loop.run())
+                self.assertEqual(status, "needs_input")
+                self.assertEqual(client.classify_calls, 0)
+                self.assertEqual(client.planner_calls, 0)
+                loop.browser.start.assert_not_awaited()
+
+    def test_output_parse_failed_is_fed_back_then_retried(self) -> None:
+        class ParseFailureFakeLLM(FakeLLM):
+            def __init__(self):
+                self.calls = []
+
+            def next_tool_call(self, task, observations, tools):
+                self.calls.append(json.loads(json.dumps(observations)))
+                if len(self.calls) == 1:
+                    return ToolCall("read_ledger", {"vendor_query": "Acme"})
+                if len(self.calls) == 2:
+                    raise ProviderRequestError(
+                        self.name, self.model, 400,
+                        response_body='{"error":{"code":"output_parse_failed","message":"invalid tool output"}}',
+                        error_code="output_parse_failed",
+                    )
+                return ToolCall("finish", {"status": "complete", "summary": "Done."})
+
+        with TemporaryDirectory(prefix="centralign-output-parse-retry-") as temp_dir:
+            client = ParseFailureFakeLLM()
+            loop = AgentLoop(Path(temp_dir), "output-parse-retry", "Show me what Acme has been invoiced", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, _ = asyncio.run(loop.run())
+
+        self.assertEqual(status, "complete")
+        self.assertEqual(len(client.calls), 3)
+        feedback = next(item for item in client.calls[2] if item.get("tool") == "tool_validation_feedback")
+        self.assertIn("output_parse_failed", feedback["result"]["error"])
+
+        class RepeatingParseFailure(FakeLLM):
+            def __init__(self):
+                self.calls = 0
+
+            def next_tool_call(self, _task, _observations, _tools):
+                self.calls += 1
+                raise ProviderRequestError(
+                    self.name, self.model, 400,
+                    response_body='{"error":{"code":"output_parse_failed","message":"invalid tool output"}}',
+                    error_code="output_parse_failed",
+                )
+
+        with TemporaryDirectory(prefix="centralign-output-parse-cap-") as temp_dir:
+            client = RepeatingParseFailure()
+            loop = AgentLoop(Path(temp_dir), "output-parse-cap", "Show me what Acme has been invoiced", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=client)
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+        self.assertEqual(status, "needs_input")
+        self.assertEqual(client.calls, 4)
+        self.assertIn("output_parse_failed", summary)
+
+    def test_provider_exception_after_host_final_result_does_not_fail_the_run(self) -> None:
+        with TemporaryDirectory(prefix="centralign-final-result-preserved-") as temp_dir:
+            data_dir = Path(temp_dir)
+            manager = RunManager(CompanyApp(data_dir), data_dir, offline=True)
+
+            async def runner(_data_dir, _run_id, _task, _base_url, emit, _approval_handler, **_kwargs):
+                emit("final_result", {"status": "needs_input", "summary": "Host asked for a vendor."})
+                raise ProviderRequestError("groq", "test-model", 400, response_body="output_parse_failed", error_code="output_parse_failed")
+
+            async def check() -> None:
+                with patch("web_app.run_computer_use_agent", new=runner):
+                    run_id = manager.start("Enter the latest invoice", "policy_driven", "http://127.0.0.1:8765", "session")
+                    await manager._tasks[run_id]
+                run = manager.get_run(run_id)
+                self.assertEqual(run["status"], "needs_input")
+                self.assertEqual(run["summary"], "Host asked for a vendor.")
+                self.assertFalse(any(event["event_type"] == "run_error" for event in run["events"]))
+
+            asyncio.run(check())
+
+    def test_pending_question_confirmation_is_scoped_and_policy_gate_remains(self) -> None:
+        with TemporaryDirectory(prefix="centralign-pending-confirmation-") as temp_dir:
+            data_dir = Path(temp_dir)
+            ensure_operator_assets(data_dir)
+            manager = RunManager(CompanyApp(data_dir), data_dir, offline=True)
+            manager.company.start_run("prior-question", "Pay the Northstar invoice and email the vendor")
+            manager._sequence["prior-question"] = 0
+            manager.event("prior-question", "task_intent", {
+                "intent": "unsupported", "vendor_query": "Northstar", "invoice_number": "",
+                "selection_criterion": "other", "reason": "The request names a Northstar invoice.",
+                "requested_actions": [
+                    {"action": "pay", "capability": "unsupported"},
+                    {"action": "email vendor", "capability": "unsupported"},
+                ],
+            })
+            manager.event("prior-question", "final_result", {
+                "status": "needs_input",
+                "summary": "I can record the invoice in the ledger, but cannot make payments or send email. Would you like me to proceed with just recording it? Not done: pay, email vendor.",
+            })
+            manager._save_pending_question("ui-session", "prior-question", "Pay the Northstar invoice and email the vendor", "needs_input")
+            pending = manager._pending_question_contexts["ui-session"]
+            self.assertEqual(pending["proposed_reduced_action"], "enter_invoice")
+            self.assertEqual(pending["invoice_number"], "NS-7002")
+            self.assertIn("created_at", pending)
+            self.assertIn("expires_at", pending)
+
+            async def check_confirmation() -> None:
+                with patch("web_app.run_computer_use_agent", new=unittest.mock.AsyncMock(return_value=("needs_input", "selection remains pending"))) as runner:
+                    run_id = manager.start("yes, just record it", "policy_driven", "http://127.0.0.1:8765", "ui-session")
+                    await manager._tasks[run_id]
+                    kwargs = runner.await_args.kwargs
+                    self.assertIn("NS-7002", runner.await_args.args[2])
+                    self.assertEqual(kwargs["confirmed_pending_context"]["unsupported_actions"], ["pay", "email vendor"])
+                    trace = manager.get_run(run_id)["events"]
+                    self.assertTrue(any(event["event_type"] == "pending_question_reply" and "Replying to previous question" in event["payload"]["message"] for event in trace))
+
+            asyncio.run(check_confirmation())
+
+            context = {**pending, "confirmed": True}
+            loop = AgentLoop(
+                data_dir, "confirmed-policy", manager._confirmed_task(pending), "http://127.0.0.1:8765",
+                lambda *_: None, lambda *_: None, confirmed_pending_context=context, client=FakeLLM(),
+            )
+            intent = asyncio.run(loop._classify_task_intent())
+            loop.task_intent = intent
+            loop.selected_invoice = {
+                "vendor": "Northstar Hosting", "canonical_vendor": "Northstar Cloud Hosting",
+                "invoice_number": "NS-7002", "invoice_date": "2026-10-02", "due_date": "2026-11-01",
+                "amount": "68500.00", "currency": "INR", "source_file": "ns.txt", "source_sha256": "a" * 64,
+            }
+            loop.policy = loop.company.read_company_policy()
+            loop.browser.start = unittest.mock.AsyncMock()
+            self.assertEqual(intent["intent"], "write_invoice_entry")
+            self.assertTrue(loop.intent_guard_result["write_allowed"])
+            self.assertEqual(loop._not_done_action_labels(), ["pay", "email vendor"])
+            with self.assertRaisesRegex(ValueError, "Approval required: call request_human_approval"):
+                asyncio.run(loop._execute("browser_open", {"path": "/erp/invoices/new"}))
+
+    def test_not_done_actions_are_short_deduplicated_and_omit_confirmed_entry(self) -> None:
+        with TemporaryDirectory(prefix="centralign-not-done-normalization-") as temp_dir:
+            loop = AgentLoop(
+                Path(temp_dir), "not-done-normalization", "Pay the Acme invoice and email the vendor",
+                "http://127.0.0.1:8765", lambda *_: None, lambda *_: None,
+                confirmed_pending_context={"confirmed": True, "proposed_reduced_action": "enter_invoice"},
+                client=FakeLLM(),
+            )
+            loop.task_intent = {"requested_actions": [
+                {"action": "record invoice in the ledger", "capability": "enter_invoice"},
+                {"action": "payment", "capability": "unsupported"},
+                {"action": "pay", "capability": "unsupported"},
+                {"action": "email", "capability": "unsupported"},
+                {"action": "email vendor", "capability": "unsupported"},
+            ]}
+            self.assertEqual(loop._not_done_action_labels(), ["pay", "email vendor"])
+
+    def test_pending_question_no_cancels_and_unrelated_task_discards_context(self) -> None:
+        with TemporaryDirectory(prefix="centralign-pending-replies-") as temp_dir:
+            data_dir = Path(temp_dir)
+            manager = RunManager(CompanyApp(data_dir), data_dir, offline=True)
+            manager._pending_question_contexts["session"] = {
+                "original_task": "Pay the Northstar invoice and email the vendor", "vendor": "Northstar",
+                "proposed_reduced_action": "enter_invoice", "unsupported_actions": ["pay", "email vendor"],
+                "requested_actions": [], "expires_at_epoch": time.time() + 600,
+            }
+
+            async def check() -> None:
+                cancel_id = manager.start("no", "policy_driven", "http://127.0.0.1:8765", "session")
+                await manager._tasks[cancel_id]
+                canceled = manager.get_run(cancel_id)
+                self.assertEqual(canceled["status"], "stopped_by_user")
+                self.assertIn("Canceled the proposal", canceled["summary"])
+                self.assertIn("Not done: pay, email vendor.", canceled["summary"])
+
+                manager._pending_question_contexts["session"] = {
+                    "original_task": "Prior request", "vendor": "Northstar", "proposed_reduced_action": "enter_invoice",
+                    "unsupported_actions": ["pay"], "expires_at_epoch": time.time() + 600,
+                }
+                with patch("web_app.run_computer_use_agent", new=unittest.mock.AsyncMock(return_value=("complete", "new task done"))) as runner:
+                    new_id = manager.start("Show me what Acme has been invoiced", "policy_driven", "http://127.0.0.1:8765", "session")
+                    await manager._tasks[new_id]
+                    self.assertNotIn("session", manager._pending_question_contexts)
+                    self.assertIsNone(runner.await_args.kwargs["confirmed_pending_context"])
+                    self.assertEqual(runner.await_args.args[2], "Show me what Acme has been invoiced")
+
+            asyncio.run(check())
+
+    def test_expired_context_is_ignored_and_bare_yes_without_context_clarifies(self) -> None:
+        with TemporaryDirectory(prefix="centralign-expired-pending-") as temp_dir:
+            manager = RunManager(CompanyApp(Path(temp_dir)), Path(temp_dir), offline=True)
+            manager._pending_question_contexts["session"] = {
+                "original_task": "Prior request", "vendor": "Northstar", "proposed_reduced_action": "enter_invoice",
+                "unsupported_actions": ["pay"], "expires_at_epoch": time.time() - 1,
+            }
+
+            async def check() -> None:
+                run_id = manager.start("yes", "policy_driven", "http://127.0.0.1:8765", "session")
+                await manager._tasks[run_id]
+                run = manager.get_run(run_id)
+                self.assertEqual(run["status"], "needs_input")
+                self.assertIn("What would you like me to confirm?", run["summary"])
+                reply = next(event["payload"] for event in run["events"] if event["event_type"] == "pending_question_reply")
+                self.assertEqual(reply["status"], "needs_clarification")
+                self.assertNotIn("session", manager._pending_question_contexts)
+
+            asyncio.run(check())
 
     def test_malformed_arguments_are_fed_back_and_retry_limit_includes_last_error(self) -> None:
         class StubClient:
@@ -1064,7 +1293,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
         self.assertEqual(status, "needs_input", summary)
         self.assertIn(exact_error, summary)
-        self.assertIn("Not done: invoice selection, invoice submission, ledger read-back verification", summary)
+        self.assertIn("Not done: record invoice.", summary)
         retry_events = [payload for kind, payload in events if kind == "tool_retry_budget"]
         self.assertEqual([event["failure_count"] for event in retry_events], [1, 2, 3, 4])
         self.assertEqual(retry_events[-1]["limit"], 4)

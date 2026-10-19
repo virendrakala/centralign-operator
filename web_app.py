@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from pydantic import BaseModel, Field
 
 from company_app import CompanyApp
+from documents import list_invoice_candidates
 from worker import ensure_operator_assets, list_workspace_files, planner_config, run_computer_use_agent
 
 ROOT = Path(__file__).resolve().parent
@@ -97,6 +98,7 @@ def _ledger_page(bills: list[dict[str, Any]], posted: str | None = None) -> str:
 class RunCreate(BaseModel):
     task: str = Field(min_length=1, max_length=2000)
     approval_mode: Literal["policy_driven", "always_gate"] = "policy_driven"
+    session_id: str = Field(default="", max_length=128)
 
 
 class ApprovalDecision(BaseModel):
@@ -105,6 +107,14 @@ class ApprovalDecision(BaseModel):
 
 class RunManager:
     """Owns async tasks, audit events, approval futures, and short-lived ERP tokens."""
+
+    PENDING_QUESTION_TTL_SECONDS = 600
+    _AFFIRMATIVE_REPLIES = {
+        "yes", "yes please", "yes just record it", "yes go ahead", "yes go ahead and record it",
+        "yes just record it in the ledger", "go ahead", "go ahead and record it", "proceed",
+        "proceed with just recording it", "just record it", "record it", "okay", "ok", "sure",
+    }
+    _NEGATIVE_REPLIES = {"no", "no thanks", "cancel", "cancel it", "do not proceed", "don't proceed", "stop", "not now"}
 
     def __init__(self, company: CompanyApp, data_dir: Path, offline: bool = False) -> None:
         self.company = company
@@ -115,6 +125,8 @@ class RunManager:
         self._pending: dict[str, asyncio.Future[str | None]] = {}
         self._approval_payload: dict[str, dict[str, Any]] = {}
         self._tokens: dict[str, dict[str, Any]] = {}
+        self._pending_question_contexts: dict[str, dict[str, Any]] = {}
+        self._pending_question_lock = threading.Lock()
         self.run_log_dir = self.data_dir / "runs"
         self.run_log_dir.mkdir(parents=True, exist_ok=True)
         self._run_log_lock = threading.Lock()
@@ -157,14 +169,218 @@ class RunManager:
             with (self.run_log_dir / f"{run_id}.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(line, ensure_ascii=False, sort_keys=True) + "\n")
 
-    def start(self, task: str, approval_mode: str, base_url: str) -> str:
+    @staticmethod
+    def _reply_kind(text: str) -> str | None:
+        normalized = re.sub(r"[^a-z0-9' ]+", " ", text.casefold())
+        normalized = " ".join(normalized.split())
+        return "affirmative" if normalized in RunManager._AFFIRMATIVE_REPLIES else "negative" if normalized in RunManager._NEGATIVE_REPLIES else None
+
+    @staticmethod
+    def _is_bare_affirmative(text: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9' ]+", " ", text.casefold())
+        return " ".join(normalized.split()) in RunManager._AFFIRMATIVE_REPLIES
+
+    def _pop_pending_question(self, session_id: str) -> tuple[dict[str, Any] | None, bool]:
+        if not session_id:
+            return None, False
+        with self._pending_question_lock:
+            pending = self._pending_question_contexts.pop(session_id, None)
+        if not pending:
+            return None, False
+        expires_at = float(pending.get("expires_at_epoch", 0))
+        expired = expires_at <= datetime.now(timezone.utc).timestamp()
+        return (None, True) if expired else (pending, False)
+
+    def _save_pending_question(self, session_id: str, run_id: str, original_task: str, status: str) -> None:
+        if not session_id or status != "needs_input":
+            return
+        events = self.company.read_audit(run_id)
+        intent = next((event.get("payload", {}) for event in reversed(events) if event.get("event_type") == "task_intent"), {})
+        final = next((event.get("payload", {}) for event in reversed(events) if event.get("event_type") == "final_result"), {})
+        summary = str(final.get("summary", ""))
+        actions = intent.get("requested_actions", []) if isinstance(intent, dict) else []
+        unsupported = []
+        for item in actions:
+            if isinstance(item, dict) and item.get("capability") == "unsupported":
+                label = str(item.get("action", "")).strip()
+                if label and label not in unsupported:
+                    unsupported.append(label)
+        vendor = str(intent.get("vendor_query", "")).strip() if isinstance(intent, dict) else ""
+        vendor_known = any(
+            vendor.casefold() in {str(item.get("short_name", "")).casefold(), str(item.get("legal_name", "")).casefold()}
+            for item in self.company.list_vendor_directory()
+        ) if vendor else False
+        proposed_action = "enter_invoice" if vendor_known and unsupported and "proceed with just recording" in summary.casefold() else None
+        candidate = None
+        invoice_number = str(intent.get("invoice_number", "")).strip() if isinstance(intent, dict) else ""
+        criterion = str(intent.get("selection_criterion", "other")) if isinstance(intent, dict) else "other"
+        reason = str(intent.get("reason", "")) if isinstance(intent, dict) else ""
+        candidates: list[dict[str, str]] = []
+        if proposed_action and vendor:
+            try:
+                candidates = list_invoice_candidates(self.data_dir, vendor)
+            except Exception:
+                candidates = []
+            if invoice_number:
+                candidate = next((item for item in candidates if item.get("invoice_number", "").casefold() == invoice_number.casefold()), None)
+            elif (
+                len(candidates) == 1
+                and criterion == "other"
+                and not re.search(r"\b20\d{2}[-/]\d{1,2}", original_task)
+                and not re.search(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", original_task, re.IGNORECASE)
+            ):
+                candidate = candidates[0]
+                invoice_number = str(candidate.get("invoice_number", ""))
+                criterion = "specific_invoice_number"
+                reason = f"The vendor has one parsed inbox invoice, {invoice_number}."
+        now = datetime.now(timezone.utc)
+        pending = {
+            "original_task": original_task,
+            "requested_actions": actions if isinstance(actions, list) else [],
+            "vendor": vendor,
+            "vendor_known": vendor_known,
+            "proposed_reduced_action": proposed_action,
+            "unsupported_actions": unsupported,
+            "selection_criterion": criterion,
+            "selection_reason": reason,
+            "invoice_number": invoice_number,
+            "candidate": candidate,
+            "candidates": [
+                {key: item.get(key, "") for key in ("path", "invoice_number", "invoice_date", "due_date", "amount", "currency")}
+                for item in candidates
+            ],
+            "created_at": now.isoformat(timespec="seconds"),
+            "expires_at": datetime.fromtimestamp(now.timestamp() + self.PENDING_QUESTION_TTL_SECONDS, timezone.utc).isoformat(timespec="seconds"),
+            "expires_at_epoch": now.timestamp() + self.PENDING_QUESTION_TTL_SECONDS,
+        }
+        with self._pending_question_lock:
+            self._pending_question_contexts[session_id] = pending
+        self.event(run_id, "pending_question_stored", {
+            "vendor": vendor or None, "proposed_reduced_action": proposed_action,
+            "unsupported_actions": unsupported, "expires_at": pending["expires_at"],
+        })
+
+    def start(self, task: str, approval_mode: str, base_url: str, session_id: str = "") -> str:
+        session_id = session_id.strip()[:128]
+        pending, expired = self._pop_pending_question(session_id)
+        reply = self._reply_kind(task)
+        clarify = "What would you like me to confirm?"
+        if pending and reply == "affirmative" and pending.get("proposed_reduced_action") == "enter_invoice":
+            has_date_scope = bool(
+                pending.get("invoice_number")
+                or pending.get("selection_criterion") == "latest_by_invoice_date"
+                or re.search(r"\b20\d{2}[-/]\d{1,2}", str(pending.get("original_task") or ""))
+                or re.search(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", str(pending.get("original_task") or ""), re.IGNORECASE)
+            )
+            if has_date_scope:
+                run_task = self._confirmed_task(pending)
+                confirmation_context = {**pending, "confirmed": True}
+                resolution = "confirmed"
+            else:
+                run_task = task
+                confirmation_context = None
+                resolution = "needs_clarification"
+                clarify = self._pending_clarification(pending)
+        elif pending and reply == "negative":
+            run_task = task
+            confirmation_context = None
+            resolution = "cancelled"
+        elif pending and reply == "affirmative":
+            run_task = task
+            confirmation_context = None
+            resolution = "needs_clarification"
+            clarify = self._pending_clarification(pending)
+        elif pending:
+            run_task = task
+            confirmation_context = None
+            resolution = "discarded_new_task"
+        elif self._is_bare_affirmative(task):
+            run_task = task
+            confirmation_context = None
+            resolution = "needs_clarification"
+        else:
+            run_task = task
+            confirmation_context = None
+            resolution = "expired" if expired else None
+
         run_id = uuid.uuid4().hex[:12]
-        self.company.start_run(run_id, task)
+        self.company.start_run(run_id, run_task)
         self._sequence[run_id] = 0
-        self.event(run_id, "task_started", {"task": task, "approval_mode": approval_mode, "runtime": "single-tool-call-agent-loop"})
-        task_handle = asyncio.create_task(self._execute(run_id, task, approval_mode, base_url), name=f"operator-{run_id}")
+        self.event(run_id, "task_started", {"task": run_task, "user_reply": task, "approval_mode": approval_mode, "runtime": "single-tool-call-agent-loop"})
+        if resolution:
+            self.event(run_id, "pending_question_reply", {
+                "status": resolution,
+                "message": "Replying to previous question" if resolution in {"confirmed", "cancelled", "needs_clarification"} and pending else "Previous question context expired; treating this as a new task." if expired else "Previous question context discarded; treating this as a new task.",
+                "original_task": pending.get("original_task") if pending else None,
+                "proposed_reduced_action": pending.get("proposed_reduced_action") if pending else None,
+                "unsupported_actions": pending.get("unsupported_actions", []) if pending else [],
+            })
+        if resolution == "cancelled":
+            summary = "Canceled the proposal. Nothing was recorded."
+            not_done = list(pending.get("unsupported_actions", []))
+            self._start_host_only_finish(run_id, "stopped_by_user", summary, pending, not_done)
+            task_handle = asyncio.create_task(asyncio.sleep(0), name=f"operator-{run_id}")
+        elif resolution == "needs_clarification":
+            self._start_host_only_finish(run_id, "needs_input", clarify, pending or {}, list((pending or {}).get("unsupported_actions", [])))
+            task_handle = asyncio.create_task(asyncio.sleep(0), name=f"operator-{run_id}")
+        else:
+            task_handle = asyncio.create_task(
+                self._execute(run_id, run_task, approval_mode, base_url, session_id, confirmation_context),
+                name=f"operator-{run_id}",
+            )
         self._tasks[run_id] = task_handle
         return run_id
+
+    @staticmethod
+    def _confirmed_task(pending: dict[str, Any]) -> str:
+        vendor = str(pending.get("vendor") or "").strip()
+        invoice_number = str(pending.get("invoice_number") or "").strip()
+        if invoice_number:
+            return f"Record invoice {invoice_number} from {vendor} in the ledger."
+        criterion = pending.get("selection_criterion")
+        if criterion == "latest_by_invoice_date":
+            return f"Record the latest invoice from {vendor} in the ledger."
+        original_task = str(pending.get("original_task") or "")
+        explicit_date = re.search(r"\b(20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?)\b", original_task)
+        if explicit_date:
+            return f"Record the invoice dated {explicit_date.group(1)} from {vendor} in the ledger."
+        month = re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b", original_task, re.IGNORECASE)
+        if month and criterion == "other":
+            return f"Record the {month.group(1)} invoice from {vendor} in the ledger."
+        return f"Record an invoice from {vendor} in the ledger."
+
+    @staticmethod
+    def _pending_clarification(pending: dict[str, Any]) -> str:
+        if pending.get("vendor") and not pending.get("vendor_known"):
+            return f"I couldn't identify vendor {pending['vendor']} in the company directory. Which listed vendor should I use?"
+        candidates = pending.get("candidates") or []
+        if pending.get("proposed_reduced_action") == "enter_invoice" and candidates:
+            options = "; ".join(
+                f"{item.get('invoice_number')} dated {item.get('invoice_date')} for {item.get('currency')} {item.get('amount')}"
+                for item in candidates[:8]
+            )
+            return f"I can proceed with invoice entry only. Which {pending.get('vendor')} invoice should I record? Candidates: {options}."
+        if pending.get("proposed_reduced_action") == "enter_invoice":
+            return f"I couldn't find a parsed invoice candidate for {pending.get('vendor')}. Please check the inbox or clarify the vendor."
+        return "What would you like me to confirm?"
+
+    def _start_host_only_finish(self, run_id: str, status: str, summary: str, pending: dict[str, Any], not_done: list[str]) -> None:
+        unique_not_done = list(dict.fromkeys(str(item) for item in not_done if str(item).strip()))
+        summary = f"{summary.rstrip()} Not done: {', '.join(unique_not_done) if unique_not_done else 'none'}."
+        result = {
+            "status": status,
+            "summary": summary,
+            "what_was_done": "No requested actions were completed.",
+            "requested_actions": pending.get("requested_actions", []),
+            "not_done_actions": unique_not_done,
+            "not_done": "none" if not unique_not_done else ", ".join(unique_not_done),
+            "evidence": {},
+            "elapsed_seconds": 0.0,
+            "original_task": pending.get("original_task"),
+        }
+        self.event(run_id, "final_result", result)
+        self.event(run_id, "task_finished", {"status": status, "summary": summary})
+        self.company.finish_run(run_id, status, summary)
 
     async def request_approval(self, run_id: str, payload: dict[str, Any]) -> str | None:
         future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
@@ -213,7 +429,10 @@ class RunManager:
         record["used"] = True
         return True
 
-    async def _execute(self, run_id: str, task: str, approval_mode: str, base_url: str) -> None:
+    async def _execute(
+        self, run_id: str, task: str, approval_mode: str, base_url: str,
+        session_id: str = "", confirmed_pending_context: dict[str, Any] | None = None,
+    ) -> None:
         try:
             status, summary = await run_computer_use_agent(
                 self.data_dir,
@@ -224,11 +443,21 @@ class RunManager:
                 lambda payload: self.request_approval(run_id, payload),
                 approval_mode=approval_mode,
                 offline=self.offline,
+                confirmed_pending_context=confirmed_pending_context,
             )
         except Exception as exc:
-            status = "needs_review"
-            summary = f"The computer-use run stopped safely: {type(exc).__name__}: {exc}"
-            self.event(run_id, "run_error", {"error": summary})
+            final_event = next(
+                (event.get("payload", {}) for event in reversed(self.company.read_audit(run_id)) if event.get("event_type") == "final_result"),
+                None,
+            )
+            if isinstance(final_event, dict) and final_event.get("status") in {"complete", "needs_input", "needs_review", "stopped_by_user"}:
+                status = str(final_event["status"])
+                summary = str(final_event.get("summary", "The host already finalized this run."))
+            else:
+                status = "needs_review"
+                summary = f"The computer-use run stopped safely: {type(exc).__name__}: {exc}"
+                self.event(run_id, "run_error", {"error": summary})
+        self._save_pending_question(session_id, run_id, task, status)
         self.event(run_id, "task_finished", {"status": status, "summary": summary})
         self.company.finish_run(run_id, status, summary)
 
@@ -263,6 +492,7 @@ class RunManager:
         self._pending.clear()
         self._approval_payload.clear()
         self._tokens.clear()
+        self._pending_question_contexts.clear()
         self._sequence.clear()
         for path in self.run_log_dir.glob("*.jsonl"):
             path.unlink(missing_ok=True)
@@ -326,7 +556,7 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
             raise HTTPException(status_code=403, detail="The Operator only starts browser actions on the local ERP host.")
         port = request.url.port or 8765
         base_url = f"http://{host}:{port}"
-        run_id = manager.start(payload.task.strip(), payload.approval_mode, base_url)
+        run_id = manager.start(payload.task.strip(), payload.approval_mode, base_url, payload.session_id)
         return {"run_id": run_id}
 
     @application.get("/api/runs")

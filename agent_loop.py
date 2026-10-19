@@ -35,7 +35,7 @@ _MONTHS = {
     "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12",
 }
 _HOST_ENTRY_VERBS = re.compile(r"\b(?:enter|record|post|log|add|submit)\b", re.IGNORECASE)
-_HOST_INVOICE_TOPIC = re.compile(r"\b(?:invoice|invoices|bill|bills)\b", re.IGNORECASE)
+_HOST_INVOICE_TOPIC = re.compile(r"\b(?:invoices?|invoiced|bills?|billed|billing)\b", re.IGNORECASE)
 _HOST_UNSUPPORTED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("pay", re.compile(r"\b(?:pay|pays|paid|paying)\b|\b(?:make|initiate|process)\s+(?:a\s+)?payments?\b", re.IGNORECASE)),
     ("approve payment", re.compile(r"\bapprove\s+(?:the\s+)?payments?\b", re.IGNORECASE)),
@@ -139,10 +139,12 @@ class AgentLoop:
         approval_mode: str = "policy_driven",
         offline: bool = False,
         client: LLMClient | None = None,
+        confirmed_pending_context: dict[str, Any] | None = None,
     ) -> None:
         self.data_dir = data_dir.resolve()
         self.run_id = run_id
         self.task = task
+        self.confirmed_pending_context = dict(confirmed_pending_context or {})
         self.base_url = base_url
         self.emit = emit
         self.approval_handler = approval_handler
@@ -301,15 +303,14 @@ class AgentLoop:
             "verification_status": "verified" if verification_passed else str((self.verification or {}).get("status") or "pending"),
         }
 
-    @staticmethod
-    def _canonical_action_label(action: str) -> str:
+    def _canonical_action_label(self, action: str) -> str:
         action = " ".join(action.casefold().split())
         if re.search(r"\bapprove\b.*\bpayments?\b", action):
             return "approve payment"
         if re.search(r"\b(?:pay|payment|paid|paying)\b", action):
             return "pay"
         if re.search(r"\b(?:email|e-mail)\b", action):
-            return "email vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "email"
+            return "email vendor" if re.search(r"\b(?:vendor|supplier)\b", action) or re.search(r"\b(?:vendor|supplier)\b", self.task, re.IGNORECASE) else "email"
         if re.search(r"\b(?:wire|transfer)\b", action):
             return "transfer"
         if re.search(r"\b(?:delete|remove)\b", action):
@@ -319,6 +320,8 @@ class AgentLoop:
         if re.search(r"\b(?:contact|notify)\b", action):
             return "contact vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "contact"
         if re.search(r"\bsend\b", action):
+            if re.search(r"\b(?:email|e-mail)\b", self.task, re.IGNORECASE):
+                return "email vendor" if re.search(r"\b(?:vendor|supplier)\b", self.task, re.IGNORECASE) else "email"
             return "send"
         return action[:120]
 
@@ -360,21 +363,25 @@ class AgentLoop:
                 action_keys.add(key)
 
         classifier_unsupported = any(item["capability"] == "unsupported" for item in actions)
-        if classifier_intent == "unsupported" and not classifier_unsupported:
+        if classifier_intent == "unsupported" and not classifier_unsupported and not result.get("clarifying_question"):
             actions.append({"action": "unsupported requested action", "capability": "unsupported"})
             classifier_unsupported = True
         unsupported_actions = [item["action"] for item in actions if item["capability"] == "unsupported"]
         has_enter_capability = any(item["capability"] == "enter_invoice" for item in actions)
+        confirmed_reduced_action = (
+            self.confirmed_pending_context.get("proposed_reduced_action") == "enter_invoice"
+            and bool(self.confirmed_pending_context.get("confirmed"))
+        )
         guard_allows_write = (
             classifier_intent == "write_invoice_entry"
             and explicit_entry_verb
             and has_enter_capability
-            and not unsupported_actions
+            and (not unsupported_actions or confirmed_reduced_action)
         )
 
         effective_intent = classifier_intent
         clarifying_question = result["clarifying_question"]
-        if classifier_unsupported or unsupported:
+        if (classifier_unsupported or unsupported) and not confirmed_reduced_action:
             effective_intent = "unsupported"
             clarifying_question = ""
         elif classifier_intent == "write_invoice_entry" and not guard_allows_write:
@@ -395,6 +402,7 @@ class AgentLoop:
             "explicit_entry_verb": explicit_entry_verb,
             "unsupported_actions": unsupported_actions,
             "classifier_reported_unsupported": classifier_unsupported,
+            "confirmed_reduced_action": confirmed_reduced_action,
             "write_allowed": guard_allows_write and effective_intent == "write_invoice_entry",
             "effective_intent": effective_intent,
         }
@@ -410,6 +418,44 @@ class AgentLoop:
 
     async def _classify_task_intent(self) -> dict[str, Any]:
         vendors = self.company.list_vendor_directory()
+        if self.confirmed_pending_context.get("confirmed"):
+            pending = self.confirmed_pending_context
+            vendor = str(pending.get("vendor") or "").strip()
+            invoice_number = str(pending.get("invoice_number") or "").strip()
+            criterion = str(pending.get("selection_criterion") or "other")
+            reason = str(pending.get("selection_reason") or "The user confirmed invoice recording only.")
+            task_intent = {
+                "intent": "write_invoice_entry",
+                "vendor_query": vendor,
+                "invoice_number": invoice_number,
+                "selection_criterion": criterion,
+                "reason": reason,
+                "clarifying_question": "",
+                "requested_actions": [
+                    {"action": "record invoice in the ledger", "capability": "enter_invoice"},
+                    *[
+                        {"action": str(action), "capability": "unsupported"}
+                        for action in pending.get("unsupported_actions", [])
+                    ],
+                ],
+            }
+            self.intent_guard_result = {
+                "classifier_intent": "write_invoice_entry",
+                "explicit_entry_verb": True,
+                "unsupported_actions": [str(action) for action in pending.get("unsupported_actions", [])],
+                "classifier_reported_unsupported": bool(pending.get("unsupported_actions")),
+                "confirmed_reduced_action": True,
+                "write_allowed": True,
+                "effective_intent": "write_invoice_entry",
+            }
+            task_intent["classifier_intent"] = "write_invoice_entry"
+            task_intent["intent_guard"] = dict(self.intent_guard_result)
+            return task_intent
+
+        preflight = self._preflight_intent_gate(vendors)
+        if preflight is not None:
+            return self._apply_host_intent_guard(preflight)
+
         classifier = getattr(self.client, "classify_task_intent", None)
         if callable(classifier):
             result = await self._await_with_long_operation_trace(
@@ -490,6 +536,97 @@ class AgentLoop:
         if result["intent"] == "ambiguous" and not result["clarifying_question"]:
             result["clarifying_question"] = "Please clarify the vendor and invoice you want me to use."
         return self._apply_host_intent_guard(result)
+
+    def _preflight_intent_gate(self, vendors: list[dict[str, str]]) -> dict[str, Any] | None:
+        """Stop obvious unsupported or underspecified requests before contacting a provider."""
+        unsupported = _deterministic_unsupported_actions(self.task)
+        has_invoice_topic = bool(_HOST_INVOICE_TOPIC.search(self.task))
+        entry_text = re.sub(r"\blog\s+in(?:to)?\b", " ", self.task, flags=re.IGNORECASE)
+        explicit_entry = bool(_HOST_ENTRY_VERBS.search(entry_text) and has_invoice_topic)
+
+        aliases: list[tuple[int, str]] = []
+        lowered = self.task.casefold()
+        for item in vendors:
+            for alias in (str(item.get("short_name", "")), str(item.get("legal_name", ""))):
+                if alias and re.search(rf"(?<![a-z0-9]){re.escape(alias.casefold())}(?![a-z0-9])", lowered):
+                    aliases.append((len(alias), str(item.get("short_name") or item.get("legal_name") or alias)))
+        vendor_query = ""
+        if aliases:
+            max_length = max(size for size, _ in aliases)
+            matches = sorted({name for size, name in aliases if size == max_length}, key=str.casefold)
+            if len(matches) == 1:
+                vendor_query = matches[0]
+            else:
+                return {
+                    "intent": "ambiguous", "vendor_query": "", "invoice_number": "",
+                    "selection_criterion": "other", "reason": "The vendor name matches multiple directory entries.",
+                    "clarifying_question": "Which vendor did you mean: " + ", ".join(matches) + "?",
+                    "requested_actions": ([{"action": "enter invoice in the ledger", "capability": "enter_invoice"}] if explicit_entry else []),
+                }
+        else:
+            phrase = re.search(r"\b(?:from|for|vendor)\s+([A-Z][A-Za-z0-9& .'-]{1,60})", self.task)
+            if phrase:
+                vendor_query = re.split(
+                    r"\b(?:invoice|invoices|bill|bills|latest|newest|record|enter|post|submit|in|and|email|pay)\b",
+                    phrase.group(1), flags=re.IGNORECASE,
+                )[0].strip(" .,-")
+
+        explicit_number = re.search(r"\b(?:AC[-_][A-Z0-9_-]+|INV[-_][A-Z0-9_-]+|NS[-_][A-Z0-9_-]+)\b", self.task, re.IGNORECASE)
+        months = _explicit_task_months(self.task)
+        if explicit_number:
+            criterion, reason, invoice_number = "specific_invoice_number", f"The task explicitly names invoice {explicit_number.group(0)}.", explicit_number.group(0)
+        elif re.search(r"\b(latest|newest|most recent)\b", self.task, re.IGNORECASE):
+            criterion, reason, invoice_number = "latest_by_invoice_date", "The task requests the latest invoice by invoice date.", ""
+        elif months:
+            criterion, reason, invoice_number = "other", f"The task specifies the {months[0].capitalize()} invoice.", ""
+        else:
+            criterion, reason, invoice_number = "other", "The task does not specify an invoice number or date criterion.", ""
+
+        actions = list(unsupported)
+        if explicit_entry:
+            actions.insert(0, {"action": "record invoice in the ledger", "capability": "enter_invoice"})
+        if unsupported:
+            return {
+                "intent": "unsupported", "vendor_query": vendor_query, "invoice_number": invoice_number,
+                "selection_criterion": criterion, "reason": reason, "clarifying_question": "",
+                "requested_actions": actions,
+            }
+
+        read_only_invoice_task = has_invoice_topic and bool(re.search(r"\b(?:what|show|list|which|lookup|look up|find|review|read)\b", self.task, re.IGNORECASE))
+        if explicit_entry or read_only_invoice_task:
+            if not vendor_query:
+                if re.search(r"\b(?:from|for)\s+[A-Z][A-Za-z0-9& .'-]{1,60}", self.task):
+                    question = f"I couldn't identify vendor {vendor_query or 'in that request'} in the company directory. Which listed vendor should I use?"
+                else:
+                    question = "Which vendor's invoice should I use?" if explicit_entry else "Which vendor's ledger entries should I look up?"
+                return {
+                    "intent": "ambiguous", "vendor_query": "", "invoice_number": invoice_number,
+                    "selection_criterion": criterion, "reason": reason, "clarifying_question": question,
+                    "requested_actions": ([{"action": "record invoice in the ledger", "capability": "enter_invoice"}] if explicit_entry else [{"action": "read ledger", "capability": "read_ledger"}]),
+                }
+            known = any(vendor_query.casefold() in {str(item.get("short_name", "")).casefold(), str(item.get("legal_name", "")).casefold()} for item in vendors)
+            if not known:
+                return {
+                    "intent": "ambiguous", "vendor_query": vendor_query, "invoice_number": invoice_number,
+                    "selection_criterion": criterion, "reason": reason,
+                    "clarifying_question": f"I couldn't identify vendor {vendor_query} in the company directory. Which listed vendor should I use?",
+                    "requested_actions": ([{"action": "record invoice in the ledger", "capability": "enter_invoice"}] if explicit_entry else [{"action": "read ledger", "capability": "read_ledger"}]),
+                }
+            if explicit_entry and not explicit_number and criterion == "other" and not months and not re.search(r"\b20\d{2}[-/]\d{1,2}\b", self.task):
+                return {
+                    "intent": "ambiguous", "vendor_query": vendor_query, "invoice_number": "",
+                    "selection_criterion": "other", "reason": "The task does not identify which invoice to enter.",
+                    "clarifying_question": f"Which {vendor_query} invoice should I enter: the latest, a specific invoice number, or another date range?",
+                    "requested_actions": [{"action": "record invoice in the ledger", "capability": "enter_invoice"}],
+                }
+        elif not has_invoice_topic:
+            return {
+                "intent": "unsupported", "vendor_query": "", "invoice_number": "",
+                "selection_criterion": "other", "reason": "This request is outside invoice entry and ledger lookup.",
+                "clarifying_question": "I can record invoices in the ledger or look up existing invoice entries. What invoice task would you like help with?",
+                "requested_actions": [],
+            }
+        return None
 
     def _require_write_intent(self) -> None:
         # Directly injected test planners may set a classification without going
@@ -643,8 +780,24 @@ class AgentLoop:
                 or (capability == "read_ledger" and self.read_ledger_rows is None)
                 or (capability == "list_candidates" and not self.candidate_listed)
             )
-            if unperformed and action and action not in not_done:
-                not_done.append(action)
+            if capability == "enter_invoice" and self.confirmed_pending_context.get("confirmed"):
+                # The user confirmed the reduced record-only proposal. Keep unsupported
+                # actions visible, but do not repeat the confirmed proposal as not done.
+                unperformed = False
+            if not unperformed:
+                continue
+            if capability == "enter_invoice":
+                label = "record invoice"
+            elif capability == "read_ledger":
+                label = "read ledger"
+            elif capability == "list_candidates":
+                label = "list candidates"
+            elif capability == "unsupported":
+                label = self._canonical_action_label(action)
+            else:
+                label = "requested action"
+            if label and label not in not_done:
+                not_done.append(label)
         return not_done
 
     def _unsupported_task_summary(self) -> str:
@@ -685,10 +838,8 @@ class AgentLoop:
     @staticmethod
     def _with_not_done_line(summary: str, not_done: list[str]) -> str:
         line = "Not done: " + (", ".join(not_done) if not_done else "none") + "."
-        if re.search(r"(?im)^Not done:", summary):
-            summary = re.sub(r"(?im)^Not done:.*$", line, summary)
-            return summary
-        return f"{summary.rstrip()} {line}"
+        summary = re.sub(r"(?im)\s*Not done:\s*.*$", "", summary).rstrip()
+        return f"{summary} {line}" if summary else line
 
     def _finalize_run_result(self, status: str, summary: str) -> tuple[str, str]:
         """Attach requested/unperformed actions to every terminal run result."""
@@ -715,6 +866,9 @@ class AgentLoop:
             "not_done": "none" if not not_done else ", ".join(not_done),
             "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
         })
+        if self.confirmed_pending_context.get("confirmed"):
+            result["original_task"] = self.confirmed_pending_context.get("original_task")
+            result["confirmed_reduced_action"] = "enter_invoice"
         if not result.get("what_was_done"):
             result["what_was_done"] = "No requested actions were completed." if not_done else "Completed the requested actions."
         self.final_result = result
@@ -891,10 +1045,10 @@ class AgentLoop:
         if error.status_code != 400:
             return False
         code = (error.error_code or "").casefold().replace("-", "_")
-        if code in {"tool_use_failed", "invalid_tool_call", "tool_validation_failed", "schema_validation_error"}:
+        if code in {"tool_use_failed", "output_parse_failed", "invalid_tool_call", "tool_validation_failed", "schema_validation_error"}:
             return True
         message = (error.response_body or "").casefold().replace("-", "_")
-        return "tool_use_failed" in message or (
+        return "tool_use_failed" in message or "output_parse_failed" in message or (
             any(token in message for token in ("schema", "validation"))
             and any(token in message for token in ("tool", "function", "argument", "parameter"))
         ) or "failed to call a function" in message or "invalid tool arguments" in message
@@ -1725,6 +1879,13 @@ class AgentLoop:
                 return "needs_review", reason
             self.emit("intent_guard", self.intent_guard_result or {})
             self.emit("task_intent", self.task_intent)
+            if self.task_intent["intent"] in {"unsupported", "ambiguous"}:
+                summary = (
+                    self._unsupported_task_summary()
+                    if self.task_intent["intent"] == "unsupported"
+                    else str(self.task_intent.get("clarifying_question") or "Please clarify the requested invoice task.")
+                )
+                return self._finalize_run_result("needs_input", summary)
             if self.task_intent["intent"] == "write_invoice_entry":
                 await self.browser.start()
             for step in range(1, MAX_STEPS + 1):
@@ -2049,10 +2210,12 @@ async def run_computer_use_agent(
     *,
     approval_mode: str = "policy_driven",
     offline: bool = False,
+    confirmed_pending_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Run with a live provider, or FakeLLM replay when explicitly offline."""
     loop = AgentLoop(
         data_dir, run_id, task, base_url, emit, approval_handler,
         approval_mode=approval_mode, offline=offline,
+        confirmed_pending_context=confirmed_pending_context,
     )
     return await loop.run()

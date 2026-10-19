@@ -8,6 +8,11 @@ async function requestJson(url, options = {}) {
   return data;
 }
 function node(tag, className, text) { const item = document.createElement(tag); if (className) item.className = className; if (text !== undefined) item.textContent = text; return item; }
+function getSessionId() {
+  let id = sessionStorage.getItem("centralign-session-id");
+  if (!id) { id = crypto.randomUUID(); sessionStorage.setItem("centralign-session-id", id); }
+  return id;
+}
 function timestamp(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? "" : new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date); }
 function friendlyStatus(status) { return ({ idle: "Ready", running: "Running", awaiting_approval: "Approval needed", complete: "Verified", needs_input: "Needs attention", needs_review: "Needs attention", incomplete: "Incomplete" })[status] || String(status || "Ready").replaceAll("_", " "); }
 function setStatus(status, detail = "") {
@@ -22,7 +27,12 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_intent: "Host intent classification", intent_guard: "Deterministic intent guard", prompt_injection_detected: "Prompt injection ignored", selection_check: "Invoice selection check", finish_nudge: "Finish tool reminder", task_finished: "Run finished", run_error: "Run error" };
+  if (event.event_type === "pending_question_reply") {
+    if (["confirmed", "cancelled"].includes(payload.status) && payload.original_task) return "Replying to previous question";
+    if (payload.status === "needs_clarification") return "Confirmation needed";
+    return "Pending question cleared";
+  }
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_intent: "Host intent classification", intent_guard: "Deterministic intent guard", pending_question_stored: "Follow-up question saved for this session", prompt_injection_detected: "Prompt injection ignored", selection_check: "Invoice selection check", finish_nudge: "Finish tool reminder", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
@@ -37,10 +47,12 @@ function eventSummary(event) {
     return [p.logged_in ? "logged in" : "not logged in", invoice ? `invoice ${invoice.invoice_number} · ${invoice.amount} ${invoice.currency}` : "no invoice selected", `approval ${p.approval_status}`, `form ${p.form_status}`, p.workflow_hint || p.submission_status || "", !p.workflow_hint && p.next_action ? `next: ${p.next_action}` : "", p.legal_vendor ? `vendor ${p.legal_vendor}` : "", p.last_erp_alert ? `alert: ${p.last_erp_alert}` : ""].filter(Boolean).join(" · ");
   }
   if (event.event_type === "task_intent") return `Classified as ${p.intent || "unknown"}${p.vendor_query ? ` · vendor ${p.vendor_query}` : ""}${p.selection_criterion ? ` · selection ${p.selection_criterion}` : ""}${p.requested_actions?.length ? ` · actions ${p.requested_actions.map((item) => `${item.action} → ${item.capability}`).join(", ")}` : ""}${p.reason ? ` · ${p.reason}` : ""}${p.clarifying_question ? ` · ${p.clarifying_question}` : ""}`;
-  if (event.event_type === "intent_guard") return `Classifier: ${p.classifier_intent || "unknown"} · explicit entry verb: ${p.explicit_entry_verb ? "yes" : "no"} · write tools: ${p.write_allowed ? "unlocked" : "locked"}${p.unsupported_actions?.length ? ` · unsupported: ${p.unsupported_actions.join(", ")}` : ""}`;
+  if (event.event_type === "intent_guard") return `Classifier: ${p.classifier_intent || "unknown"} · explicit entry verb: ${p.explicit_entry_verb ? "yes" : "no"} · write tools: ${p.write_allowed ? "unlocked" : "locked"}${p.confirmed_reduced_action ? " · confirmed record-only proposal" : ""}${p.unsupported_actions?.length ? ` · unsupported: ${p.unsupported_actions.join(", ")}` : ""}`;
   if (event.event_type === "prompt_injection_detected") return `${p.message || "Instruction-like invoice text was ignored."} Source: ${p.path || "invoice"}.`;
   if (event.event_type === "selection_check") return `Selection check ${p.status || "unknown"}: ${p.criterion || "criterion unavailable"} · ${p.selected_invoice || "invoice unavailable"}. ${p.reason || ""}`;
   if (event.event_type === "finish_nudge") return `${p.instruction || "Call finish with this summary."} ${p.summary || ""}`;
+  if (event.event_type === "pending_question_reply") return `${p.message || `Follow-up: ${p.status || "resolved"}`}${p.status === "confirmed" && p.unsupported_actions?.length ? ` · proceeding with invoice entry only; not doing: ${p.unsupported_actions.join(", ")}` : ""}`;
+  if (event.event_type === "pending_question_stored") return `Saved a ${p.proposed_reduced_action ? "record-only proposal" : "clarification"} for ${p.vendor || "this task"}; expires ${p.expires_at || "in 10 minutes"}.`;
   if (event.event_type === "prompt_size") {
     const parts = Object.entries(p.breakdown || {}).map(([name, size]) => `${name} ${size.approx_tokens} tok`).join(" · ");
     return `Approx. ${p.approx_tokens} tokens (${p.approx_characters} chars; estimate). ${parts}`;
@@ -230,7 +242,7 @@ $("#taskForm").addEventListener("submit", async (event) => {
   $("#evidenceSource").textContent = "—"; $("#evidenceHash").textContent = "—";
   const empty = node("tr"); const cell = node("td", "empty-cell", "No ledger read-back has been captured."); cell.colSpan = 4; empty.append(cell); $("#evidenceBody").replaceChildren(empty);
   setStatus("running"); setRunButton(true);
-  try { const result = await requestJson("/api/runs", { method: "POST", body: JSON.stringify({ task, approval_mode: "policy_driven" }) }); state.runId = result.run_id; pollRun(state.runId); }
+  try { const result = await requestJson("/api/runs", { method: "POST", body: JSON.stringify({ task, approval_mode: "policy_driven", session_id: getSessionId() }) }); state.runId = result.run_id; pollRun(state.runId); }
   catch (error) { state.finished = true; setRunButton(false); setStatus("needs_review", error.message); }
 });
 const SCENARIOS = {
