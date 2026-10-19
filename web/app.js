@@ -542,16 +542,12 @@ function formatAmount(currency, amount) {
   return `${currency || ""} ${formatted}`.trim();
 }
 function setRunLoading(visible) { $("#traceLoading").hidden = !visible; }
-function shortPath(value) {
-  const text = String(value || "");
-  return text.length > 42 ? `${text.slice(0, 21)}…${text.slice(-16)}` : text || "—";
-}
-function appendCopyValue(container, value, { path = false, label = "Copy value" } = {}) {
+function appendCopyValue(container, value, { path = false, truncate = false, label = "Copy value" } = {}) {
   const full = String(value || "—");
-  const shown = node("span", `truncate-value${path ? " mono-path" : ""}`, path ? shortPath(full) : full);
-  shown.title = full;
+  const shortHash = full.length > 29 ? `${full.slice(0, 12)}…${full.slice(-12)}` : full;
+  const shown = node("span", `evidence-value${truncate ? " truncate-value hash-value" : ""}${path ? " mono-path" : ""}`, truncate ? shortHash : full);
   container.append(shown);
-  if (full !== "—" && full.length > 27) {
+  if (full !== "—" && (full.length > 27 || truncate)) {
     const button = node("button", "copy-button", "Copy");
     button.type = "button";
     button.setAttribute("aria-label", label);
@@ -585,7 +581,6 @@ function renderSummaryTrace(run) {
       const item = node("li", "system-activity-event");
       const details = node("details", "system-activity-details");
       const heading = node("summary", "system-activity-summary", row.title);
-      heading.title = row.result;
       details.append(heading, node("pre", "diagnostic-payload", JSON.stringify(row.detail || [], null, 2)));
       item.append(details);
       list.append(item);
@@ -605,7 +600,6 @@ function renderSummaryTrace(run) {
     content.append(top);
     if (row.result) {
       const result = node("p", "summary-result", row.result);
-      result.title = row.result;
       content.append(result);
     }
     item.append(mark, content);
@@ -628,7 +622,7 @@ function renderDiagnosticsTrace(run, list = $("#diagnosticsList")) {
     top.append(node("time", "diagnostic-time", timestamp));
     content.append(top);
     const summary = eventSummary(event);
-    if (summary) { const line = node("p", "diagnostic-summary", summary); line.title = summary; content.append(line); }
+    if (summary) content.append(node("p", "diagnostic-summary", summary));
     const details = node("details", "diagnostic-details");
     details.append(node("summary", "details-toggle", "View details"));
     details.append(node("pre", "diagnostic-payload", JSON.stringify(event.payload || {}, null, 2)));
@@ -734,7 +728,7 @@ function renderResult(run) {
       evidenceLines.append(node("span", "evidence-summary", `Ledger row ${ledgerId.startsWith("#") ? ledgerId : `#${ledgerId}`}`));
     }
     if (facts.sourceFile) { const source = node("span", "result-evidence-path"); appendCopyValue(source, facts.sourceFile, { path: true, label: "Copy source file path" }); evidenceLines.append(source); }
-    if (facts.sourceHash) { const hash = node("span", "result-evidence-path"); appendCopyValue(hash, facts.sourceHash, { path: true, label: "Copy source SHA-256" }); evidenceLines.append(hash); }
+    if (facts.sourceHash) { const hash = node("span", "result-evidence-path"); appendCopyValue(hash, facts.sourceHash, { path: true, truncate: true, label: "Copy source SHA-256" }); evidenceLines.append(hash); }
     appendEvidenceLink(evidenceLines, facts.screenshotUrl, "Open ledger screenshot ↗");
     resultEvidence.append(evidenceLines);
   }
@@ -767,8 +761,7 @@ function renderApproval(run) {
   for (const [name, value, path] of [["Vendor", invoice.vendor, false], ["Invoice #", invoice.invoice_number, false], ["Amount", formatAmount(invoice.currency, invoice.amount), false], ["Due date", invoice.due_date, false], ["Source file", payload.source_file, true]]) {
     const cell = node("div", "approval-fact");
     cell.append(node("span", "approval-fact-label", name));
-    const displayed = node("strong", path ? "mono-path truncate-value" : "truncate-value", value || "—");
-    displayed.title = value || "—";
+    const displayed = node("strong", path ? "mono-path evidence-value" : "evidence-value", value || "—");
     cell.append(displayed);
     if (path && value && value.length > 27) {
       const copy = node("button", "copy-button", "Copy"); copy.type = "button"; copy.dataset.copy = value; copy.setAttribute("aria-label", "Copy source file path"); cell.append(copy);
@@ -797,7 +790,7 @@ function renderEvidence(run) {
     const body = $("#evidenceBody");
     body.replaceChildren();
     const row = node("tr"); const cell = node("td", "empty-cell", "No ledger read-back yet."); cell.colSpan = 4; row.append(cell); body.append(row);
-    $("#cropLink").hidden = true; $("#ledgerCrop").hidden = true; $("#cropPlaceholder").hidden = false; $("#cropStatus").textContent = "No capture";
+    $("#cropLink").hidden = true; $("#ledgerCrop").hidden = true; $("#ledgerCrop").dataset.source = ""; $("#ledgerCrop").removeAttribute("src"); $("#cropPlaceholder").hidden = false; $("#cropPlaceholder").textContent = "A ledger screenshot appears here after verification."; $("#cropStatus").textContent = "No capture";
     return;
   }
   const matches = proof.matches || {};
@@ -805,7 +798,7 @@ function renderEvidence(run) {
   badge.textContent = verified ? "Verified" : "Needs review";
   badge.classList.add(verified ? "badge-success" : "badge-error");
   $("#evidenceSource").replaceChildren(); appendCopyValue($("#evidenceSource"), proof.source_file || "—", { path: true, label: "Copy source file path" });
-  $("#evidenceHash").replaceChildren(); appendCopyValue($("#evidenceHash"), proof.source_sha256 || "—", { path: true, label: "Copy source SHA-256" });
+  $("#evidenceHash").replaceChildren(); appendCopyValue($("#evidenceHash"), proof.source_sha256 || "—", { path: true, truncate: true, label: "Copy source SHA-256" });
   const body = $("#evidenceBody");
   body.replaceChildren();
   const fields = proof.expected || {};
@@ -820,7 +813,6 @@ function renderEvidence(run) {
       [actual[key] || "—", `Copy ledger ${fieldLabel}`],
     ]) {
       const cell = node("td");
-      cell.title = value;
       if (String(value).length > 27) {
         const copy = node("span", "copy-value");
         appendCopyValue(copy, value, { label });
@@ -834,16 +826,48 @@ function renderEvidence(run) {
   }
   const screenshotUrl = proof.screenshot_url || "";
   if (screenshotUrl) {
-    const link = $("#cropLink"); link.href = screenshotUrl; link.hidden = false;
+    const link = $("#cropLink"); link.href = screenshotUrl; link.hidden = true;
     const image = $("#ledgerCrop");
-    image.onload = () => { link.hidden = false; $("#cropPlaceholder").hidden = true; };
-    image.onerror = () => { link.hidden = true; $("#cropPlaceholder").hidden = false; $("#cropStatus").textContent = "Screenshot unavailable"; };
-    image.src = `${screenshotUrl}${screenshotUrl.startsWith("data:") ? "" : `?v=${Date.now()}`}`; image.hidden = false;
-    $("#cropPlaceholder").hidden = true; $("#cropStatus").textContent = "Captured";
+    if (image.dataset.source !== screenshotUrl) {
+      image.dataset.source = screenshotUrl;
+      image.onload = () => {
+        image.hidden = false; link.hidden = false; $("#cropPlaceholder").hidden = true; $("#cropStatus").textContent = "Captured";
+        $("#enlargedLedgerCrop").src = image.currentSrc || image.src;
+      };
+      image.onerror = () => {
+        link.hidden = true; image.hidden = true; $("#cropPlaceholder").hidden = false;
+        $("#cropPlaceholder").textContent = "The ledger screenshot could not be loaded.";
+        $("#cropStatus").textContent = "Screenshot unavailable";
+      };
+      image.hidden = true; $("#cropPlaceholder").hidden = false; $("#cropPlaceholder").textContent = "Loading ledger screenshot…";
+      $("#cropStatus").textContent = "Loading";
+      image.src = screenshotUrl;
+    } else if (image.complete && image.naturalWidth > 0) {
+      image.hidden = false; link.hidden = false; $("#cropPlaceholder").hidden = true; $("#cropStatus").textContent = "Captured";
+    } else if (image.complete) {
+      image.hidden = true; link.hidden = true; $("#cropPlaceholder").hidden = false; $("#cropPlaceholder").textContent = "The ledger screenshot could not be loaded."; $("#cropStatus").textContent = "Screenshot unavailable";
+    } else {
+      image.hidden = true; link.hidden = true; $("#cropPlaceholder").hidden = false; $("#cropPlaceholder").textContent = "Loading ledger screenshot…"; $("#cropStatus").textContent = "Loading";
+    }
   } else {
-    $("#cropLink").hidden = true; $("#ledgerCrop").hidden = true; $("#cropPlaceholder").hidden = false; $("#cropStatus").textContent = "Path recorded";
+    $("#cropLink").hidden = true; $("#ledgerCrop").hidden = true; $("#cropPlaceholder").hidden = false;
+    $("#ledgerCrop").dataset.source = ""; $("#ledgerCrop").removeAttribute("src");
+    $("#cropPlaceholder").textContent = "Screenshot path is recorded, but the image URL is unavailable.";
+    $("#cropStatus").textContent = "Path recorded";
   }
 }
+$("#cropLink").addEventListener("click", (event) => {
+  const image = $("#ledgerCrop");
+  if (image.hidden || !image.complete || image.naturalWidth === 0) return;
+  event.preventDefault();
+  const dialog = $("#imageDialog");
+  $("#enlargedLedgerCrop").src = image.currentSrc || image.src;
+  if (typeof dialog.showModal === "function") dialog.showModal();
+});
+$("#closeImageDialog").addEventListener("click", () => $("#imageDialog").close());
+$("#imageDialog").addEventListener("click", (event) => {
+  if (event.target === $("#imageDialog")) $("#imageDialog").close();
+});
 function renderFrame(run) {
   const frame = [...(run.events || [])].reverse().find((event) => event.event_type === "browser_frame" && event.payload?.kind !== "ledger_crop");
   if (!frame) {
@@ -874,7 +898,6 @@ function renderHistory(runs) {
     const button = node("button", "history-row");
     button.type = "button";
     button.setAttribute("aria-current", String(run.id === state.runId));
-    button.title = run.task || "Invoice task";
     const statusTone = run.status === "complete" ? "success" : run.status === "awaiting_approval" || run.status === "needs_input" ? "warning" : ["needs_review", "incomplete", "failed"].includes(run.status) ? "error" : "neutral";
     button.append(node("span", "history-task", run.task || "Invoice task"), node("span", `history-state history-state-${statusTone}`, friendlyStatus(run.status)));
     const time = node("span", "history-time", `${run.id || ""} · ${run.started_at ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(run.started_at)) : ""}`);
@@ -887,7 +910,6 @@ function renderRun(run) {
   state.run = run;
   state.runId = run.id;
   $("#traceRunId").textContent = run.id || "—";
-  $("#traceRunId").title = run.id || "";
   renderResult(run);
   renderProgress(run);
   renderTrace(run);
@@ -969,7 +991,6 @@ function clearRunPanel() {
   state.approvalSeen = false;
   setResultTab("summary");
   $("#traceRunId").textContent = "Starting…";
-  $("#traceRunId").title = "";
   $("#traceList").replaceChildren();
   $("#diagnosticsList").replaceChildren(); $("#diagnosticsEmpty").hidden = false;
   $("#traceEmpty").hidden = false;
@@ -978,7 +999,8 @@ function clearRunPanel() {
   $("#approvalTokenMessage").hidden = true;
   $("#browserFrame").hidden = true; $("#browserPlaceholder").hidden = false; $("#browserUrl").textContent = "/erp/login"; $("#frameBadge").textContent = "Starting browser";
   $("#frameAction").textContent = "Waiting for the first browser action";
-  $("#ledgerCrop").hidden = true; $("#cropLink").hidden = true; $("#cropPlaceholder").hidden = false; $("#cropStatus").textContent = "No capture";
+  $("#ledgerCrop").hidden = true; $("#ledgerCrop").dataset.source = ""; $("#ledgerCrop").removeAttribute("src"); $("#cropLink").hidden = true; $("#cropPlaceholder").hidden = false; $("#cropPlaceholder").textContent = "A ledger screenshot appears here after verification."; $("#cropStatus").textContent = "No capture";
+  if ($("#imageDialog").open) $("#imageDialog").close();
   $("#evidenceBadge").textContent = "Not verified"; $("#evidenceBadge").className = "semantic-badge badge-neutral";
   $("#evidenceSource").replaceChildren(document.createTextNode("—")); $("#evidenceHash").replaceChildren(document.createTextNode("—"));
   const empty = node("tr"); const cell = node("td", "empty-cell", "No ledger read-back yet."); cell.colSpan = 4; empty.append(cell); $("#evidenceBody").replaceChildren(empty);

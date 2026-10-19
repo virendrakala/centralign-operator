@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#F8FAFC">
     <meta name="description" content="CentrAlign autonomous browser operator workbench">
     <title>CentrAlign Operator</title>
-    <link rel="stylesheet" href="/styles.css?v=20261019-5">
-    <script src="/app.js?v=20261019-6" defer></script>
+    <link rel="stylesheet" href="/styles.css?v=20261019-7">
+    <script src="/app.js?v=20261019-7" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -19,7 +19,7 @@
         <div class="header-actions">
           <span id="providerBadge" class="planner-badge" aria-live="polite">Checking planner…</span>
           <a class="erp-link" href="/erp/login" target="_blank" rel="noreferrer">Open sandbox ERP <span aria-hidden="true">↗</span></a>
-          <button id="resetDemoButton" class="button button-secondary" type="button" title="Clear the local ERP ledger and run history">Reset demo data</button>
+          <button id="resetDemoButton" class="button button-secondary" type="button">Reset demo data</button>
           <span id="runIndicator" class="status-pill status-neutral" data-state="idle" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="runIndicatorText">Ready</span></span>
         </div>
       </div>
@@ -129,6 +129,10 @@
               <img id="ledgerCrop" alt="Screenshot of the verified ERP ledger row" hidden>
             </a>
             <div id="cropPlaceholder" class="crop-placeholder">A ledger screenshot appears here after verification.</div>
+            <dialog id="imageDialog" class="image-dialog" aria-label="Enlarged ledger screenshot">
+              <div class="image-dialog-toolbar"><strong>Ledger screenshot</strong><button id="closeImageDialog" class="button button-secondary" type="button">Close</button></div>
+              <img id="enlargedLedgerCrop" alt="Enlarged screenshot of the verified ERP ledger row">
+            </dialog>
           </article>
         </aside>
       </div>
