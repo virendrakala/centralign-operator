@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from documents import ensure_company_memory
 from policy import parse_policy
 
 
@@ -46,10 +47,7 @@ class CompanyApp:
             bundled_policy = ROOT / "data" / POLICY_RELATIVE_PATH
             if bundled_policy.exists() and bundled_policy.resolve() != self.policy_path.resolve():
                 shutil.copyfile(bundled_policy, self.policy_path)
-        memory_path = self.data_dir / "policies" / "company_memory.md"
-        bundled_memory = ROOT / "data" / "policies" / "company_memory.md"
-        if not memory_path.exists() and bundled_memory.exists() and bundled_memory.resolve() != memory_path.resolve():
-            shutil.copyfile(bundled_memory, memory_path)
+        ensure_company_memory(self.data_dir)
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:

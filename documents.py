@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 import shutil
 from datetime import datetime
 from decimal import Decimal
@@ -41,11 +42,11 @@ def ensure_operator_assets(data_dir: Path) -> None:
         target = inbox / source.name
         if not target.exists():
             shutil.copyfile(source, target)
-    for name in ("procurement_policy.txt", "company_memory.md"):
-        source = ROOT / "data" / "policies" / name
-        target = policies / name
-        if source.exists() and not target.exists():
-            shutil.copyfile(source, target)
+    source = ROOT / "data" / "policies" / "procurement_policy.txt"
+    target = policies / "procurement_policy.txt"
+    if source.exists() and not target.exists():
+        shutil.copyfile(source, target)
+    ensure_company_memory(data_dir)
 
     fixtures = [
         ("INV_2026_08_Acme.pdf", "INV-2026-2084", "2026-08-04", "2026-09-03", "42,000.00"),
@@ -133,6 +134,27 @@ def ensure_operator_assets(data_dir: Path) -> None:
         pdf.setFillColorRGB(.38, .43, .50)
         pdf.drawString(52, 52, "Synthetic training data. Not a real payable or financial record.")
         pdf.save()
+
+
+def ensure_company_memory(data_dir: Path) -> None:
+    """Create a local sandbox credential and vendor directory when memory is absent."""
+    path = data_dir / "policies" / "company_memory.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "# CentrAlign Sandbox Company Memory\n\n"
+        "## Legacy ERP sandbox credentials\n"
+        "Email: ops@centralign.internal\n"
+        f"Password: {secrets.token_urlsafe(32)}\n\n"
+        "## ERP vendor directory notes\n"
+        "VND-1042 | Acme | Acme Analytics Pvt Ltd\n"
+        "VND-2088 | Northstar | Northstar Cloud Hosting\n"
+        "VND-3176 | Vertex | Vertex Security Systems\n"
+    )
+    try:
+        with path.open("x", encoding="utf-8") as memory_file:
+            memory_file.write(content)
+    except FileExistsError:
+        pass
 
 
 def list_workspace_files(data_dir: Path) -> list[dict[str, str]]:

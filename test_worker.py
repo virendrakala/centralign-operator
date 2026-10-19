@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import threading
@@ -121,6 +122,32 @@ def wait_for_run(base_url: str, run_id: str, on_approval=None) -> dict:
 
 
 class AgentLoopUnitTests(unittest.TestCase):
+    def test_acme_invoice_fixtures_have_unique_consistent_source_fields(self) -> None:
+        candidates = list_invoice_candidates(ROOT / "data", "Acme")
+        by_number = {item["invoice_number"]: item for item in candidates}
+
+        self.assertEqual(len(by_number), len(candidates))
+        self.assertEqual(by_number["INV-2026-2084"]["amount"], "42000.00")
+        self.assertEqual(by_number["INV-2026-2084"]["invoice_date"], "2026-08-04")
+        self.assertEqual(by_number["INV-2026-2116"]["amount"], "68500.00")
+        self.assertEqual(by_number["INV-2026-2116"]["invoice_date"], "2026-10-21")
+        self.assertTrue(by_number["INV-2026-2084"]["path"].endswith("INV_2026_08_Acme.pdf"))
+        self.assertTrue(by_number["INV-2026-2116"]["path"].endswith("INV_2026_10_Acme.pdf"))
+
+    def test_sandbox_company_memory_is_generated_locally_and_persisted(self) -> None:
+        with TemporaryDirectory(prefix="centralign-company-memory-") as temp_dir:
+            data_dir = Path(temp_dir)
+            ensure_operator_assets(data_dir)
+            memory_path = data_dir / "policies" / "company_memory.md"
+            first_memory = memory_path.read_text(encoding="utf-8")
+            password_match = re.search(r"^Password:\s*(.+)$", first_memory, re.MULTILINE)
+            self.assertIsNotNone(password_match)
+            self.assertGreaterEqual(len(password_match.group(1)), 40)
+            self.assertEqual(len(CompanyApp(data_dir).list_vendor_directory()), 3)
+
+            ensure_operator_assets(data_dir)
+            self.assertEqual(memory_path.read_text(encoding="utf-8"), first_memory)
+
     def test_offline_client_is_explicit_fake_replay_and_returns_one_tool(self) -> None:
         client = FakeLLM()
         call = client.next_tool_call("record Acme invoice", [], TOOL_DEFINITIONS)
@@ -182,13 +209,13 @@ class AgentLoopUnitTests(unittest.TestCase):
                 discovery = await loop._execute("list_invoice_candidates", {"vendor_query": "Acme"})
                 self.assertEqual(loop.task_intent["intent"], "write_invoice_entry")
                 self.assertGreaterEqual(len(discovery["candidates"]), 3)
-                old_path = "inbox/acme-analytics-2116.txt"
+                old_path = "inbox/INV_2026_08_Acme.pdf"
                 with self.assertRaisesRegex(ValueError, r"INV-2026-2116.*2026-10-21"):
                     await loop._execute("read_document", {"path": old_path})
                 loop.policy = await asyncio.to_thread(loop.company.read_company_policy)
                 with self.assertRaisesRegex(ValueError, r"Latest-by-invoice-date selection rejected.*INV-2026-2116"):
                     await loop._execute("request_human_approval", {
-                        "invoice_number": "AC-2116", "canonical_vendor": "Acme Analytics Pvt Ltd",
+                        "invoice_number": "INV-2026-2084", "canonical_vendor": "Acme Analytics Pvt Ltd",
                         "selection_criterion": "latest_by_invoice_date",
                         "selection_reason": "The task requests the latest invoice by invoice date.",
                     })
@@ -197,7 +224,7 @@ class AgentLoopUnitTests(unittest.TestCase):
 
             candidates, chosen = asyncio.run(exercise())
 
-        self.assertIn("inbox/acme-analytics-2116.txt", {item["path"] for item in candidates})
+        self.assertIn("inbox/INV_2026_10_Acme.pdf", {item["path"] for item in candidates})
         self.assertEqual(chosen["invoice"]["invoice_number"], "INV-2026-2116")
         self.assertEqual(loop.selection_criterion, "latest_by_invoice_date")
         check = next(payload for kind, payload in events if kind == "selection_check")

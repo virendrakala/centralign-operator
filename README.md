@@ -1,140 +1,208 @@
 # CentrAlign Operator
 
-CentrAlign Operator is a local invoice-processing prototype. One bounded agent loop reads invoice sources and procurement policy, operates a sandbox ERP through Playwright, pauses for human approval when policy requires it, and verifies the resulting ledger row from the ERP page.
+CentrAlign Operator is a local accounts-payable prototype. A bounded tool-calling agent reads synthetic invoice files and one procurement policy, works through a local sandbox ERP, waits for approval when the policy requires it, and checks the saved ledger row before reporting a successful invoice entry.
 
-The ERP, invoices, credentials, approval broker, and SQLite ledger are synthetic demo data. The agent writes through the ERP form; it does not write directly to SQLite. The quickstart below explicitly uses FakeLLM replay and does not need an LLM API key.
+The app is a demo environment. Its ERP, company memory, vendors, invoices, credentials, and ledger are synthetic. It does not connect to a real finance system and cannot pay invoices or send email.
 
-## Run locally
+## Setup and run
 
-Requirements: Python 3.10+, the packages in `requirements.txt`, and Playwright Chromium.
+Requirements: Python 3.10 or newer, the packages in `requirements.txt`, and the Playwright Chromium browser.
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 -m playwright install chromium
+```
+
+### Offline replay demo
+
+Offline replay is a **scripted test double**, not a live language model. Start it explicitly:
+
+```bash
 python3 web_app.py --offline
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The Operator and the sandbox ERP run in the same FastAPI process. To use a fresh data directory:
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The page labels the selected planner as **FakeLLM · offline replay**. The replay uses a fixed local sequence to exercise the supported workflow; it does not demonstrate live model reasoning. Start with a fresh ledger using `python3 web_app.py --offline --reset-demo-data`. The UI also has a **Reset demo data** button. Reset clears ledger rows and run history while preserving inbox files and policy.
+
+To keep the demo data separate from the checked-in fixtures, pass a data directory:
 
 ```bash
-python3 web_app.py --data-dir /tmp/centralign-operator --offline
+python3 web_app.py --offline --data-dir /tmp/centralign-operator
 ```
 
-Use `python3 web_app.py --offline --reset-demo-data` to clear the persisted ledger and run history before the server starts. The workbench also has a **Reset demo data** button; it cancels active runs, clears ledger, SQLite run records, and `runs/*.jsonl` logs, and preserves invoice files and policy.
+### Live providers
 
-The first startup copies the bundled text fixtures and policy into a new data directory and creates the sample Acme PDFs if they are missing. The local ERP login details are in `data/policies/company_memory.md`; they are synthetic sandbox credentials.
-
-## Agent loop
-
-Before browser startup, a host preflight stops obvious unsupported or underspecified requests without contacting a provider. Otherwise the active provider returns a schema-validated JSON task classification: `read_only`, `write_invoice_entry`, `unsupported`, or `ambiguous`, plus every requested action mapped to `enter_invoice`, `read_ledger`, `list_candidates`, or `unsupported`. The host independently checks the original task text for an explicit invoice entry verb and unsupported actions. Unsupported actions keep write tools locked until the same UI session explicitly confirms a pending record-only proposal; that confirmation unlocks only invoice entry, and every unsupported action remains undone. A classifier write label cannot override the host guard. Both classifier and guard decisions appear in the trace. Read-only tasks expose only their requested ledger or candidate lookup tools plus `finish`. Every task ends with `finish(status, summary)`; plain-text answers are not accepted. For read-only tasks, the host renders the structured answer and summary from ledger or candidate fields. Unsupported or unclear requests finish with a host-generated refusal or clarifying question. Follow-up context expires after ten minutes. Final summaries and results list every requested action left undone. For invoice entry, the provider returns one tool call per decision; `complete` is accepted only after ledger verification passes.
-
-```text
-Task
-  -> AgentLoop asks the active provider for one tool call or browser action sequence
-  -> host validates schema, route, selector, source, duplicate, and approval rules
-  -> document tool or Playwright ERP action
-  -> observation returned to the same loop
-  -> finish only after live ledger read-back verification
-```
-
-The tool set includes `browser_fill_form` for a bounded batch of validated fields and `browser_action_sequence` for two or three sequential browser primitives. Both call the same route, selector, invoice-source, duplicate, vendor, and approval checks used by standalone browser actions. A visible ERP alert or failed action stops the sequence so the model can inspect and recover. Fill batches return a short list of fields set and one compact snapshot capped at 4,000 characters. Snapshots retain the URL path, page title, every visible alert, empty/filled form-field states, buttons, and capped table rows; passwords and other sensitive field values are never included.
-
-Invoice entry starts with `list_invoice_candidates(vendor_query)`. The host parses every inbox PDF/TXT using the same structured extractor and returns each path, written vendor, invoice number, invoice date, due date, amount, and currency. The model selects from that list. For `latest_by_invoice_date`, the host checks that selection against every discovered candidate for the vendor and names a newer invoice if the selection is stale. Explicit invoice-number and other user criteria are preserved and are not replaced with a latest-date rule. The final result records the selected invoice, all candidates and dates, the criterion, and a passed selection check alongside ledger verification evidence.
-
-Sign-in uses a dedicated `erp_login` tool. The host fills and submits credentials from `policies/company_memory.md`; the model cannot access the login selectors or password. Redirects to the login page state `Session required: call erp_login`. Navigating away from a populated form returns a warning listing the unsaved fields. If a tool with the same arguments repeats without changing page state, the agent warns after three repetitions and stops after five, including the last alert in its final message. Live providers receive the last three observations in full and one-line summaries of older observations; offline replay keeps its complete local state. If a provider rejects plain text because it requires a tool call, the host stores at most 300 characters and nudges the model once to call `finish` with that summary.
-
-The Acme demo follows the actual ERP validation path. The source says `Acme Analytics`, while the ERP requires the legal name displayed in its vendor directory. The agent first enters the source label. After the ERP displays its unknown-vendor alert, the agent inspects the directory, retries with the observed legal entity, and reads the posted row back from the ledger.
-
-## Providers
-
-The app uses `FakeLLM` replay only when started explicitly with `--offline`. A live run without a configured API key, or one whose live providers fail, stops with a clear error; it never switches into replay.
-
-For HTTP 429 and 503, the active provider is retried up to four times after the initial attempt. The agent honors `Retry-After` or a response message such as `retry in 8s`, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. Each wait appears in the UI trace as `[RATE_LIMIT_RECOVERY]`. After those retries fail, it uses one other live provider only when `CENTRALIGN_FALLBACK_PROVIDER` is set.
-
-Provider HTTP 400 tool-use or schema-validation errors, malformed JSON arguments, and host-side argument validation failures are returned to the same provider with the error and relevant tool schema. The model gets three retries per run; the run then stops and reports the last error. These validation retries never switch to offline replay. When `erp_login` runs, the trace states that credentials were supplied by the host. The credentials are not part of the model's tool schema or observations.
-
-Invoice write tools report required form fields as filled or empty and give the next action when the form is ready. The model selects a source from the candidate table and reads it; the host attaches the selected document's filename and SHA-256 to the ERP form and trace. Amounts and other source-backed form values must match the parsed structured fields. A ledger check with no matching row reports whether a submit occurred and includes a recovery instruction. Repeated failures are counted by tool and error across the full run; the trace warns at two and stops with `needs_input` at four. The final summary states which parts of the invoice task were completed.
-
-The host keeps approval tokens bound to the selected invoice and injects the token plus the verification checkbox immediately before submit. `#approval_token` is not available to model fill tools. If the policy gate is still pending, the run state and form feedback tell the model to call `request_human_approval` with the invoice number. Approval requests identify a single invoice by number or read-document path; ambiguous requests list the invoice candidates. An already-approved invoice returns `already_approved` without opening another human approval request. After a successful submit, host state says `submitted: <invoice_number>; next: verify_ledger_row`. Verification takes no required arguments: the host uses the submitted source document and returns per-field matches, the ledger row ID, and a row screenshot path. Passing verification ends the run with a structured result containing the action, ledger and approval evidence, source file/hash, and elapsed time.
-
-Live runs keep three recent observations in full and summarize older history. The trace reports approximate per-turn prompt size broken down into system prompt, tool schemas, host run state, and task/history. Estimates use serialized characters divided by four. Requests and tool waits exceeding 30 seconds produce start and completion trace events. Every run event is also appended to `data/runs/<run_id>.jsonl` with credentials, approval tokens, and common provider-key formats redacted.
-
-Groq (default model `llama-3.3-70b-versatile`):
+Live runs require the API key for the selected provider. They do not switch to offline replay. Copy `.env.example` to `.env`, fill in the one provider key you want to use, then export the settings in the current shell before starting the server:
 
 ```bash
-export CENTRALIGN_PROVIDER=groq
-export GROQ_API_KEY="..."
-export CENTRALIGN_FALLBACK_PROVIDER=gemini # optional live fallback
-export CENTRALIGN_GROQ_MODEL="llama-3.3-70b-versatile" # optional
+cp .env.example .env
+# Edit .env and set the selected provider's API key.
+set -a
+source .env
+set +a
 python3 web_app.py
 ```
 
-OpenRouter (default model `openrouter/free`):
+For example, Groq with an OpenAI-compatible `gpt-oss` model:
 
-```bash
-export CENTRALIGN_PROVIDER=openrouter
-export OPENROUTER_API_KEY="..."
-export CENTRALIGN_OPENROUTER_MODEL="openrouter/free" # optional
-python3 web_app.py
+```dotenv
+CENTRALIGN_PROVIDER=groq
+GROQ_API_KEY=your_groq_key
+CENTRALIGN_GROQ_MODEL=openai/gpt-oss-20b
 ```
 
-Gemini API (default model `gemini-2.5-flash-lite`):
+Alternatively, set `CENTRALIGN_PROVIDER=gemini` with `GEMINI_API_KEY`, or `CENTRALIGN_PROVIDER=openai` with `OPENAI_API_KEY`. The provider-specific model variables are `CENTRALIGN_GROQ_MODEL`, `CENTRALIGN_GEMINI_MODEL`, and `CENTRALIGN_OPENAI_MODEL`; `CENTRALIGN_MODEL` is a general override. Groq’s current code default is `llama-3.3-70b-versatile`, Gemini’s is `gemini-2.5-flash-lite`, and OpenAI’s is `gpt-4o`. The model can be changed to one enabled for your account. OpenRouter is also supported with `OPENROUTER_API_KEY` and `CENTRALIGN_OPENROUTER_MODEL`.
 
-```bash
-export CENTRALIGN_PROVIDER=gemini
-export GEMINI_API_KEY="..."
-export CENTRALIGN_GEMINI_MODEL="gemini-2.5-flash-lite" # optional
-python3 web_app.py
+At most one live fallback is used, and only when `CENTRALIGN_FALLBACK_PROVIDER` names a separately configured provider. For HTTP 429/503, the client reads `Retry-After` or a `retry in Ns` message, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. It retries the same provider up to four times after the initial attempt. A configured live fallback is considered only after those retries fail. A live run with no usable provider stops with an error; it never becomes a replay run.
+
+**Keep `.env` local.** Do not commit API keys. The app sends the task and selected observations to the configured provider. ERP credentials, approval tokens, and host-computed source hashes are kept on the local host.
+
+### macOS SSL certificate note
+
+If Python reports a certificate verification error on macOS, check the certificate setup for that Python installation. For a Python.org framework installation, run its matching `Install Certificates.command` from `/Applications/Python 3.x/`. Do not disable TLS certificate verification.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    T[Task] --> I[Intent gate]
+    I -->|supported| A[Agent loop]
+    I -->|unsupported or unclear| F[Host final result]
+    A <--> M[Live model or explicit offline replay]
+    A --> H[Host-validated tools]
+    H --> D[Invoice and policy documents]
+    H --> E[Sandbox ERP]
+    E --> V[Independent ledger verifier]
+    D --> V
+    V --> F[Structured final result]
 ```
 
-OpenAI Responses API:
+### Agent loop
+
+For a supported task, the host classifies the request and applies a separate deterministic check to the original wording. The bounded agent loop sends the current task, recent observations, compact host-owned run state, and available tool schemas to the selected provider. The model chooses the next tool and any recovery action. The host validates each call, executes it, records an observation, and asks the model what to do next. A run ends through `finish`; invoice-entry runs can finish successfully only after the ERP ledger has been read back and verified. Unsupported or ambiguous intent-gate results are finalized by the host without an additional model turn.
+
+### Safety layers
+
+- **LLM capability classifier:** identifies requested actions and maps them to supported capabilities or `unsupported`.
+- **Deterministic verb guard:** independently requires an explicit record/enter/post/log verb and rejects recognized unsupported actions before write tools are made available.
+- **Human approval gate:** blocks writes above the configured currency threshold until a person approves the run.
+- **Single-use, invoice-bound token:** the host creates a short-lived approval token for the approved invoice and submits it to the ERP; the model cannot supply it.
+- **Route and selector allowlists:** browser tools can operate only on the local ERP routes and approved controls.
+- **Untrusted document handling:** invoice text is treated as data, known instruction-like lines are flagged and removed from model-facing text, and amount/date/vendor fields come from structured parsing.
+- **Independent verification:** the host reads the ERP ledger row and compares its fields with the selected parsed invoice before returning `complete`.
+
+These checks reduce risk in this narrow demo. The prompt-injection detector is heuristic and is not a complete defense.
+
+### Model and host responsibilities
+
+| The model chooses | The host owns |
+|---|---|
+| The next tool call, invoice candidate, and recovery after an observation | Login and credentials from company memory |
+| A sequence of permitted actions, with results observed between writes | Route/selector checks, policy checks, and write authorization |
+| A selection reason and invoice-entry intent to be checked | Source parsing, provenance filename/hash, and approval token lifecycle |
+| A finish request | Ledger read-back verification and final evidence |
+
+The host does not let a model-provided summary or invoice amount substitute for its parsed invoice and ledger evidence.
+
+## Design decisions
+
+- **Host-managed login, tokens, and hashes:** credentials, approval secrets, and SHA-256 computation are capabilities the model does not need. Keeping them on the host avoids asking a model to invent or repeat sensitive values and gives the host the source provenance it can verify.
+- **Independent verification:** a successful submit response alone does not prove what was saved. The verifier reads the ERP ledger and checks the source fields before the host reports completion.
+- **Layered intent checks:** the LLM classifier can interpret wording and list requested capabilities; the deterministic guard is a separate check that locks writes when an explicit entry verb is absent or a recognized unsupported verb is present.
+- **Sandbox ERP:** a local ERP provides realistic page navigation, form validation, approval, and ledger read-back without touching a real finance system.
+- **Explicit replay mode:** `--offline` runs a scripted FakeLLM test double for repeatable local demonstrations. The UI and API identify it as `offline-replay`; it is not an automatic fallback for live calls.
+
+## Models, APIs, and frameworks
+
+| Component | Use in this project | Exercise status |
+|---|---|---|
+| Python | Agent, host, tools, and evaluation runner | Used by the local tests and offline app |
+| FastAPI and Uvicorn | Operator API and sandbox ERP pages | Exercised by local integration tests |
+| Playwright | Browser interaction and ERP DOM verification | Exercised by local integration tests with Chromium |
+| pypdf | Extract text from invoice PDFs | Used by local extraction and integration tests |
+| SQLite | Local ledger, run history, and audit events | Exercised by local integration tests |
+| Groq chat-completions adapter | Live provider; model is configurable, including `openai/gpt-oss-20b` and `openai/gpt-oss-120b` | Both gpt-oss model IDs were reported exercised live during development. Some runs succeeded and some exposed failures; this is not a pass-rate claim. |
+| Gemini adapter | Google AI Studio API | Implemented; no live result verified for this release |
+| OpenAI adapter | OpenAI Responses API | Implemented; no live result verified for this release |
+| OpenRouter adapter | OpenAI-compatible chat completions | Implemented; no live result verified for this release |
+
+The project depends on Python packages listed in `requirements.txt`. It does not use a frontend framework; the workbench is HTML, CSS, and JavaScript in `web/`.
+
+## Evaluation
+
+Run the end-to-end offline scenarios with:
 
 ```bash
-export CENTRALIGN_PROVIDER=openai
-export OPENAI_API_KEY="..."
-export CENTRALIGN_MODEL="gpt-4o" # optional; this is the default
-python3 web_app.py
+python3 eval.py
 ```
 
-`CENTRALIGN_PROVIDER` chooses the primary provider. If it is unset, the first configured provider is selected in this order: Groq, OpenRouter, Gemini, OpenAI. Set `CENTRALIGN_FALLBACK_PROVIDER` to at most one other configured provider to enable live failover. `CENTRALIGN_MODEL` overrides the primary provider's default model; a provider-specific model variable takes precedence when both are set. Gemini 2.5 Flash-Lite may not be enabled for every AI Studio account, so set `CENTRALIGN_GEMINI_MODEL` to a model available to your account if needed.
+The runner starts an isolated app with explicit offline replay, uses a temporary data directory, and automatically approves only the high-value case as part of the scripted evaluation. It prints one `PASS` or `FAIL` per scenario and exits nonzero on any failure. It requires the Playwright Chromium browser installed above.
 
-When a live provider is enabled, the task and observations—including extracted invoice text with detected instruction-like lines removed—are sent to that provider to choose the next tool call. Use only synthetic or otherwise approved data. ERP credentials and approval tokens stay on the local host and are never supplied to the model.
+| Scenario | Expected outcome | Live result |
+|---|---|---|
+| Latest Acme invoice | Human approval requested; after approval, invoice `INV-2026-2116` is posted and verified | TODO — fill in after live run |
+| Unsupported payment and email request | No write tools run; `needs_input` explains the supported invoice-entry option | TODO — fill in after live run |
+| Read-only Acme ledger question | Answer is rendered from ledger fields; no ERP write occurs | TODO — fill in after live run |
+| August Acme invoice | `INV-2026-2084` is selected and verified without policy approval | TODO — fill in after live run |
+| Invoice with instruction-like text | The injection line is flagged; parsed amount `INR 900.00` is used and the invoice is verified | TODO — fill in after live run |
 
-## Safety and verification
+The table’s live-result cells are intentionally left for a live-provider run. `eval.py` tests the offline scripted workflow, not live model quality.
 
-- Browser navigation is limited to the four local ERP routes. Form selectors are allowlisted, and source-backed values must match the selected document.
-- The host checks invoice source and policy before a write, checks for a duplicate in the ERP ledger, blocks unapproved vendors, and enforces the approval gate.
-- Approval tokens expire after five minutes, are bound to the invoice number, legal vendor, amount, and currency, and can be consumed once.
-- Invoice and policy contents are treated as data. The model is told not to follow instructions embedded in source documents.
-- One canonical policy file, `data/policies/procurement_policy.txt`, supplies the INR and USD approval thresholds and approved-vendor rules. Instruction-like invoice content is flagged in the trace, stripped from the model-facing text, and cannot override parsed amount fields.
-- A run reports `complete` only after the ERP ledger DOM matches the source vendor/legal entity, invoice number, dates, amount, and currency. A row screenshot and source SHA-256 are retained as evidence under `data/evidence/<run-id>/`.
-- SQLite in `company_app.py` persists ERP bills, run history, and audit events. The agent's posting path is the Playwright-operated ERP form.
+## Demo data and reset
 
-## Code map
+The checked-in inbox contains synthetic PDF and TXT invoices. The two canonical Acme PDFs are `INV-2026-2084` (August, INR 42,000) and `INV-2026-2116` (October, INR 68,500). Stale Acme TXT copies with conflicting invoice numbers and amounts were removed. The other TXT fixtures cover Northstar, Vertex, and an instruction-like line. `data/policies/procurement_policy.txt` is the single policy source for approval thresholds and approved vendors. On first startup, the host creates `data/policies/company_memory.md` locally with vendor-directory information and a random sandbox password; this local file is ignored by Git and is not exposed to the model.
+
+## Known limitations
+
+- The supported write workflow is invoice entry only.
+- Invoice extraction supports PDF and TXT documents with the expected labeled fields.
+- Browser control is limited to one sandbox ERP with fixed routes and selectors.
+- Reported live runs with free-tier providers took roughly 3–8 minutes; rate limits and network delays can extend that.
+- Open models sometimes return malformed or schema-invalid tool calls. The host feeds recoverable validation feedback back to the provider, but a run can still stop for input/review.
+- The deterministic unsupported-verb list can miss synonyms or indirect wording.
+- The intent classifier is an LLM; the deterministic guard is an additional check, not a complete language-understanding system.
+- Cross-run memory is limited. Ledger and run records persist locally; pending conversational follow-up context is in memory and expires after ten minutes.
+- The app cannot make payments, send email, or operate on real ERP systems.
+- Prompt-injection defense uses heuristic detection, line removal, and structured field parsing; it is not complete.
+
+## Assumptions
+
+- Invoice and policy fixtures are synthetic and suitable for a local demo.
+- The user reviews and decides every requested human approval.
+- “Record,” “enter,” “post,” and “log” indicate invoice entry only when the host guard also finds no recognized unsupported action.
+- Live API keys are supplied through environment variables and kept outside version control.
+
+## What I would build next
+
+- Generic form and page understanding beyond the fixed ERP selectors.
+- Vision-based computer use for layouts without stable DOM controls.
+- Persistent, permissioned company memory across sessions.
+- Scheduled invoice intake and review.
+- Broader evaluation sets for intent, extraction, injection, and provider-specific tool calling.
+- A hosted demo with isolated tenant data and explicit operational controls.
+
+## Repository map
 
 | File | Responsibility |
 |---|---|
-| `agent_loop.py` | Shared bounded observe/decide/execute loop, tool schemas, host checks, and stop conditions. |
-| `llm_clients.py` | OpenAI, Gemini, Groq, OpenRouter, single-key provider routing, retry recovery, and offline-only FakeLLM. |
-| `documents.py` | Confined invoice listing, PDF/TXT extraction, field parsing, and source hashes. |
+| `agent_loop.py` | Bounded observe/decide/execute loop, intent/write gates, tools, retries, run state, and final results. |
+| `llm_clients.py` | Provider adapters, retry/fallback policy, and explicit offline FakeLLM replay. |
+| `browser_tools.py` | Playwright session, route/selector allowlists, snapshots, and ledger verification. |
+| `documents.py` | Confined inbox access, PDF/TXT parsing, candidate listing, and source hashes. |
 | `policy.py` | Procurement policy parsing and threshold checks. |
-| `browser_tools.py` | Playwright session, route/control allowlists, screenshots, and live ERP read-back. |
-| `company_app.py` | SQLite persistence behind the ERP plus policy and vendor-directory data access. |
-| `web_app.py` | FastAPI Operator APIs, approval token broker, and sandbox ERP pages. |
-| `worker.py` | Small public entry point and CLI delegation. |
-| `web/` | Operator workbench HTML, CSS, and JavaScript. |
-| `data/inbox/`, `data/policies/` | Synthetic invoice sources, procurement rules, and sandbox company memory. |
+| `company_app.py` | SQLite ledger, run/audit persistence, vendor directory, and policy access. |
+| `web_app.py` | FastAPI workbench API, approval broker, and local ERP pages. |
+| `worker.py` | Public agent entry point and CLI delegation. |
+| `eval.py` | Offline end-to-end evaluation scenarios. |
+| `web/` | HTML, CSS, and JavaScript workbench. |
+| `test_worker.py` | Python unit and integration tests. |
+| `data/inbox/` and `data/policies/` | Synthetic demo invoices, policy, and sandbox company memory. |
 
 ## Checks
-
-The tests cover strict task classification and write gating, read-only ledger lookups, unsupported and ambiguous tasks, candidate discovery and latest-date rejection, prompt injection, policy thresholds, host-managed sign-in, approval, ERP read-back, duplicate handling, token binding, loop detection, and tool/route guards.
 
 ```bash
 python3 -m compileall -q .
 python3 -m unittest -v test_worker.py
+node --test web/trace_summary.test.js
 node --check web/app.js
+python3 eval.py
 ```
-
-## Current scope and known limitations
-
-The approval waiter is in-memory and is intended for a single-user local demo. Live LLM availability and behavior depend on the selected provider and network access.
