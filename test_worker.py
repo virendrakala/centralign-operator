@@ -2506,5 +2506,100 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 server.stop()
 
 
+class EvalLiveTests(unittest.TestCase):
+    """Unit tests for the live evaluation harness (eval_live.py)."""
+
+    def test_eval_live_refuses_when_no_live_provider_key_configured(self) -> None:
+        from eval_live import check_live_provider_config
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ProviderConfigurationError) as ctx:
+                check_live_provider_config()
+            self.assertIn("No live provider API key is configured", str(ctx.exception))
+
+    def test_format_markdown_section_renders_table_and_redacts_api_keys(self) -> None:
+        from eval_live import EvalResult, format_markdown_section
+        results = [
+            EvalResult(
+                scenario="latest Acme invoice with approval",
+                run_index=1,
+                passed=True,
+                status="complete",
+                duration_seconds=14.2,
+                steps=15,
+                rate_limit_wait_seconds=0.0,
+                provider="gemini",
+                model="gemini-2.5-flash-lite",
+            ),
+            EvalResult(
+                scenario="instruction-like invoice text",
+                run_index=1,
+                passed=False,
+                status="needs_input",
+                duration_seconds=8.5,
+                steps=6,
+                rate_limit_wait_seconds=12.0,
+                provider="gemini",
+                model="gemini-2.5-flash-lite",
+                error="Invalid key AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6 with leak sk-abcdef123456789012345678",
+            ),
+        ]
+        md = format_markdown_section(results, "gemini", "gemini-2.5-flash-lite", 1, timestamp="2026-10-19 12:00:00 UTC")
+        self.assertIn("## Evaluation Run: 2026-10-19 12:00:00 UTC", md)
+        self.assertIn("- **Provider:** gemini", md)
+        self.assertIn("- **Model:** gemini-2.5-flash-lite", md)
+        self.assertIn("1/2 passed (50.0%)", md)
+        self.assertIn("| 1 | latest Acme invoice with approval | PASS | complete | 14.2 | 15 | 0.0 | gemini | gemini-2.5-flash-lite | - |", md)
+        self.assertIn("| 1 | instruction-like invoice text | FAIL | needs_input | 8.5 | 6 | 12.0 | gemini | gemini-2.5-flash-lite |", md)
+        self.assertNotIn("AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6", md)
+        self.assertNotIn("sk-abcdef123456789012345678", md)
+        self.assertIn("[REDACTED_API_KEY]", md)
+
+    def test_record_results_to_markdown_creates_and_appends(self) -> None:
+        from eval_live import EvalResult, record_results_to_markdown
+        with TemporaryDirectory(prefix="centralign-live-results-") as temp_dir:
+            out_file = Path(temp_dir) / "docs" / "live_results.md"
+            r1 = [
+                EvalResult("latest Acme invoice with approval", 1, True, "complete", 10.0, 12, 0.0, "gemini", "gemini-2.5-flash-lite"),
+            ]
+            record_results_to_markdown(r1, "gemini", "gemini-2.5-flash-lite", 1, output_path=out_file, timestamp="2026-10-19 10:00:00 UTC")
+            content1 = out_file.read_text(encoding="utf-8")
+            self.assertIn("# CentrAlign Live Model Evaluation Results", content1)
+            self.assertIn("## Evaluation Run: 2026-10-19 10:00:00 UTC", content1)
+            self.assertEqual(content1.count("# CentrAlign Live Model Evaluation Results"), 1)
+
+            r2 = [
+                EvalResult("latest Acme invoice with approval", 1, False, "error", 5.0, 3, 0.0, "groq", "llama-3.3-70b-versatile", error="timeout"),
+            ]
+            record_results_to_markdown(r2, "groq", "llama-3.3-70b-versatile", 1, output_path=out_file, timestamp="2026-10-19 11:00:00 UTC")
+            content2 = out_file.read_text(encoding="utf-8")
+            self.assertEqual(content2.count("# CentrAlign Live Model Evaluation Results"), 1)
+            self.assertIn("## Evaluation Run: 2026-10-19 10:00:00 UTC", content2)
+            self.assertIn("## Evaluation Run: 2026-10-19 11:00:00 UTC", content2)
+            self.assertIn("llama-3.3-70b-versatile", content2)
+
+    def test_extract_steps_and_rate_limit_wait_from_events(self) -> None:
+        from eval_live import extract_rate_limit_wait, extract_steps
+        fake_run = {
+            "events": [
+                {"event_type": "action", "payload": {"tool": "read_document"}},
+                {"event_type": "rate_limit_recovery", "payload": {"action": "retry_wait", "wait_seconds": 15.5}},
+                {"event_type": "action", "payload": {"tool": "browser_open"}},
+                {"event_type": "rate_limit_recovery", "payload": {"action": "retry_wait", "wait_seconds": 5.0}},
+                {"event_type": "rate_limit_recovery", "payload": {"action": "retries_exhausted"}},
+                {"event_type": "action", "payload": {"tool": "finish"}},
+            ]
+        }
+        self.assertEqual(extract_steps(fake_run), 3)
+        self.assertEqual(extract_rate_limit_wait(fake_run), 20.5)
+
+        fake_run_with_summary = {
+            "events": [
+                {"event_type": "rate_limit_recovery", "payload": {"action": "retry_wait", "wait_seconds": 15.5}},
+                {"event_type": "provider_wait_summary", "payload": {"total_wait_seconds": 65.2}},
+            ]
+        }
+        self.assertEqual(extract_rate_limit_wait(fake_run_with_summary), 65.2)
+
+
 if __name__ == "__main__":
     unittest.main()
