@@ -3,3 +3,4 @@ __pycache__/
 data/company.sqlite3
 data/company.sqlite3-shm
 data/company.sqlite3-wal
+data/runs/*.jsonl

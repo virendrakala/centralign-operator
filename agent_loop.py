@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -18,12 +19,14 @@ from policy import approval_required
 
 
 MAX_STEPS = 64
-MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES = 3
+MAX_REPEATED_TOOL_ERRORS = 4
+WARN_REPEATED_TOOL_ERRORS = 2
 MAX_TOOL_VALIDATION_RETRIES = 3
 MAX_SUBMIT_ATTEMPTS = 3
 LOOP_GUARD_WARN_AFTER = 3
 LOOP_GUARD_STOP_AFTER = 5
-FULL_OBSERVATIONS_TO_KEEP = 6
+FULL_OBSERVATIONS_TO_KEEP = 4
+LONG_OPERATION_TRACE_SECONDS = 30
 STOP_STATUSES = {"complete", "needs_input", "needs_review", "stopped_by_user"}
 _ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP_ROUTES.items())
 
@@ -41,7 +44,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "browser_check", "description": "Check the approval confirmation control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
     {"name": "browser_click", "description": "Click the invoice submit control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}}, "required": ["selector"]}},
     {"name": "request_human_approval", "description": "Request policy approval by invoice_number or read_document path. Include canonical_vendor from the observed directory when needed. The host injects source provenance and the approved token.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}}, "required": [], "additionalProperties": False}},
-    {"name": "verify_ledger_row", "description": "Read back the selected invoice from the ERP ledger and compare its fields.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "expected_fields": {"type": "object", "properties": {"document_path": {"type": "string", "description": "Optional read_document path to disambiguate."}, "vendor": {"type": "string"}, "canonical_vendor": {"type": "string"}, "invoice_number": {"type": "string"}, "invoice_date": {"type": "string"}, "due_date": {"type": "string"}, "amount": {"type": "string"}, "currency": {"type": "string"}}, "required": ["vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency"]}}, "required": ["invoice_number", "expected_fields"]}},
+    {"name": "verify_ledger_row", "description": "Verify the submitted source invoice in the ERP ledger. Optional invoice_number only.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": [], "additionalProperties": False}},
     {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
 ]
 TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
@@ -95,14 +98,17 @@ class AgentLoop:
         self.denied_invoices: set[str] = set()
         self.prompt_tokens_before: list[int] = []
         self.prompt_tokens_after: list[int] = []
+        self.prompt_breakdown_tokens: list[dict[str, int]] = []
         self.duplicate_checked = False
         self.duplicate_present = False
         self.verification: dict[str, Any] | None = None
         self.submit_attempts = 0
         self.submit_performed = False
-        self.last_tool_failure_signature: str | None = None
-        self.consecutive_identical_tool_failures = 0
+        self.tool_failure_counts: dict[tuple[str, str], int] = {}
         self.finished: tuple[str, str] | None = None
+        self.final_result: dict[str, Any] | None = None
+        self.approval_record: dict[str, Any] | None = None
+        self.started_monotonic = time.monotonic()
         self._last_page_snapshot: dict[str, Any] | None = None
         self._last_action_key: str | None = None
         self._last_action_page_signature: str | None = None
@@ -167,12 +173,19 @@ class AgentLoop:
             approval_status = "required" if self._needs_approval() else "not_required"
         fields = snapshot.get("form_fields", [])
         form_filled = any(isinstance(field, dict) and field.get("state") == "filled" for field in fields)
-        if self.submit_performed:
+        posted = bool(getattr(self.browser, "write_submitted", False))
+        if posted:
             form_status = "submitted"
         elif page_path == "/erp/invoices/new" and form_filled:
             form_status = "filled"
         else:
             form_status = "empty"
+        submission_status = (
+            f"submitted: {invoice['invoice_number']}" if posted and invoice
+            else "submit_attempted" if self.submit_performed else None
+        )
+        next_action = "verify_ledger_row" if posted else "inspect_submit_alert" if self.submit_performed else None
+        workflow_hint = f"{submission_status}; next: {next_action}" if submission_status and next_action else None
         alerts = snapshot.get("alerts") or ([snapshot.get("alert")] if snapshot.get("alert") else [])
         approval_hint = None
         if approval_status == "required":
@@ -184,6 +197,9 @@ class AgentLoop:
             "approval_status": approval_status,
             "approval_hint": approval_hint,
             "form_status": form_status,
+            "submission_status": submission_status,
+            "next_action": next_action,
+            "workflow_hint": workflow_hint,
             "last_erp_alert": str(alerts[-1])[:300] if alerts else None,
         }
 
@@ -212,6 +228,52 @@ class AgentLoop:
         }
         chars = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
         return chars, math.ceil(chars / 4)
+
+    def _prompt_size_breakdown(self, observations: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+        state = next((item.get("result", {}) for item in observations if item.get("tool") == "host_run_state"), {})
+        history = [item for item in observations if item.get("tool") != "host_run_state"]
+        components = {
+            "system_prompt": SYSTEM_INSTRUCTIONS,
+            "tool_schemas": TOOL_DEFINITIONS,
+            "run_state": state,
+            "history": {"task": self.task, "observations": history},
+        }
+        result: dict[str, dict[str, int]] = {}
+        for key, value in components.items():
+            chars = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+            result[key] = {"characters": chars, "approx_tokens": math.ceil(chars / 4)}
+        return result
+
+    async def _await_with_long_operation_trace(
+        self,
+        label: str,
+        awaitable: Any,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> Any:
+        """Emit a visible marker when an async wait/request crosses the long-operation threshold."""
+        task = asyncio.ensure_future(awaitable)
+        started = time.monotonic()
+        done, _ = await asyncio.wait({task}, timeout=LONG_OPERATION_TRACE_SECONDS)
+        if done:
+            return task.result()
+        metadata = dict(details or {})
+        self.emit("long_operation", {
+            "operation": label,
+            "status": "still_running",
+            "elapsed_seconds": LONG_OPERATION_TRACE_SECONDS,
+            **metadata,
+        })
+        try:
+            return await task
+        finally:
+            elapsed = round(time.monotonic() - started, 2)
+            self.emit("long_operation", {
+                "operation": label,
+                "status": "finished" if task.done() and not task.cancelled() and task.exception() is None else "ended_with_error",
+                "elapsed_seconds": elapsed,
+                **metadata,
+            })
 
     @staticmethod
     def _observation_one_line(item: dict[str, Any]) -> str:
@@ -425,6 +487,21 @@ class AgentLoop:
             directory_terms = set(re.findall(r"[a-z0-9]+", " ".join(row[1:3]).casefold()))
             if not source_terms.intersection(directory_terms):
                 raise ValueError("The observed vendor directory entry does not correspond to the source vendor label.")
+
+    def _attach_directory_vendor(self, invoice: dict[str, Any]) -> None:
+        """Resolve a source label to one matching legal entity from the observed directory."""
+        if invoice.get("canonical_vendor"):
+            return
+        source_terms = set(re.findall(r"[a-z0-9]+", str(invoice.get("vendor", "")).casefold()))
+        matches = {
+            str(row[2]) for row in getattr(self.browser, "vendor_rows", [])
+            if len(row) >= 3
+            and source_terms.intersection(set(re.findall(r"[a-z0-9]+", " ".join(map(str, row[1:3])).casefold())))
+        }
+        if len(matches) == 1:
+            candidate = matches.pop()
+            self._validate_vendor_evidence(candidate)
+            invoice["canonical_vendor"] = candidate
 
     async def _execute(
         self, name: str, arguments: dict[str, Any], *, include_snapshot: bool = True
@@ -695,7 +772,15 @@ class AgentLoop:
                 "source_file": invoice["source_file"],
                 "source_sha256": invoice["source_sha256"],
             }
-            token = await self.approval_handler(payload)
+            token = await self._await_with_long_operation_trace(
+                "human_approval_wait", self.approval_handler(payload),
+                details={"invoice_number": invoice["invoice_number"]},
+            )
+            self.approval_record = {
+                "status": "approved" if token else "denied_or_timed_out",
+                "invoice_number": invoice["invoice_number"],
+                "reason": reason,
+            }
             if token:
                 self.approval_tokens[invoice_key] = str(token)
                 self.denied_invoices.discard(invoice_key)
@@ -704,15 +789,31 @@ class AgentLoop:
             self.browser.set_invoice(invoice)
             return {"status": "approved" if token else "denied_or_timed_out", "invoice_number": invoice["invoice_number"]}
         if name == "verify_ledger_row":
-            fields = arguments.get("expected_fields")
-            if not isinstance(fields, dict) or str(arguments.get("invoice_number", "")) != str(fields.get("invoice_number", "")):
-                raise ValueError("Ledger verification must identify the selected source invoice.")
-            invoice = self._invoice_by_fields(fields)
-            canonical = str(fields.get("canonical_vendor", ""))
-            if canonical:
-                self._validate_vendor_evidence(canonical)
-                invoice["canonical_vendor"] = canonical
-            self.selected_invoice = invoice
+            invoice_number = _clean_text(arguments.get("invoice_number"), 100)
+            if invoice_number:
+                candidates = [
+                    (path, document["invoice"]) for path, document in self.documents.items()
+                    if document.get("invoice") and str(document["invoice"].get("invoice_number")) == invoice_number
+                ]
+                if len(candidates) != 1:
+                    raise ValueError(
+                        "Verification invoice is missing or ambiguous. " + self._read_invoice_candidates()
+                    )
+                if (
+                    getattr(self.browser, "write_submitted", False)
+                    and self.selected_invoice
+                    and invoice_number != str(self.selected_invoice.get("invoice_number"))
+                ):
+                    raise ValueError(
+                        f"This run submitted {self.selected_invoice.get('invoice_number')}; verify that invoice instead."
+                    )
+                self.selected_invoice_path, invoice = candidates[0]
+                self.selected_invoice = invoice
+            elif not self.selected_invoice:
+                raise ValueError("Read an invoice source before calling verify_ledger_row.")
+            else:
+                invoice = self.selected_invoice
+            self._attach_directory_vendor(invoice)
             self.browser.set_invoice(invoice)
             result = await self.browser.verify_ledger_row(invoice)
             self.verification = result if result.get("status") in {"verified", "mismatch"} else None
@@ -730,6 +831,29 @@ class AgentLoop:
                     result["message"] = "No ledger row was found after the invoice form was submitted. Inspect the ERP alert before retrying."
             elif result.get("status") == "mismatch":
                 self.duplicate_checked, self.duplicate_present = True, True
+            if result.get("status") == "verified" and result.get("pass"):
+                approval_record = self.approval_record or {
+                    "status": "not_applicable_existing_ledger_row" if result.get("already_present") else "not_required"
+                }
+                what_was_done = (
+                    f"Verified existing ledger row for invoice {invoice['invoice_number']}."
+                    if result.get("already_present")
+                    else f"Submitted invoice {invoice['invoice_number']} and verified its ledger row."
+                )
+                self.final_result = {
+                    "status": "complete",
+                    "what_was_done": what_was_done,
+                    "evidence": {
+                        "ledger_row_id": result.get("ledger_row_id"),
+                        "ledger_screenshot_path": result.get("screenshot_path"),
+                        "approval_record": approval_record,
+                        "source_file": invoice.get("source_file"),
+                        "source_sha256": invoice.get("source_sha256"),
+                    },
+                    "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
+                }
+                self.emit("final_result", self.final_result)
+                self.finished = ("complete", what_was_done)
             return result
         if name == "finish":
             status = _clean_text(arguments.get("status"), 40)
@@ -762,27 +886,27 @@ class AgentLoop:
             return False
         return _normalized(vendor) in {_normalized(item) for item in self.policy.get("approved_vendors", [])}
 
-    def _record_tool_failure(self, name: str, arguments: dict[str, Any], error: str) -> bool:
-        """Count only adjacent failures with the same tool, arguments, and error."""
-        signature = json.dumps([name, arguments, error], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if signature == self.last_tool_failure_signature:
-            self.consecutive_identical_tool_failures += 1
-        else:
-            self.last_tool_failure_signature = signature
-            self.consecutive_identical_tool_failures = 1
-        count = self.consecutive_identical_tool_failures
+    def _record_tool_failure(self, name: str, error: str) -> int:
+        """Count matching tool/error failures over the entire run, regardless of intervening events."""
+        key = (name, " ".join(error.split()))
+        count = self.tool_failure_counts.get(key, 0) + 1
+        self.tool_failure_counts[key] = count
         self.emit("tool_retry_budget", {
             "tool": name,
-            "consecutive_identical_failures": count,
-            "limit": MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES,
-            "remaining": max(0, MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES - count),
+            "failure_count": count,
+            "limit": MAX_REPEATED_TOOL_ERRORS,
+            "remaining": max(0, MAX_REPEATED_TOOL_ERRORS - count),
             "error": error,
         })
-        return count >= MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES
+        return count
 
-    def _clear_tool_failures(self) -> None:
-        self.last_tool_failure_signature = None
-        self.consecutive_identical_tool_failures = 0
+    def _append_repeat_failure_warning(self, name: str, error: str, count: int) -> None:
+        warning = (
+            f"Repeated failure {count}/{MAX_REPEATED_TOOL_ERRORS} for {name}: {error}. "
+            "Change the call using this error feedback; do not repeat the same failing request."
+        )
+        self.observations.append({"tool": "repeat_failure_warning", "arguments": {}, "result": {"warning": warning}})
+        self.emit("tool_retry_warning", {"tool": name, "failure_count": count, "limit": MAX_REPEATED_TOOL_ERRORS, "error": error, "warning": warning})
 
     def _tool_failure_summary(self, name: str, error: str) -> str:
         done = []
@@ -806,9 +930,28 @@ class AgentLoop:
         done_text = ", ".join(done) if done else "none"
         not_done_text = ", ".join(not_done) if not_done else "none"
         return (
-            f"Stopped after {MAX_CONSECUTIVE_IDENTICAL_TOOL_FAILURES} consecutive identical failures "
-            f"in {name}. Last error: {error}. Done: {done_text}. Not done: {not_done_text}."
+            f"Stopped after {MAX_REPEATED_TOOL_ERRORS} failures for {name} with the same error. "
+            f"Last error: {error}. Done: {done_text}. Not done: {not_done_text}."
         )
+
+    def _provider_tool_error_text(self, error: ProviderRequestError) -> str:
+        body = error.response_body or ""
+        try:
+            payload = json.loads(body)
+            detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+            message = detail.get("message") if isinstance(detail, dict) else None
+            code = detail.get("code") if isinstance(detail, dict) else None
+            text = f"HTTP {error.status_code} {code or error.error_code or 'tool validation error'}: {message or str(error)}"
+        except (TypeError, ValueError):
+            text = f"HTTP {error.status_code} {error.error_code or 'tool validation error'}: {str(error)}"
+        return self._safe_validation_error(text, body)
+
+    def _stop_for_repeated_failure(self, name: str, error: str, count: int) -> tuple[str, str] | None:
+        if count < MAX_REPEATED_TOOL_ERRORS:
+            return None
+        reason = self._tool_failure_summary(name, error)
+        self.emit("run_error", {"error": reason})
+        return "needs_input", reason
 
     async def run(self) -> tuple[str, str]:
         await self.browser.start()
@@ -826,24 +969,38 @@ class AgentLoop:
                     self.emit("host_run_state", {"turn": step, **run_state})
                     baseline_chars, baseline_tokens = self._estimate_prompt_tokens(turn_observations[1:])
                     prompt_chars, prompt_tokens = self._estimate_prompt_tokens(turn_observations)
+                    prompt_breakdown = self._prompt_size_breakdown(turn_observations)
                     self.prompt_tokens_before.append(baseline_tokens)
                     self.prompt_tokens_after.append(prompt_tokens)
+                    self.prompt_breakdown_tokens.append({key: value["approx_tokens"] for key, value in prompt_breakdown.items()})
                     self.emit("prompt_size", {
                         "turn": step,
                         "approx_characters": prompt_chars,
                         "approx_tokens": prompt_tokens,
                         "without_run_state_characters": baseline_chars,
                         "without_run_state_tokens": baseline_tokens,
+                        "breakdown": prompt_breakdown,
                         "token_heuristic": "serialized characters divided by four; estimate only",
                     })
-                    call = await asyncio.to_thread(self.client.next_tool_call, self.task, turn_observations, TOOL_DEFINITIONS)
+                    call = await self._await_with_long_operation_trace(
+                        "provider_request",
+                        asyncio.to_thread(self.client.next_tool_call, self.task, turn_observations, TOOL_DEFINITIONS),
+                        details={"provider": provider_name, "turn": step},
+                    )
                 except ProviderRequestError as exc:
                     if not self._is_recoverable_provider_tool_error(exc):
                         provider_name = getattr(self.client, "name", type(self.client).__name__)
                         reason = f"{provider_name} decision failed at step {step}: {type(exc).__name__}: {exc}"
                         self.emit("run_error", {"error": reason})
                         return "needs_review", reason
-                    last_validation_error = self._safe_validation_error(str(exc), exc.response_body or "")
+                    last_validation_error = self._provider_tool_error_text(exc)
+                    failed_tool = exc.rejected_tool_name or "provider_tool_call"
+                    failure_count = self._record_tool_failure(failed_tool, last_validation_error)
+                    stopped = self._stop_for_repeated_failure(failed_tool, last_validation_error, failure_count)
+                    if stopped:
+                        return stopped
+                    if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                        self._append_repeat_failure_warning(failed_tool, last_validation_error, failure_count)
                     if validation_retries >= MAX_TOOL_VALIDATION_RETRIES:
                         reason = self._validation_retry_limit_message(last_validation_error, exc.rejected_tool_name)
                         self.emit("run_error", {"error": reason})
@@ -865,11 +1022,17 @@ class AgentLoop:
                     return "needs_review", f"{provider_name} stopped without calling finish; the run did not claim completion."
 
                 if call.name == "__malformed_tool_arguments__":
-                    invalid_tool = call.arguments.get("tool_name")
+                    invalid_tool = str(call.arguments.get("tool_name") or "provider_tool_call")
                     last_validation_error = self._safe_validation_error(
                         "Malformed tool arguments: " + str(call.arguments.get("message", "invalid tool arguments")),
                         str(call.arguments.get("message", "")),
                     )
+                    failure_count = self._record_tool_failure(invalid_tool, last_validation_error)
+                    stopped = self._stop_for_repeated_failure(invalid_tool, last_validation_error, failure_count)
+                    if stopped:
+                        return stopped
+                    if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                        self._append_repeat_failure_warning(invalid_tool, last_validation_error, failure_count)
                     if validation_retries >= MAX_TOOL_VALIDATION_RETRIES:
                         reason = self._validation_retry_limit_message(last_validation_error, str(invalid_tool) if invalid_tool else None)
                         self.emit("run_error", {"error": reason})
@@ -884,6 +1047,12 @@ class AgentLoop:
                 self._event_action(call)
                 if call.name not in TOOL_BY_NAME:
                     last_validation_error = f"Unknown tool name: {call.name}. Use one of the supplied tool schemas."
+                    failure_count = self._record_tool_failure(call.name, last_validation_error)
+                    stopped = self._stop_for_repeated_failure(call.name, last_validation_error, failure_count)
+                    if stopped:
+                        return stopped
+                    if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                        self._append_repeat_failure_warning(call.name, last_validation_error, failure_count)
                     if validation_retries >= MAX_TOOL_VALIDATION_RETRIES:
                         reason = self._validation_retry_limit_message(last_validation_error, call.name)
                         self.emit("run_error", {"error": reason})
@@ -900,6 +1069,12 @@ class AgentLoop:
                         last_validation_error = self._safe_validation_error(
                             f"Malformed arguments for {call.name}: {type(exc).__name__}: {exc}", str(exc)
                         )
+                        failure_count = self._record_tool_failure(call.name, last_validation_error)
+                        stopped = self._stop_for_repeated_failure(call.name, last_validation_error, failure_count)
+                        if stopped:
+                            return stopped
+                        if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                            self._append_repeat_failure_warning(call.name, last_validation_error, failure_count)
                         if validation_retries >= MAX_TOOL_VALIDATION_RETRIES:
                             reason = self._validation_retry_limit_message(last_validation_error, call.name)
                             self.emit("run_error", {"error": reason})
@@ -910,7 +1085,10 @@ class AgentLoop:
                         )
                         continue
                     try:
-                        result = await self._execute(call.name, call.arguments)
+                        result = await self._await_with_long_operation_trace(
+                            f"tool:{call.name}", self._execute(call.name, call.arguments),
+                            details={"tool": call.name, "turn": step},
+                        )
                     except Exception as exc:
                         result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
                 safe_arguments = self._redact_arguments(call.name, call.arguments)
@@ -955,21 +1133,26 @@ class AgentLoop:
                         return "needs_review", reason
                 if result.get("status") == "error":
                     last_error = str(result.get("message", "tool action failed"))
-                    if self._record_tool_failure(call.name, safe_arguments, last_error):
-                        reason = self._tool_failure_summary(call.name, last_error)
-                        self.emit("run_error", {"error": reason})
-                        return "needs_input", reason
-                else:
-                    self._clear_tool_failures()
+                    failure_count = self._record_tool_failure(call.name, last_error)
+                    if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                        self._append_repeat_failure_warning(call.name, last_error, failure_count)
+                    stopped = self._stop_for_repeated_failure(call.name, last_error, failure_count)
+                    if stopped:
+                        return stopped
                 if self.finished:
                     return self.finished
             return "needs_review", f"The agent reached the {MAX_STEPS}-step limit without calling finish."
         finally:
             if self.prompt_tokens_after:
+                breakdown_keys = self.prompt_breakdown_tokens[0].keys()
                 self.emit("prompt_size_summary", {
                     "turns": len(self.prompt_tokens_after),
                     "average_tokens_without_run_state": round(sum(self.prompt_tokens_before) / len(self.prompt_tokens_before), 1),
                     "average_tokens_with_run_state": round(sum(self.prompt_tokens_after) / len(self.prompt_tokens_after), 1),
+                    "average_breakdown_tokens": {
+                        key: round(sum(item.get(key, 0) for item in self.prompt_breakdown_tokens) / len(self.prompt_breakdown_tokens), 1)
+                        for key in breakdown_keys
+                    },
                     "token_heuristic": "serialized characters divided by four; estimate only",
                 })
             await self.browser.close()

@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import html
 import json
+import os
 import re
 import secrets
 import threading
@@ -26,6 +27,8 @@ ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 DEFAULT_DATA_DIR = ROOT / "data"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SECRET_VALUE_RE = re.compile(r"\b(?:APR-[A-Z0-9]{8,}|gsk_[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,})\b")
+SECRET_PAYLOAD_KEYS = {"password", "passwd", "secret", "api_key", "access_token", "authorization", "approval_token", "token_preview", "token", "session_token", "refresh_token"}
 
 
 def _escape(value: Any) -> str:
@@ -112,11 +115,47 @@ class RunManager:
         self._pending: dict[str, asyncio.Future[str | None]] = {}
         self._approval_payload: dict[str, dict[str, Any]] = {}
         self._tokens: dict[str, dict[str, Any]] = {}
+        self.run_log_dir = self.data_dir / "runs"
+        self.run_log_dir.mkdir(parents=True, exist_ok=True)
+        self._run_log_lock = threading.Lock()
+        self._known_secrets: set[str] = set()
+        memory_path = self.data_dir / "policies" / "company_memory.md"
+        if memory_path.exists():
+            for line in memory_path.read_text(encoding="utf-8").splitlines():
+                if line.casefold().startswith(("email:", "password:")):
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        self._known_secrets.add(value)
+        for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"):
+            value = os.environ.get(key, "").strip()
+            if value:
+                self._known_secrets.add(value)
+
+    def _redact_event_value(self, value: Any, key: str = "") -> Any:
+        normalized_key = key.casefold().replace("-", "_")
+        if normalized_key in SECRET_PAYLOAD_KEYS or normalized_key.endswith(("_token", "_api_key")):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(item_key): self._redact_event_value(item_value, str(item_key)) for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [self._redact_event_value(item) for item in value]
+        if isinstance(value, str):
+            safe = value
+            for secret in self._known_secrets:
+                safe = safe.replace(secret, "[REDACTED]")
+            return SECRET_VALUE_RE.sub("[REDACTED]", safe)
+        return value
 
     def event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
         sequence = self._sequence.get(run_id, 0) + 1
         self._sequence[run_id] = sequence
-        self.company.append_event(run_id, sequence, event_type, payload)
+        safe_payload = self._redact_event_value(payload)
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        self.company.append_event(run_id, sequence, event_type, safe_payload)
+        line = {"sequence": sequence, "timestamp": timestamp, "event_type": event_type, "payload": safe_payload}
+        with self._run_log_lock:
+            with (self.run_log_dir / f"{run_id}.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(line, ensure_ascii=False, sort_keys=True) + "\n")
 
     def start(self, task: str, approval_mode: str, base_url: str) -> str:
         run_id = uuid.uuid4().hex[:12]
@@ -139,7 +178,7 @@ class RunManager:
         finally:
             self._pending.pop(run_id, None)
             self._approval_payload.pop(run_id, None)
-        self.event(run_id, "approval_decision", {"decision": "approved" if token else "denied_or_timed_out", "token_minted": bool(token), "token_preview": (token[:8] + "…") if token else None})
+        self.event(run_id, "approval_decision", {"decision": "approved" if token else "denied_or_timed_out", "token_minted": bool(token)})
         return token
 
     def decide(self, run_id: str, approved: bool) -> str | None:
@@ -225,6 +264,8 @@ class RunManager:
         self._approval_payload.clear()
         self._tokens.clear()
         self._sequence.clear()
+        for path in self.run_log_dir.glob("*.jsonl"):
+            path.unlink(missing_ok=True)
         self.company.reset_demo_data()
 
 
@@ -433,6 +474,9 @@ def main() -> None:
     import uvicorn
     selected_app = app if args.data_dir is None and not args.offline else create_app(args.data_dir, offline=args.offline)
     if args.reset_demo_data:
+        run_log_dir = selected_app.state.data_dir / "runs"
+        for path in run_log_dir.glob("*.jsonl"):
+            path.unlink(missing_ok=True)
         selected_app.state.company.reset_demo_data()
     uvicorn.run(selected_app, host="127.0.0.1", port=args.port, log_level="info")
 

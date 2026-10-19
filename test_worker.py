@@ -155,8 +155,143 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertIn("tool_use_failed", feedback["result"]["error"])
         schema = feedback["result"]["tool_schemas"][0]
         self.assertEqual(schema["name"], "verify_ledger_row")
-        self.assertIn("invoice_number", schema["parameters"]["properties"]["expected_fields"]["required"])
+        self.assertEqual(set(schema["parameters"]["properties"]), {"invoice_number"})
+        self.assertEqual(schema["parameters"]["required"], [])
         self.assertFalse(any(kind == "credentials_supplied" for kind, _ in events))
+
+    def test_repeated_provider_tool_use_failed_warns_at_two_and_stops_at_four(self) -> None:
+        failure = ProviderRequestError(
+            "groq", "openai/gpt-oss-120b", 400,
+            response_body='{"error":{"code":"tool_use_failed","message":"verify_ledger_row arguments must be empty"}}',
+            error_code="tool_use_failed", rejected_tool_name="verify_ledger_row",
+        )
+
+        class StubClient:
+            name = "groq"
+            model = "openai/gpt-oss-120b"
+
+            def __init__(self):
+                self.calls = []
+
+            def next_tool_call(self, _task, observations, _tools):
+                self.calls.append(json.loads(json.dumps(observations)))
+                raise failure
+
+        with TemporaryDirectory(prefix="centralign-400-retry-guard-") as temp_dir:
+            client = StubClient()
+            events = []
+            loop = AgentLoop(
+                Path(temp_dir), "400-retry-guard", "verify invoice", "http://127.0.0.1:8765",
+                lambda kind, payload: events.append((kind, payload)), lambda *_: None, client=client,
+            )
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            status, summary = asyncio.run(loop.run())
+
+        self.assertEqual(status, "needs_input")
+        self.assertIn("4 failures for verify_ledger_row", summary)
+        self.assertIn("tool_use_failed", summary)
+        self.assertEqual(len(client.calls), 4)
+        self.assertTrue(any(item.get("tool") == "repeat_failure_warning" for item in client.calls[2]))
+        counts = [payload["failure_count"] for kind, payload in events if kind == "tool_retry_budget"]
+        self.assertEqual(counts, [1, 2, 3, 4])
+        self.assertEqual([payload["failure_count"] for kind, payload in events if kind == "tool_retry_warning"], [2])
+
+    def test_verify_tool_needs_no_model_fields_and_host_finalizes_with_evidence(self) -> None:
+        schema = TOOL_BY_NAME["verify_ledger_row"]["parameters"]
+        self.assertEqual(set(schema["properties"]), {"invoice_number"})
+        self.assertEqual(schema["required"], [])
+        self.assertFalse(schema["additionalProperties"])
+        invoice = {
+            "vendor": "Acme Analytics", "canonical_vendor": "Acme Analytics Pvt Ltd",
+            "invoice_number": "INV-HOST-VERIFY", "invoice_date": "2026-10-01",
+            "due_date": "2026-11-01", "amount": "60000.00", "currency": "INR",
+            "source_file": "inbox/invoice.txt", "source_sha256": "d" * 64,
+        }
+
+        class StubBrowser:
+            write_submitted = True
+            logged_in = True
+            vendor_rows = [["ACM", "Acme Analytics", "Acme Analytics Pvt Ltd", "Approved"]]
+
+            def set_invoice(self, _invoice):
+                pass
+
+            async def verify_ledger_row(self, selected):
+                self.selected = selected
+                return {
+                    "status": "verified", "pass": True, "invoice_number": selected["invoice_number"],
+                    "already_present": False, "ledger_row_id": "#42", "screenshot_path": "/tmp/ledger.png",
+                    "matches": {"vendor": True, "amount": True}, "field_matches": [],
+                }
+
+        with TemporaryDirectory(prefix="centralign-host-verify-") as temp_dir:
+            events = []
+            loop = AgentLoop(Path(temp_dir), "host-verify", "record invoice", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=FakeLLM())
+            browser = StubBrowser()
+            loop.browser = browser
+            loop.documents["inbox/invoice.txt"] = {"path": "inbox/invoice.txt", "invoice": invoice}
+            loop.selected_invoice = invoice
+            loop.selected_invoice_path = "inbox/invoice.txt"
+            loop.approval_record = {"status": "approved", "invoice_number": invoice["invoice_number"]}
+            state = loop._host_run_state()
+            result = asyncio.run(loop._execute("verify_ledger_row", {}))
+
+        self.assertEqual(state["workflow_hint"], "submitted: INV-HOST-VERIFY; next: verify_ledger_row")
+        self.assertIs(browser.selected, invoice)
+        self.assertTrue(result["pass"])
+        self.assertEqual(loop.finished[0], "complete")
+        final = next(payload for kind, payload in events if kind == "final_result")
+        self.assertEqual(final["evidence"]["ledger_row_id"], "#42")
+        self.assertEqual(final["evidence"]["ledger_screenshot_path"], "/tmp/ledger.png")
+        self.assertEqual(final["evidence"]["approval_record"]["status"], "approved")
+        self.assertEqual(final["evidence"]["source_file"], "inbox/invoice.txt")
+        self.assertEqual(final["evidence"]["source_sha256"], "d" * 64)
+        self.assertGreaterEqual(final["elapsed_seconds"], 0)
+
+    def test_long_provider_request_emits_pending_and_finished_trace_events(self) -> None:
+        class SlowClient:
+            name = "groq"
+            model = "slow-test"
+
+            @staticmethod
+            def next_tool_call(*_args):
+                time.sleep(0.03)
+                return ToolCall("finish", {"status": "needs_review", "summary": "done"})
+
+        with TemporaryDirectory(prefix="centralign-long-request-") as temp_dir:
+            events = []
+            loop = AgentLoop(Path(temp_dir), "long-request", "task", "http://127.0.0.1:8765", lambda *event: events.append(event), lambda *_: None, client=SlowClient())
+            loop.browser.start = unittest.mock.AsyncMock()
+            loop.browser.close = unittest.mock.AsyncMock()
+            with patch("agent_loop.LONG_OPERATION_TRACE_SECONDS", 0.005):
+                asyncio.run(loop.run())
+        operations = [payload for kind, payload in events if kind == "long_operation"]
+        self.assertEqual([item["status"] for item in operations], ["still_running", "finished"])
+        self.assertEqual(operations[0]["operation"], "provider_request")
+        self.assertGreaterEqual(operations[1]["elapsed_seconds"], 0.02)
+
+    def test_run_jsonl_persists_every_event_with_secrets_redacted(self) -> None:
+        with TemporaryDirectory(prefix="centralign-jsonl-") as temp_dir:
+            data_dir = Path(temp_dir)
+            company = CompanyApp(data_dir)
+            company.start_run("jsonl-run", "persist this run")
+            manager = RunManager(company, data_dir, offline=True)
+            manager._sequence["jsonl-run"] = 0
+            manager.event("jsonl-run", "sensitive_probe", {
+                "password": "demo-password", "approval_token": "APR-ABCDEF123456",
+                "message": "provider key gsk_12345678901234567890",
+            })
+            path = data_dir / "runs" / "jsonl-run.jsonl"
+            lines = path.read_text(encoding="utf-8").splitlines()
+            record = json.loads(lines[0])
+
+        serialized = json.dumps(record)
+        self.assertEqual(record["event_type"], "sensitive_probe")
+        self.assertIn("[REDACTED]", serialized)
+        self.assertNotIn("demo-password", serialized)
+        self.assertNotIn("APR-ABCDEF123456", serialized)
+        self.assertNotIn("gsk_12345678901234567890", serialized)
 
     def test_malformed_arguments_are_fed_back_and_retry_limit_includes_last_error(self) -> None:
         class StubClient:
@@ -198,10 +333,11 @@ class AgentLoopUnitTests(unittest.TestCase):
             loop.browser.start = unittest.mock.AsyncMock()
             loop.browser.close = unittest.mock.AsyncMock()
             status, summary = asyncio.run(loop.run())
-            self.assertEqual(status, "needs_review")
-            self.assertIn("retry limit reached after 3 retries", summary)
+            self.assertEqual(status, "needs_input")
+            self.assertIn("4 failures for verify_ledger_row", summary)
             self.assertIn("still missing invoice_number", summary)
             self.assertEqual(len(client.calls), 4)  # initial attempt and three retries
+            self.assertTrue(any(item.get("tool") == "repeat_failure_warning" for item in client.calls[2]))
             self.assertEqual(sum(item.get("tool") == "tool_validation_feedback" for item in client.calls[-1]), 3)
 
     def test_all_live_adapters_surface_malformed_tool_arguments(self) -> None:
@@ -326,9 +462,7 @@ class AgentLoopUnitTests(unittest.TestCase):
                         {"selector": "#invoice_number_input", "value": invoice["invoice_number"]},
                     ]})
                 if self.step == 2:
-                    fields = {key: invoice[key] for key in ("vendor", "invoice_number", "invoice_date", "due_date", "amount", "currency")}
-                    fields["document_path"] = "inbox/invoice.txt"
-                    return ToolCall("verify_ledger_row", {"invoice_number": invoice["invoice_number"], "expected_fields": fields})
+                    return ToolCall("verify_ledger_row", {"invoice_number": invoice["invoice_number"]})
                 verified = next(item for item in observations if item.get("tool") == "verify_ledger_row")
                 self.verify_message = verified["result"].get("message")
                 return ToolCall("finish", {"status": "needs_input", "summary": self.verify_message})
@@ -413,17 +547,20 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertIn(exact_error, summary)
         self.assertIn("Not done: invoice selection, invoice submission, ledger read-back verification", summary)
         retry_events = [payload for kind, payload in events if kind == "tool_retry_budget"]
-        self.assertEqual([event["consecutive_identical_failures"] for event in retry_events], [1, 2, 3])
+        self.assertEqual([event["failure_count"] for event in retry_events], [1, 2, 3, 4])
+        self.assertEqual(retry_events[-1]["limit"], 4)
+        warnings = [payload for kind, payload in events if kind == "tool_retry_warning"]
+        self.assertEqual([warning["failure_count"] for warning in warnings], [2])
         self.assertTrue(any(kind == "run_error" for kind, _ in events))
 
         with TemporaryDirectory(prefix="centralign-consecutive-counter-") as temp_dir:
             loop = AgentLoop(Path(temp_dir), "counter", "task", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=FakeLLM())
-            arguments = {"selector": "#invoice_number_input", "value": "INV-1"}
-            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "first error"))
-            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "different error"))
-            self.assertEqual(loop.consecutive_identical_tool_failures, 1)
-            self.assertFalse(loop._record_tool_failure("browser_fill", arguments, "different error"))
-            self.assertTrue(loop._record_tool_failure("browser_fill", arguments, "different error"))
+            self.assertEqual(loop._record_tool_failure("browser_fill", "first error"), 1)
+            self.assertEqual(loop._record_tool_failure("browser_fill", "different error"), 1)
+            self.assertEqual(loop._record_tool_failure("browser_fill", "first error"), 2)
+            loop._provider_recovery({"action": "retry_wait", "wait_seconds": 4})
+            self.assertEqual(loop._record_tool_failure("browser_fill", "first error"), 3)
+            self.assertEqual(loop._record_tool_failure("browser_snapshot", "first error"), 1)
 
     def test_approval_token_is_host_injected_and_survives_a_rejected_submit(self) -> None:
         invoice = {
@@ -554,13 +691,17 @@ class AgentLoopUnitTests(unittest.TestCase):
                 for index in range(10)
             ]
             compact = loop._conversation_observations()
-            self.assertEqual(len(compact), 2 + 6)
+            self.assertEqual(len(compact), 2 + 4)
             self.assertEqual(compact[0]["tool"], "host_run_state")
             summaries = compact[1]["result"]["summaries"]
-            self.assertEqual(len(summaries), 4)
+            self.assertEqual(len(summaries), 6)
             self.assertTrue(all("\\n" not in line and len(line) <= 240 for line in summaries))
             self.assertNotIn("long invoice body", json.dumps(summaries))
             self.assertEqual(compact[-1], loop.observations[-1])
+            breakdown = loop._prompt_size_breakdown(compact)
+            self.assertEqual(set(breakdown), {"system_prompt", "tool_schemas", "run_state", "history"})
+            self.assertGreater(breakdown["history"]["characters"], breakdown["system_prompt"]["characters"])
+            self.assertGreater(breakdown["history"]["characters"], breakdown["tool_schemas"]["characters"])
 
     def test_repeated_same_action_warns_at_three_and_stops_at_five(self) -> None:
         repeated_action = ToolCall("browser_snapshot", {})
@@ -610,6 +751,9 @@ class AgentLoopUnitTests(unittest.TestCase):
             })
             company.start_run("reset-run", "test run")
             company.append_event("reset-run", 1, "task_started", {"task": "test"})
+            run_log_dir = data_dir / "runs"
+            run_log_dir.mkdir(parents=True, exist_ok=True)
+            (run_log_dir / "reset-run.jsonl").write_text("{}\n", encoding="utf-8")
             company.reset_demo_data()
             self.assertEqual(company.list_bills(), [])
             self.assertEqual(company.list_runs(), [])
@@ -621,11 +765,13 @@ class AgentLoopUnitTests(unittest.TestCase):
                 "amount": "100.00", "currency": "INR", "source_file": "invoice.txt",
             })
             company.start_run("reset-run-2", "test run")
+            (run_log_dir / "reset-run-2.jsonl").write_text("{}\n", encoding="utf-8")
             with patch("sys.argv", ["web_app.py", "--data-dir", str(data_dir), "--reset-demo-data"]), patch("uvicorn.run") as serve:
                 web_main()
             serve.assert_called_once()
             self.assertEqual(CompanyApp(data_dir).list_bills(), [])
             self.assertEqual(CompanyApp(data_dir).list_runs(), [])
+            self.assertEqual(list(run_log_dir.glob("*.jsonl")), [])
 
     def test_provider_configuration_selects_openai_gemini_and_replay(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -900,8 +1046,9 @@ class AgentLoopUnitTests(unittest.TestCase):
             loop.browser.start = skip_browser
             loop.browser.close = skip_browser
             status, summary = asyncio.run(loop.run())
-        self.assertEqual(status, "needs_review")
-        self.assertIn("Last tool error (browser_open)", summary)
+        self.assertEqual(status, "needs_input")
+        self.assertIn("4 failures for browser_open", summary)
+        self.assertIn("Last error:", summary)
         self.assertIn("one of the allowed values:", summary)
 
     def test_host_rejects_unlisted_tools_routes_and_unsafe_writes(self) -> None:
@@ -1096,11 +1243,26 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 run_states = [event["payload"] for event in first_run["events"] if event["event_type"] == "host_run_state"]
                 self.assertTrue(run_states)
                 self.assertTrue(all({"logged_in", "selected_invoice", "legal_vendor", "approval_status", "form_status", "last_erp_alert"} <= state.keys() for state in run_states))
+                self.assertTrue(any(state.get("workflow_hint") == "submitted: INV-2026-2116; next: verify_ledger_row" for state in run_states))
                 prompt_summary = next(event["payload"] for event in first_run["events"] if event["event_type"] == "prompt_size_summary")
                 self.assertGreater(prompt_summary["average_tokens_with_run_state"], prompt_summary["average_tokens_without_run_state"])
+                self.assertEqual(set(prompt_summary["average_breakdown_tokens"]), {"system_prompt", "tool_schemas", "run_state", "history"})
+                prompt_turn = next(event["payload"] for event in first_run["events"] if event["event_type"] == "prompt_size")
+                self.assertEqual(set(prompt_turn["breakdown"]), {"system_prompt", "tool_schemas", "run_state", "history"})
                 verification = next(event["payload"] for event in first_run["events"] if event["event_type"] == "verification")
                 self.assertEqual(verification["status"], "verified")
                 self.assertTrue(all(verification["matches"].values()))
+                self.assertTrue(verification["pass"])
+                self.assertEqual(verification["ledger_row_id"], "#1")
+                self.assertTrue(all(row["match"] for row in verification["field_matches"]))
+                self.assertTrue(Path(verification["screenshot_path"]).exists())
+                final_result = next(event["payload"] for event in first_run["events"] if event["event_type"] == "final_result")
+                self.assertEqual(final_result["status"], "complete")
+                self.assertEqual(final_result["evidence"]["ledger_row_id"], verification["ledger_row_id"])
+                self.assertEqual(final_result["evidence"]["approval_record"]["status"], "approved")
+                self.assertEqual(final_result["evidence"]["source_file"], verification["source_file"])
+                self.assertEqual(final_result["evidence"]["source_sha256"], verification["source_sha256"])
+                self.assertGreaterEqual(final_result["elapsed_seconds"], 0)
                 verify_observation = next(event["payload"] for event in first_run["events"] if event["event_type"] == "observation" and event["payload"].get("tool") == "verify_ledger_row")
                 self.assertNotIn("source_sha256", json.dumps(verify_observation))
                 self.assertEqual(verification["source_sha256"], provenance["source_sha256"])
@@ -1109,6 +1271,12 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(screenshot_status, 200)
                 self.assertEqual(headers.get_content_type(), "image/png")
                 self.assertTrue(screenshot.startswith(b"\x89PNG\r\n\x1a\n"))
+
+                jsonl_path = Path(temp_dir) / "runs" / f"{first_id}.jsonl"
+                self.assertTrue(jsonl_path.exists())
+                jsonl_records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([record["event_type"] for record in jsonl_records], [event["event_type"] for event in first_run["events"]])
+                self.assertNotIn("APR-", jsonl_path.read_text(encoding="utf-8"))
 
                 status, history = json_request(base_url, "/api/runs")
                 self.assertEqual(status, 200)
@@ -1151,6 +1319,7 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(reset_state["bills"], [])
                 self.assertEqual(reset_state["runs"], [])
                 self.assertTrue(reset_state["files"])
+                self.assertEqual(list((Path(temp_dir) / "runs").glob("*.jsonl")), [])
             finally:
                 server.stop()
 

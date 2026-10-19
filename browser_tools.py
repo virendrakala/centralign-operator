@@ -493,7 +493,11 @@ class BrowserTools:
         invoice_number = invoice["invoice_number"]
         row = self.page.locator("#ledger_table tbody tr").filter(has_text=invoice_number).first
         if not await row.count():
-            result = {"status": "not_found", "invoice_number": invoice_number, "already_present": False, "matches": {}}
+            result = {
+                "status": "not_found", "pass": False, "invoice_number": invoice_number,
+                "ledger_row_id": None, "field_matches": [], "already_present": False,
+                "matches": {}, "screenshot_path": None,
+            }
             if navigation_warning:
                 result["warning"] = navigation_warning
             return result
@@ -508,6 +512,24 @@ class BrowserTools:
             "currency": invoice["currency"],
         }
         matches = {key: _normalize(str(expected[key])) == _normalize(str(actual.get(key, ""))) for key in expected}
+        source_values = {
+            "vendor": invoice["vendor"],
+            "invoice_number": invoice["invoice_number"],
+            "invoice_date": invoice["invoice_date"],
+            "due_date": invoice["due_date"],
+            "amount": invoice["amount"],
+            "currency": invoice["currency"],
+        }
+        field_matches = [
+            {
+                "field": key,
+                "source_value": source_values[key],
+                "expected_value": expected[key],
+                "ledger_value": actual.get(key, ""),
+                "match": matches[key],
+            }
+            for key in expected
+        ]
         self.frame_index += 1
         screenshot = self.evidence_dir / f"frame-{self.frame_index:04d}.png"
         await row.screenshot(path=str(screenshot), animations="disabled")
@@ -520,10 +542,13 @@ class BrowserTools:
         self.emit("browser_frame", frame)
         result = {
             "status": "verified" if all(matches.values()) else "mismatch",
+            "pass": all(matches.values()),
             "invoice_number": invoice_number,
+            "ledger_row_id": actual.get("bill_id"),
             "expected": expected,
             "actual": actual,
             "matches": matches,
+            "field_matches": field_matches,
             "source_vendor": invoice["vendor"],
             "canonical_vendor": expected_vendor,
             "source_file": invoice["source_file"],
@@ -531,6 +556,7 @@ class BrowserTools:
             "already_present": not self.write_submitted,
             "screenshot_index": self.frame_index,
             "screenshot_url": frame["screenshot_url"],
+            "screenshot_path": str(screenshot),
         }
         if navigation_warning:
             result["warning"] = navigation_warning
