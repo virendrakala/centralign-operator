@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from browser_tools import APPROVAL_CHECK_SELECTORS, CLICK_SELECTORS, ERP_ROUTES, MODEL_FORM_SELECTORS, BrowserTools
 from company_app import CompanyApp
 from documents import list_invoice_candidates, list_workspace_files, read_document, remove_prompt_injection_lines
+from intent_rules import HOST_ENTRY_VERBS as _HOST_ENTRY_VERBS, HOST_INVOICE_TOPIC as _HOST_INVOICE_TOPIC, deterministic_unsupported_actions as _deterministic_unsupported_actions
 from llm_clients import FakeLLM, LLMClient, ProviderRequestError, SYSTEM_INSTRUCTIONS, ToolCall, make_client
 from policy import approval_required
 
@@ -34,18 +35,6 @@ _MONTHS = {
     "january": "01", "february": "02", "march": "03", "april": "04", "may": "05", "june": "06",
     "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12",
 }
-_HOST_ENTRY_VERBS = re.compile(r"\b(?:enter|record|post|log|add|submit)\b", re.IGNORECASE)
-_HOST_INVOICE_TOPIC = re.compile(r"\b(?:invoices?|invoiced|bills?|billed|billing)\b", re.IGNORECASE)
-_HOST_UNSUPPORTED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("pay", re.compile(r"\b(?:pay|pays|paid|paying)\b|\b(?:make|initiate|process)\s+(?:a\s+)?payments?\b", re.IGNORECASE)),
-    ("approve payment", re.compile(r"\bapprove\s+(?:the\s+)?payments?\b", re.IGNORECASE)),
-    ("email vendor", re.compile(r"\b(?:email|e-mail)\b", re.IGNORECASE)),
-    ("send", re.compile(r"\bsend\b", re.IGNORECASE)),
-    ("transfer", re.compile(r"\b(?:transfer|wire)\b", re.IGNORECASE)),
-    ("delete", re.compile(r"\b(?:delete|remove)\b", re.IGNORECASE)),
-    ("refund", re.compile(r"\brefund\b", re.IGNORECASE)),
-    ("contact vendor", re.compile(r"\b(?:contact|notify)\b", re.IGNORECASE)),
-)
 _CAPABILITIES = {"enter_invoice", "read_ledger", "list_candidates", "unsupported"}
 
 
@@ -60,39 +49,6 @@ def _explicit_task_months(task: str) -> list[str]:
             task, re.IGNORECASE,
         )
     ]
-
-
-def _deterministic_unsupported_actions(task: str) -> list[dict[str, str]]:
-    """Find requested unsupported actions without relying on the LLM classifier."""
-    lowered = task.casefold()
-    found: list[tuple[int, str]] = []
-    email = re.search(r"\b(?:email|e-mail)\b", lowered)
-    send = re.search(r"\bsend\b", lowered)
-    for label, pattern in _HOST_UNSUPPORTED_PATTERNS:
-        match = pattern.search(task)
-        if not match:
-            continue
-        canonical = label
-        if label == "email vendor":
-            if re.search(r"\b(?:vendor|supplier)\b", lowered):
-                canonical = "email vendor"
-            elif send and email:
-                canonical = "send email"
-            else:
-                canonical = "email"
-        elif label == "send" and email and re.search(r"\bsend\s+(?:an?\s+)?e-?mail\b", lowered):
-            # The email pattern already represents the single requested action.
-            continue
-        elif label == "contact vendor" and not re.search(r"\b(?:vendor|supplier)\b", lowered):
-            canonical = "contact"
-        found.append((match.start(), canonical))
-    actions: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for _, label in sorted(found):
-        if label not in seen:
-            actions.append({"action": label, "capability": "unsupported"})
-            seen.add(label)
-    return actions
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -317,7 +273,11 @@ class AgentLoop:
             return "delete"
         if re.search(r"\brefund\b", action):
             return "refund"
-        if re.search(r"\b(?:contact|notify)\b", action):
+        if re.search(r"\b(?:contact|notify|inform|alert|tell)\b", action):
+            if re.search(r"\bfinance\b", action):
+                return "notify finance"
+            if re.search(r"\b(?:notify|inform|alert|tell)\b", action):
+                return "notify vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "notify finance"
             return "contact vendor" if re.search(r"\b(?:vendor|supplier)\b", action) else "contact"
         if re.search(r"\bsend\b", action):
             if re.search(r"\b(?:email|e-mail)\b", self.task, re.IGNORECASE):
@@ -329,6 +289,7 @@ class AgentLoop:
         classifier_intent = result["intent"]
         actions = [dict(item) for item in result["requested_actions"]]
         unsupported = _deterministic_unsupported_actions(self.task)
+        explicit_unsupported_labels = {item["action"] for item in unsupported}
         entry_text = re.sub(r"\blog\s+in(?:to)?\b", " ", self.task, flags=re.IGNORECASE)
         explicit_entry_verb = bool(
             _HOST_ENTRY_VERBS.search(entry_text)
@@ -347,6 +308,11 @@ class AgentLoop:
                     item["action"] = "email vendor"
                 if item["action"] == "send" and re.search(r"\bsend\s+(?:an?\s+)?e-?mail\b", self.task, re.IGNORECASE):
                     item["action"] = "email vendor" if re.search(r"\b(?:vendor|supplier)\b", self.task, re.IGNORECASE) else "email"
+                # The classifier reports its interpretation, but only the host's
+                # affirmative-action parser may lock writes. This drops labels
+                # inferred from negated or incidental mentions.
+                if item["action"] not in explicit_unsupported_labels:
+                    continue
             if not any(
                 prior["capability"] == item["capability"] and prior["action"].casefold() == item["action"].casefold()
                 for prior in normalized_actions
@@ -363,9 +329,19 @@ class AgentLoop:
                 action_keys.add(key)
 
         classifier_unsupported = any(item["capability"] == "unsupported" for item in actions)
-        if classifier_intent == "unsupported" and not classifier_unsupported and not result.get("clarifying_question"):
-            actions.append({"action": "unsupported requested action", "capability": "unsupported"})
-            classifier_unsupported = True
+        if classifier_intent == "unsupported" and not classifier_unsupported and explicit_entry_verb and not unsupported:
+            # The host found an explicit entry request and no affirmative
+            # unavailable action. This also covers policy-compliance language,
+            # which is supported within the invoice-entry workflow.
+            classifier_intent = "write_invoice_entry"
+            result["intent"] = classifier_intent
+            if not any(item["capability"] == "enter_invoice" for item in actions):
+                actions.append({"action": "enter invoice in the ledger", "capability": "enter_invoice"})
+            classifier_unsupported = False
+        elif classifier_intent == "unsupported" and not classifier_unsupported and not unsupported:
+            classifier_intent = "ambiguous"
+            result["intent"] = classifier_intent
+            result["clarifying_question"] = "Please clarify the invoice task and the invoice you want me to use."
         unsupported_actions = [item["action"] for item in actions if item["capability"] == "unsupported"]
         has_enter_capability = any(item["capability"] == "enter_invoice" for item in actions)
         confirmed_reduced_action = (

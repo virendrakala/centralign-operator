@@ -38,6 +38,7 @@ from llm_clients import (
     make_client,
 )
 from documents import ensure_operator_assets, has_prompt_injection, list_invoice_candidates
+from intent_rules import deterministic_unsupported_actions
 from policy import approval_required, parse_policy
 from worker import planner_config
 from web_app import RunManager, create_app, main as web_main
@@ -375,6 +376,60 @@ class AgentLoopUnitTests(unittest.TestCase):
         self.assertTrue(loop.intent_guard_result["explicit_entry_verb"])
         self.assertTrue(loop.intent_guard_result["write_allowed"])
         self.assertIn("browser_click", {tool["name"] for tool in loop._tools_for_intent()})
+
+    def test_unsupported_intent_guard_is_context_and_negation_aware(self) -> None:
+        allowed_phrases = [
+            "Enter the Acme invoice. Do not send any email.",
+            "Enter it, no need to contact the vendor.",
+            "Enter the invoice; the contact at the vendor is Priya.",
+            "Enter the invoice and remove nothing from the ledger.",
+        ]
+        for task in allowed_phrases:
+            with self.subTest(task=task):
+                self.assertEqual(deterministic_unsupported_actions(task), [])
+                loop = AgentLoop(
+                    Path("/tmp/intent-guard-unit"), "intent-guard", task, "http://127.0.0.1:8765",
+                    lambda *_: None, lambda *_: None, offline=True,
+                )
+                # Simulate a classifier that mistakes an incidental mention for
+                # an action; the independent host guard resolves the request.
+                classified = {
+                    "intent": "unsupported", "vendor_query": "Acme", "invoice_number": "",
+                    "selection_criterion": "latest_by_invoice_date", "reason": "",
+                    "clarifying_question": "", "requested_actions": [
+                        {"action": "enter invoice in the ledger", "capability": "enter_invoice"},
+                        {"action": "email vendor", "capability": "unsupported"},
+                    ],
+                }
+                guarded = loop._apply_host_intent_guard(classified)
+                self.assertNotEqual(guarded["intent"], "unsupported")
+                if "invoice" in task.casefold():
+                    self.assertEqual(guarded["intent"], "write_invoice_entry")
+                    self.assertTrue(guarded["intent_guard"]["write_allowed"])
+                self.assertEqual(guarded["intent_guard"]["unsupported_actions"], [])
+
+        blocked_phrases = {
+            "Enter the Acme invoice and email the vendor.": "email vendor",
+            "Enter the Acme invoice and pay it.": "pay",
+            "Delete the Acme invoice from the ledger.": "delete",
+            "Enter the Acme invoice and let finance know.": "notify finance",
+        }
+        for task, expected_action in blocked_phrases.items():
+            with self.subTest(task=task):
+                actions = deterministic_unsupported_actions(task)
+                self.assertIn(expected_action, [item["action"] for item in actions])
+                loop = AgentLoop(
+                    Path("/tmp/intent-guard-unit"), "intent-guard", task, "http://127.0.0.1:8765",
+                    lambda *_: None, lambda *_: None, offline=True,
+                )
+                guarded = loop._apply_host_intent_guard({
+                    "intent": "write_invoice_entry", "vendor_query": "Acme", "invoice_number": "",
+                    "selection_criterion": "latest_by_invoice_date", "reason": "", "clarifying_question": "",
+                    "requested_actions": [{"action": "enter invoice in the ledger", "capability": "enter_invoice"}],
+                })
+                self.assertNotEqual(guarded["intent"], "write_invoice_entry")
+                self.assertFalse(guarded["intent_guard"]["write_allowed"])
+                self.assertIn(expected_action, guarded["intent_guard"]["unsupported_actions"])
 
     def test_enter_and_email_is_blocked_even_when_classifier_claims_write(self) -> None:
         class WrongClassifierFake(FakeLLM):
@@ -2058,9 +2113,11 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 for path in ("/", "/app.js", "/styles.css"):
                     self.assertEqual(http_request(base_url, path)[0], 200)
 
-                status, started = json_request(base_url, "/api/runs", {
-                    "task": "Find the latest Acme invoice and record it in the ledger."
-                })
+                flagship_task = (
+                    "Find the latest invoice from Acme, check policy compliance, enter it into the ERP portal, "
+                    "and verify it in the ledger"
+                )
+                status, started = json_request(base_url, "/api/runs", {"task": flagship_task})
                 self.assertEqual(status, 202)
                 first_id = started["run_id"]
 
@@ -2069,6 +2126,8 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                     self.assertFalse(any(action.get("path") == "/erp/invoices/new" for action in actions))
                     request_event = next(event for event in run["events"] if event["event_type"] == "approval_requested")
                     self.assertEqual(request_event["payload"]["invoice"]["invoice_number"], "INV-2026-2116")
+                    self.assertEqual(request_event["payload"]["invoice"]["amount"], "68500.00")
+                    self.assertEqual(request_event["payload"]["invoice"]["currency"], "INR")
                     self.assertIn("INR 50000.00 policy threshold", request_event["payload"]["reason"])
                     decision_status, decision = json_request(base_url, f"/api/runs/{first_id}/approval", {"approved": True})
                     self.assertEqual(decision_status, 200)
@@ -2076,6 +2135,11 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
 
                 first_run = wait_for_run(base_url, first_id, approve_after_inspection)
                 self.assertEqual(first_run["status"], "complete", first_run.get("summary"))
+                intent_event = next(event["payload"] for event in first_run["events"] if event["event_type"] == "task_intent")
+                self.assertEqual(intent_event["intent"], "write_invoice_entry")
+                self.assertIn({"action": "check policy compliance", "capability": "enter_invoice"}, intent_event["requested_actions"])
+                self.assertTrue(any(event["event_type"] == "verification" and event["payload"].get("status") == "verified" for event in first_run["events"]))
+                self.assertTrue(any(event["event_type"] == "observation" and event["payload"].get("tool") == "read_policy" for event in first_run["events"]))
                 self.assertIn("replay", next(event["payload"]["mode"] for event in first_run["events"] if event["event_type"] == "planner"))
                 self.assertTrue(any(event["event_type"] == "self_correction" for event in first_run["events"]))
                 actions = [event["payload"] for event in first_run["events"] if event["event_type"] == "action"]
