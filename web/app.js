@@ -22,7 +22,7 @@ function setRunButton(running) { const button = $("#runButton"); button.disabled
 function eventTitle(event) {
   const payload = event.payload || {};
   if (event.event_type === "credentials_supplied") return "Credentials supplied by host";
-  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_intent: "Host intent classification", prompt_injection_detected: "Prompt injection ignored", selection_check: "Invoice selection check", task_finished: "Run finished", run_error: "Run error" };
+  const titles = { thought: "Thought", action: payload.tool || "Action", observation: payload.tool ? `Observation · ${payload.tool}` : "DOM observation", loop_guard_warning: "Repeated action warning", tool_retry_warning: "Repeated error warning", self_correction: "Self-correction", approval_requested: "Human approval requested", approval_decision: "Approval decision", approval_token_injected: "Approval token injected by host", planner: `Planner · ${payload.mode || "LLM"}`, planner_fallback: "Planner fallback", provider_turn: `Provider answer · turn ${payload.turn || "?"}`, rate_limit_recovery: "[RATE_LIMIT_RECOVERY] Recovery event", long_operation: "Long operation", verification: "Independent ledger verification", final_result: "Structured final result", provenance_attached: "Source provenance attached by host", tool_retry_budget: "Tool retry budget", host_run_state: `Host run state · turn ${payload.turn || "?"}`, prompt_size: `Prompt estimate · turn ${payload.turn || "?"}`, prompt_size_summary: "Average prompt estimate", task_intent: "Host intent classification", prompt_injection_detected: "Prompt injection ignored", selection_check: "Invoice selection check", finish_nudge: "Finish tool reminder", task_finished: "Run finished", run_error: "Run error" };
   return titles[event.event_type] || String(event.event_type || "Event").replaceAll("_", " ");
 }
 function eventSummary(event) {
@@ -39,6 +39,7 @@ function eventSummary(event) {
   if (event.event_type === "task_intent") return `Classified as ${p.intent || "unknown"}${p.vendor_query ? ` · vendor ${p.vendor_query}` : ""}${p.selection_criterion ? ` · selection ${p.selection_criterion}` : ""}${p.reason ? ` · ${p.reason}` : ""}${p.clarifying_question ? ` · ${p.clarifying_question}` : ""}`;
   if (event.event_type === "prompt_injection_detected") return `${p.message || "Instruction-like invoice text was ignored."} Source: ${p.path || "invoice"}.`;
   if (event.event_type === "selection_check") return `Selection check ${p.status || "unknown"}: ${p.criterion || "criterion unavailable"} · ${p.selected_invoice || "invoice unavailable"}. ${p.reason || ""}`;
+  if (event.event_type === "finish_nudge") return `${p.instruction || "Call finish with this summary."} ${p.summary || ""}`;
   if (event.event_type === "prompt_size") {
     const parts = Object.entries(p.breakdown || {}).map(([name, size]) => `${name} ${size.approx_tokens} tok`).join(" · ");
     return `Approx. ${p.approx_tokens} tokens (${p.approx_characters} chars; estimate). ${parts}`;
@@ -68,6 +69,7 @@ function eventSummary(event) {
     if (p.tool === "finish") return `Finish with status ${p.status || "unknown"}.`;
   }
   if (event.event_type === "observation") {
+    if (p.tool === "finish") return p.summary || p.answer?.text || "Task finished.";
     if (p.message) return p.warning ? `${p.message} ${p.warning}` : p.message;
     if (p.approval_hint) return p.approval_hint;
     if (p.next_step) return p.next_step;
@@ -92,7 +94,10 @@ function eventSummary(event) {
     if (p.action === "provider_fallback") return `${p.marker || "[RATE_LIMIT_RECOVERY]"} ${p.previous_provider} retries failed; switching to live provider ${p.provider}.`;
   }
   if (event.event_type === "verification") return p.status === "verified" ? `All ${Object.keys(p.matches || {}).length} fields match · row ${p.ledger_row_id} · ${p.screenshot_path || "screenshot unavailable"}.` : `Ledger verification status: ${p.status}.`;
-  if (event.event_type === "final_result") return `${p.what_was_done} Selected ${p.selected_invoice?.invoice_number || "invoice unavailable"} (${p.selected_invoice?.invoice_date || "date unavailable"}); criterion ${p.selection_criterion || "unavailable"}. Evidence: ledger row ${p.evidence?.ledger_row_id}, screenshot ${p.evidence?.ledger_screenshot_path}, source ${p.evidence?.source_file}; elapsed ${p.elapsed_seconds}s.`;
+  if (event.event_type === "final_result") {
+    if (p.ledger_answer) return p.ledger_answer.text || `${p.ledger_answer.vendor}: ${p.ledger_answer.invoice_count} invoice(s).`;
+    return `${p.what_was_done} Selected ${p.selected_invoice?.invoice_number || "invoice unavailable"} (${p.selected_invoice?.invoice_date || "date unavailable"}); criterion ${p.selection_criterion || "unavailable"}. Evidence: ledger row ${p.evidence?.ledger_row_id}, screenshot ${p.evidence?.ledger_screenshot_path}, source ${p.evidence?.source_file}; elapsed ${p.elapsed_seconds}s.`;
+  }
   if (event.event_type === "task_finished") return p.summary || p.status || "";
   if (event.event_type === "run_error") return p.error || "The run stopped safely.";
   return "";
@@ -107,7 +112,7 @@ function renderTrace(run) {
     const content = node("div", "trace-content");
     const top = node("div", "trace-top"); top.append(node("h3", "trace-title", eventTitle(event)), node("time", "trace-time", timestamp(event.timestamp))); content.append(top);
     const summary = eventSummary(event); if (summary) content.append(node("p", "trace-summary", summary));
-    if (event.payload && ["action", "observation", "loop_guard_warning", "tool_retry_warning", "verification", "final_result", "long_operation", "provenance_attached", "tool_retry_budget", "approval_token_injected", "host_run_state", "prompt_size", "prompt_size_summary", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error", "task_intent", "prompt_injection_detected", "selection_check"].includes(event.event_type)) {
+    if (event.payload && ["action", "observation", "loop_guard_warning", "tool_retry_warning", "verification", "final_result", "long_operation", "provenance_attached", "tool_retry_budget", "approval_token_injected", "host_run_state", "prompt_size", "prompt_size_summary", "planner", "planner_fallback", "provider_turn", "rate_limit_recovery", "approval_requested", "approval_decision", "run_error", "task_intent", "prompt_injection_detected", "selection_check", "finish_nudge"].includes(event.event_type)) {
       const details = node("details", "trace-more"); const toggle = node("summary", "", "View details"); const pre = node("pre", "trace-json", JSON.stringify(event.payload, null, 2)); details.append(toggle, pre); content.append(details);
     }
     item.append(mark, content); list.append(item);

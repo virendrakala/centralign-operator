@@ -25,9 +25,10 @@ MAX_TOOL_VALIDATION_RETRIES = 3
 MAX_SUBMIT_ATTEMPTS = 3
 LOOP_GUARD_WARN_AFTER = 3
 LOOP_GUARD_STOP_AFTER = 5
-FULL_OBSERVATIONS_TO_KEEP = 4
+FULL_OBSERVATIONS_TO_KEEP = 3
 LONG_OPERATION_TRACE_SECONDS = 30
 STOP_STATUSES = {"complete", "needs_input", "needs_review", "stopped_by_user"}
+MAX_FAILED_GENERATION_CHARS = 300
 _ROUTE_CHOICES = "; ".join(f"{path}: {description}" for path, description in ERP_ROUTES.items())
 _MONTHS = {
     "january": "01", "february": "02", "march": "03", "april": "04", "may": "05", "june": "06",
@@ -64,7 +65,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "browser_click", "description": "Submit the invoice. Declare the task's selection criterion and reason; the host checks them against the discovered candidates.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selector", "selection_criterion", "selection_reason"], "additionalProperties": False}},
     {"name": "request_human_approval", "description": "Request policy approval for a read candidate. Declare how it matches the task; the host validates latest selections.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selection_criterion", "selection_reason"], "additionalProperties": False}},
     {"name": "verify_ledger_row", "description": "Verify the submitted source invoice in the ERP ledger. Optional invoice_number only.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": [], "additionalProperties": False}},
-    {"name": "finish", "description": "Stop the run with a final status and concise evidence-based summary.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}, "evidence": {"type": "object"}}, "required": ["status", "summary"]}},
+    {"name": "finish", "description": "End every task with finish(status, summary); plain-text answers are not allowed. Complete invoice writes only after verification.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}}, "required": ["status", "summary"], "additionalProperties": False}},
 ]
 TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
 
@@ -131,7 +132,10 @@ class AgentLoop:
         self.tool_failure_counts: dict[tuple[str, str], int] = {}
         self.finished: tuple[str, str] | None = None
         self.final_result: dict[str, Any] | None = None
+        self.read_ledger_rows: list[dict[str, Any]] | None = None
+        self.read_ledger_vendor_query: str | None = None
         self.approval_record: dict[str, Any] | None = None
+        self._plain_text_nudge_used = False
         self.started_monotonic = time.monotonic()
         self._last_page_snapshot: dict[str, Any] | None = None
         self._last_action_key: str | None = None
@@ -206,20 +210,26 @@ class AgentLoop:
         else:
             approval_status = "required" if self._needs_approval() else "not_required"
         fields = snapshot.get("form_fields", [])
-        form_filled = any(isinstance(field, dict) and field.get("state") == "filled" for field in fields)
+        required_fields = [field for field in fields if isinstance(field, dict) and field.get("required")]
+        required_filled = [field for field in required_fields if field.get("state") == "filled"]
         posted = bool(getattr(self.browser, "write_submitted", False))
         if posted:
             form_status = "submitted"
-        elif page_path == "/erp/invoices/new" and form_filled:
+        elif page_path == "/erp/invoices/new" and required_fields and len(required_filled) == len(required_fields):
             form_status = "filled"
+        elif page_path == "/erp/invoices/new" and required_filled:
+            form_status = "partial"
         else:
             form_status = "empty"
         submission_status = (
             f"submitted: {invoice['invoice_number']}" if posted and invoice
             else "submit_attempted" if self.submit_performed else None
         )
-        next_action = "verify_ledger_row" if posted else "inspect_submit_alert" if self.submit_performed else None
+        verification_passed = bool(self.verification and self.verification.get("status") == "verified" and self.verification.get("pass"))
+        next_action = "finish" if verification_passed else "verify_ledger_row" if posted else "inspect_submit_alert" if self.submit_performed else None
         workflow_hint = f"{submission_status}; next: {next_action}" if submission_status and next_action else None
+        if verification_passed:
+            workflow_hint = "Ledger verification passed; next: finish."
         alerts = snapshot.get("alerts") or ([snapshot.get("alert")] if snapshot.get("alert") else [])
         approval_hint = None
         if approval_status == "required":
@@ -239,6 +249,7 @@ class AgentLoop:
             "selection_criterion": self.selection_criterion,
             "selection_reason": self.selection_reason,
             "candidate_count": len(self.candidate_invoices),
+            "verification_status": "verified" if verification_passed else str((self.verification or {}).get("status") or "pending"),
         }
 
     async def _classify_task_intent(self) -> dict[str, Any]:
@@ -383,6 +394,34 @@ class AgentLoop:
         else:
             state["approval_required"] = False
         return state
+
+    def _render_read_ledger_answer(self) -> dict[str, Any]:
+        """Render a read-only answer exclusively from host-held ledger rows."""
+        rows = self.read_ledger_rows or []
+        vendor = str(
+            rows[0].get("vendor") if rows else
+            self.read_ledger_vendor_query or (self.task_intent or {}).get("vendor_query") or "the requested vendor"
+        )
+        invoices = [
+            {
+                "vendor": str(row.get("vendor", "")),
+                "invoice_number": str(row.get("invoice_number", "")),
+                "invoice_date": str(row.get("invoice_date", "")),
+                "due_date": str(row.get("due_date", "")),
+                "amount": str(row.get("amount", "")),
+                "currency": str(row.get("currency", "")),
+            }
+            for row in rows
+        ]
+        if invoices:
+            details = "; ".join(
+                f"{item['invoice_number']} dated {item['invoice_date']} for {item['currency']} {item['amount']} (due {item['due_date']})"
+                for item in invoices
+            )
+            text = f"{vendor} has {len(invoices)} ledger invoice(s): {details}"
+        else:
+            text = f"No ledger invoices were found for {vendor}."
+        return {"vendor": vendor, "invoice_count": len(invoices), "invoices": invoices, "text": text}
 
     def _tools_for_intent(self) -> list[dict[str, Any]]:
         if not self.task_intent or self.task_intent.get("intent") in {"unsupported", "ambiguous"}:
@@ -752,6 +791,9 @@ class AgentLoop:
             if not self.task_intent or self.task_intent.get("intent") != "read_only":
                 raise ValueError("read_ledger is available only for a host-classified read_only task.")
             vendor_query = _normalized(_clean_text(arguments.get("vendor_query"), 160))
+            classified_vendor = _normalized(str(self.task_intent.get("vendor_query", "")))
+            if not vendor_query or vendor_query != classified_vendor:
+                raise ValueError("vendor_query must match the vendor identified by the host intent classification.")
             bills = await asyncio.to_thread(self.company.list_bills)
             matches = [
                 bill for bill in bills
@@ -760,7 +802,9 @@ class AgentLoop:
                     or _normalized(str(bill.get("vendor", ""))) in vendor_query
                 )
             ]
-            return {"status": "read", "vendor_query": vendor_query, "bills": matches}
+            self.read_ledger_rows = matches
+            self.read_ledger_vendor_query = str(self.task_intent.get("vendor_query", ""))
+            return {"status": "read", "vendor_query": self.read_ledger_vendor_query, "bills": matches}
         if name == "browser_open":
             path = _clean_text(arguments.get("path"), 100)
             if self.task_intent and self.task_intent.get("intent") == "read_only":
@@ -775,6 +819,9 @@ class AgentLoop:
             if path == "/erp/invoices/new" and self.selected_invoice:
                 self.browser.set_invoice(self.selected_invoice)
             result = await self.browser.browser_open(path)
+            snapshot = self._snapshot_from_result(result)
+            if snapshot is not None:
+                self._last_page_snapshot = snapshot
             if result.get("snapshot") and path == "/erp/invoices/new":
                 result["form_state"] = self._form_state(result["snapshot"])
                 result["next_step"] = result["form_state"]["next_step"]
@@ -797,6 +844,9 @@ class AgentLoop:
             return await self.browser.erp_login()
         if name == "browser_snapshot":
             result = await self.browser.browser_snapshot()
+            snapshot = self._snapshot_from_result(result)
+            if snapshot is not None:
+                self._last_page_snapshot = snapshot
             if self.selected_invoice and self.policy and self._needs_approval() and not self._invoice_is_approved():
                 result["approval_hint"] = (
                     "Approval required: call request_human_approval with invoice_number "
@@ -807,21 +857,22 @@ class AgentLoop:
             return result
         if name == "browser_fill":
             selector = _clean_text(arguments.get("selector"), 80)
-            if self.selected_invoice:
-                expected_fields = {
-                    "#invoice_number_input": "invoice_number", "#invoice_date_input": "invoice_date",
-                    "#due_date_input": "due_date", "#amount_input": "amount", "#currency_input": "currency",
-                }
-                expected_key = expected_fields.get(selector)
-                if expected_key and _clean_text(arguments.get("value"), 600) != str(self.selected_invoice.get(expected_key, "")):
-                    raise ValueError(f"{expected_key.replace('_', ' ').capitalize()} must come from the parsed structured fields of the selected invoice.")
             try:
+                if self.selected_invoice:
+                    expected_fields = {
+                        "#invoice_number_input": "invoice_number", "#invoice_date_input": "invoice_date",
+                        "#due_date_input": "due_date", "#amount_input": "amount", "#currency_input": "currency",
+                    }
+                    expected_key = expected_fields.get(selector)
+                    if expected_key and _clean_text(arguments.get("value"), 600) != str(self.selected_invoice.get(expected_key, "")):
+                        raise ValueError(f"{expected_key.replace('_', ' ').capitalize()} must come from the parsed structured fields of the selected invoice.")
                 result = await self.browser.browser_fill(selector, _clean_text(arguments.get("value"), 600))
             except Exception as exc:
                 result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
             if include_snapshot:
                 snapshot = await self.browser.compact_snapshot("locator.fill", selector)
                 result["snapshot"] = snapshot
+                self._last_page_snapshot = snapshot
                 result["form_state"] = self._form_state(snapshot)
                 result["next_step"] = result["form_state"]["next_step"]
             return result
@@ -854,6 +905,9 @@ class AgentLoop:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     break
+                if result.get("status") == "error":
+                    error = str(result.get("message", "field fill failed"))
+                    break
                 fields_set.append(selector)
                 alert = result.get("alert")
                 if alert:
@@ -865,6 +919,7 @@ class AgentLoop:
             }
             if include_snapshot:
                 snapshot = await self.browser.compact_snapshot("browser_fill_form")
+                self._last_page_snapshot = snapshot
                 result["alert"] = alert or snapshot.get("alert")
                 result["snapshot"] = snapshot
                 result["form_state"] = self._form_state(snapshot)
@@ -913,6 +968,7 @@ class AgentLoop:
                 if alert:
                     break
             snapshot = await self.browser.compact_snapshot("browser_action_sequence")
+            self._last_page_snapshot = snapshot
             result = {
                 "status": "error" if error else "sequence_stopped" if alert else "sequence_complete",
                 "actions_completed": actions_completed,
@@ -956,6 +1012,19 @@ class AgentLoop:
                     )
                 if self.submit_attempts >= MAX_SUBMIT_ATTEMPTS:
                     raise ValueError("The ERP submit retry limit has been reached.")
+                fresh_snapshot_result = await self.browser.browser_snapshot()
+                fresh_snapshot = self._snapshot_from_result(fresh_snapshot_result)
+                if fresh_snapshot is not None:
+                    self._last_page_snapshot = fresh_snapshot
+                form_state = self._form_state(fresh_snapshot or {})
+                if not form_state.get("all_required_filled"):
+                    return {
+                        "status": "error",
+                        "message": "Cannot submit the invoice: required form fields are empty. " + form_state["next_step"],
+                        "snapshot": fresh_snapshot or {},
+                        "form_state": form_state,
+                        "next_step": form_state["next_step"],
+                    }
                 if self._needs_approval():
                     token = self.approval_tokens.get(self._invoice_key() or "")
                     if not token:
@@ -970,6 +1039,9 @@ class AgentLoop:
                     })
                 self.submit_attempts += 1
             result = await self.browser.browser_click(selector)
+            snapshot = self._snapshot_from_result(result)
+            if snapshot is not None:
+                self._last_page_snapshot = snapshot
             if selector == "#submit_btn":
                 self.submit_performed = True
                 result["submit_performed"] = True
@@ -1139,8 +1211,6 @@ class AgentLoop:
                     },
                     "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
                 }
-                self.emit("final_result", self.final_result)
-                self.finished = ("complete", what_was_done)
             return result
         if name == "finish":
             status = _clean_text(arguments.get("status"), 40)
@@ -1148,10 +1218,33 @@ class AgentLoop:
             if status not in STOP_STATUSES or not summary:
                 raise ValueError("finish requires a supported stop status and a concise summary.")
             if status == "complete" and self.task_intent and self.task_intent.get("intent") == "read_only":
+                if self.read_ledger_rows is None:
+                    raise ValueError("Read-only completion requires a host ledger lookup before finish.")
+                answer = self._render_read_ledger_answer()
+                summary = answer["text"]
+                self.final_result = {
+                    "status": "complete",
+                    "what_was_done": f"Read ledger entries for {answer['vendor']}.",
+                    "ledger_answer": answer,
+                    "evidence": {},
+                    "elapsed_seconds": round(time.monotonic() - self.started_monotonic, 2),
+                }
+                self.emit("final_result", self.final_result)
                 self.finished = status, summary
-                return {"status": "finished", "final_status": status, "summary": summary, "evidence": {}}
+                return {"status": "finished", "final_status": status, "summary": summary, "answer": answer, "evidence": {}}
             if status == "complete" and not (self.verification and self.verification.get("status") == "verified"):
                 raise ValueError("A complete run requires a matching read-back from the live ERP ledger DOM.")
+            if self.task_intent and self.task_intent.get("intent") == "unsupported":
+                status = "needs_input"
+                summary = "This sandbox supports invoice entry and ledger lookup only. It cannot pay invoices or contact vendors."
+            elif self.task_intent and self.task_intent.get("intent") == "ambiguous":
+                status = "needs_input"
+                summary = str(self.task_intent.get("clarifying_question") or "Please clarify which vendor or invoice you mean.")
+            if status == "complete" and self.task_intent and self.task_intent.get("intent") == "write_invoice_entry":
+                if not self.verification.get("pass") or not self.final_result:
+                    raise ValueError("A complete invoice write requires a passed ledger verification before finish.")
+                summary = str(self.final_result["what_was_done"])
+                self.emit("final_result", self.final_result)
             self.finished = status, summary
             return {"status": "finished", "final_status": status, "summary": summary, "evidence": self.verification or {}}
         raise ValueError(f"Tool is not in the runtime allowlist: {name}")
@@ -1236,6 +1329,31 @@ class AgentLoop:
             text = f"HTTP {error.status_code} {error.error_code or 'tool validation error'}: {str(error)}"
         return self._safe_validation_error(text, body)
 
+    def _plain_text_from_provider_error(self, error: ProviderRequestError) -> str | None:
+        code = (error.error_code or "").casefold().replace("-", "_")
+        if error.status_code != 400 or code != "tool_use_failed":
+            return None
+        generation = error.failed_generation
+        if not generation:
+            try:
+                payload = json.loads(error.response_body or "")
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                detail = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+                for source in (detail, payload):
+                    for key in ("failed_generation", "generated_text", "completion"):
+                        value = source.get(key)
+                        if isinstance(value, str) and value.strip():
+                            generation = value.strip()
+                            break
+                    if generation:
+                        break
+        if not isinstance(generation, str) or not generation.strip():
+            return None
+        safe = self._safe_validation_error(generation.strip(), generation.strip())
+        return safe[:MAX_FAILED_GENERATION_CHARS]
+
     def _stop_for_repeated_failure(self, name: str, error: str, count: int) -> tuple[str, str] | None:
         if count < MAX_REPEATED_TOOL_ERRORS:
             return None
@@ -1258,14 +1376,6 @@ class AgentLoop:
                 self.emit("run_error", {"error": reason})
                 return "needs_review", reason
             self.emit("task_intent", self.task_intent)
-            if self.task_intent["intent"] == "unsupported":
-                refusal = "This sandbox supports invoice entry and ledger lookup only. It cannot pay invoices or contact vendors."
-                self.emit("task_finished", {"status": "needs_input", "summary": refusal})
-                return "needs_input", refusal
-            if self.task_intent["intent"] == "ambiguous":
-                question = self.task_intent["clarifying_question"]
-                self.emit("task_finished", {"status": "needs_input", "summary": question})
-                return "needs_input", question
             if self.task_intent["intent"] == "write_invoice_entry":
                 await self.browser.start()
             for step in range(1, MAX_STEPS + 1):
@@ -1300,6 +1410,40 @@ class AgentLoop:
                         reason = f"{provider_name} decision failed at step {step}: {type(exc).__name__}: {exc}"
                         self.emit("run_error", {"error": reason})
                         return "needs_review", reason
+                    plain_text = self._plain_text_from_provider_error(exc)
+                    if plain_text is not None:
+                        last_validation_error = "Provider returned plain text where a finish tool call was required."
+                        failed_tool = "finish"
+                        failure_count = self._record_tool_failure(failed_tool, last_validation_error)
+                        stopped = self._stop_for_repeated_failure(failed_tool, last_validation_error, failure_count)
+                        if stopped:
+                            return stopped
+                        if failure_count == WARN_REPEATED_TOOL_ERRORS:
+                            self._append_repeat_failure_warning(failed_tool, last_validation_error, failure_count)
+                        if validation_retries >= MAX_TOOL_VALIDATION_RETRIES:
+                            reason = self._validation_retry_limit_message(last_validation_error, failed_tool)
+                            self.emit("run_error", {"error": reason})
+                            return "needs_review", reason
+                        validation_retries += 1
+                        if not self._plain_text_nudge_used:
+                            self._plain_text_nudge_used = True
+                            feedback = {
+                                "tool": "finish_nudge",
+                                "arguments": {},
+                                "result": {
+                                    "instruction": "Call finish with this summary.",
+                                    "summary": plain_text[:MAX_FAILED_GENERATION_CHARS],
+                                },
+                            }
+                            self.observations.append(feedback)
+                            self.emit("finish_nudge", feedback["result"])
+                        else:
+                            self._append_tool_validation_feedback(
+                                retry_number=validation_retries,
+                                tool_name="finish",
+                                error_text=last_validation_error,
+                            )
+                        continue
                     last_validation_error = self._provider_tool_error_text(exc)
                     failed_tool = exc.rejected_tool_name or "provider_tool_call"
                     failure_count = self._record_tool_failure(failed_tool, last_validation_error)
