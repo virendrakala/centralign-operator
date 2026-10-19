@@ -53,21 +53,21 @@ def _explicit_task_months(task: str) -> list[str]:
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {"name": "list_files", "description": "List invoice and policy files.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "read_document", "description": "Read a listed invoice and extract its fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "read_document", "description": "Read an invoice and extract fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "read_policy", "description": "Read AP rules and approval thresholds.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "list_invoice_candidates", "description": "Parse every inbox PDF/TXT and list structured invoice candidates for the requested vendor. The model chooses one candidate.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
-    {"name": "read_ledger", "description": "Read-only lookup of posted ledger invoices for a vendor.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
-    {"name": "browser_open", "description": "Open an allowed ERP route; warns about unsaved form fields.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
-    {"name": "erp_login", "description": "Host signs in using company memory and returns the landing page and alert.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
-    {"name": "browser_snapshot", "description": "Inspect URL, title, alerts, field states, buttons, and table rows. Secrets are redacted.", "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "browser_fill", "description": "Fill one allowlisted invoice field with source data or an observed vendor.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowlisted invoice field."}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
-    {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice fields.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS), "description": "Allowlisted invoice field."}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
-    {"name": "browser_action_sequence", "description": "Run two or three field-fill actions only: browser_fill, browser_check, or browser_fill_form. Navigation, clicks, approval requests, and ledger verification must each be separate tool calls so their results can be observed first.", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
+    {"name": "list_invoice_candidates", "description": "List candidate invoices for a vendor from inbox.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
+    {"name": "read_ledger", "description": "Read posted ledger invoices for a vendor.", "parameters": {"type": "object", "properties": {"vendor_query": {"type": "string"}}, "required": ["vendor_query"], "additionalProperties": False}},
+    {"name": "browser_open", "description": "Open an allowed ERP route.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "enum": list(ERP_ROUTES), "description": f"Choose an allowed route: {_ROUTE_CHOICES}"}}, "required": ["path"]}},
+    {"name": "erp_login", "description": "Sign in to ERP using host credentials.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+    {"name": "browser_snapshot", "description": "Inspect URL, alerts, fields, and tables.", "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"name": "browser_fill", "description": "Fill one invoice field with source data.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS)}, "value": {"type": "string"}}, "required": ["selector", "value"]}},
+    {"name": "browser_fill_form", "description": "Fill up to ten allowlisted invoice fields.", "parameters": {"type": "object", "properties": {"fields": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(MODEL_FORM_SELECTORS)}, "value": {"type": "string"}}, "required": ["selector", "value"], "additionalProperties": False}}}, "required": ["fields"], "additionalProperties": False}},
+    {"name": "browser_action_sequence", "description": "Run 2-3 form actions (browser_fill, browser_check, browser_fill_form).", "parameters": {"type": "object", "properties": {"actions": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "object", "properties": {"tool": {"type": "string", "enum": ["browser_fill", "browser_check", "browser_fill_form"]}, "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, "required": ["actions"], "additionalProperties": False}},
     {"name": "browser_check", "description": "Check the approval confirmation control.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(APPROVAL_CHECK_SELECTORS)}}, "required": ["selector"]}},
-    {"name": "browser_click", "description": "Submit the invoice. Declare the task's selection criterion and reason; the host checks them against the discovered candidates.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selector", "selection_criterion", "selection_reason"], "additionalProperties": False}},
-    {"name": "request_human_approval", "description": "Request policy approval for a read candidate. Declare how it matches the task; the host validates latest selections.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selection_criterion", "selection_reason"], "additionalProperties": False}},
-    {"name": "verify_ledger_row", "description": "Verify the submitted source invoice in the ERP ledger. Optional invoice_number only.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": [], "additionalProperties": False}},
-    {"name": "finish", "description": "End every task with finish(status, summary); plain-text answers are not allowed. Complete invoice writes only after verification.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}}, "required": ["status", "summary"], "additionalProperties": False}},
+    {"name": "browser_click", "description": "Submit invoice. Provide selection criterion and reason.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "enum": sorted(CLICK_SELECTORS)}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selector", "selection_criterion", "selection_reason"], "additionalProperties": False}},
+    {"name": "request_human_approval", "description": "Request policy approval for selected invoice.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}, "document_path": {"type": "string"}, "canonical_vendor": {"type": "string"}, "reason": {"type": "string"}, "selection_criterion": {"type": "string", "enum": ["latest_by_invoice_date", "specific_invoice_number", "other"]}, "selection_reason": {"type": "string"}}, "required": ["selection_criterion", "selection_reason"], "additionalProperties": False}},
+    {"name": "verify_ledger_row", "description": "Verify the invoice row in the ERP ledger.", "parameters": {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": [], "additionalProperties": False}},
+    {"name": "finish", "description": "Finish task with status and summary. Complete writes only after verification.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "needs_input", "needs_review", "stopped_by_user"]}, "summary": {"type": "string"}}, "required": ["status", "summary"], "additionalProperties": False}},
 ]
 TOOL_BY_NAME = {tool["name"]: tool for tool in TOOL_DEFINITIONS}
 
@@ -165,13 +165,70 @@ class AgentLoop:
         safe_args = self._redact_arguments(call.name, call.arguments)
         self.emit("action", {"tool": call.name, **safe_args})
 
+    def _compact_observation(self, item: dict[str, Any], is_recent: bool = False) -> dict[str, Any]:
+        tool = item.get("tool")
+        arguments = item.get("arguments", {})
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return item
+
+        if is_recent:
+            safe_result = dict(result)
+            if "snapshot" in safe_result and isinstance(safe_result["snapshot"], dict):
+                snap = dict(safe_result["snapshot"])
+                if len(str(snap.get("dom_tree", ""))) > 200:
+                    snap["dom_tree"] = str(snap.get("dom_tree", ""))[:200]
+                if len(str(snap.get("body_text", ""))) > 200:
+                    snap["body_text"] = str(snap.get("body_text", ""))[:200]
+                safe_result["snapshot"] = snap
+            elif tool == "browser_snapshot":
+                if len(str(safe_result.get("dom_tree", ""))) > 200:
+                    safe_result["dom_tree"] = str(safe_result.get("dom_tree", ""))[:200]
+                if len(str(safe_result.get("summary", ""))) > 200:
+                    safe_result["summary"] = str(safe_result.get("summary", ""))[:200]
+            elif safe_result == result:
+                return item
+            return {"tool": tool, "arguments": arguments, "result": safe_result}
+
+        # For older observations:
+        safe_result = dict(result)
+        safe_result.pop("source_file", None)
+        safe_result.pop("source_sha256", None)
+        safe_result.pop("raw_text", None)
+        safe_result.pop("field_matches", None)
+        if "policy" in safe_result and isinstance(safe_result["policy"], dict):
+            pol = dict(safe_result["policy"])
+            pol.pop("raw_text", None)
+            safe_result["policy"] = pol
+
+        compact_res: dict[str, Any] = {}
+        for key, val in safe_result.items():
+            if key == "snapshot" and isinstance(val, dict):
+                snap = {
+                    "url": val.get("url"),
+                    "url_path": val.get("url_path"),
+                    "alert": val.get("alert"),
+                    "notice": val.get("notice"),
+                }
+                tables = val.get("tables") or {}
+                if "vendor_directory" in tables:
+                    snap["tables"] = {"vendor_directory": tables["vendor_directory"]}
+                elif "ledger_table" in tables:
+                    snap["tables"] = {"ledger_table": tables["ledger_table"]}
+                compact_res["snapshot"] = snap
+            elif key in {"dom_tree", "form_fields", "buttons", "body_text", "inputs", "form_state", "summary"}:
+                continue
+            else:
+                compact_res[key] = val
+        return {"tool": tool, "arguments": arguments, "result": compact_res}
+
     def _conversation_observations(self, run_state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Keep recent observations intact and compress earlier context to one-line summaries."""
+        """Keep recent observations structured and compact older observations/snapshots."""
         if getattr(self.client, "name", "") == "offline-replay":
-            # FakeLLM is deterministic local replay, not a token-billed conversation model.
-            recent = self.observations
+            cutoff = max(0, len(self.observations) - 2)
+            recent = [self._compact_observation(item, is_recent=i >= cutoff) for i, item in enumerate(self.observations)]
         elif len(self.observations) <= FULL_OBSERVATIONS_TO_KEEP:
-            recent = self.observations
+            recent = [self._compact_observation(item, is_recent=True) for item in self.observations]
         else:
             older = self.observations[:-FULL_OBSERVATIONS_TO_KEEP]
             summaries = [self._observation_one_line(item) for item in older]
@@ -179,7 +236,7 @@ class AgentLoop:
                 "tool": "history_summary",
                 "arguments": {},
                 "result": {"summaries": summaries},
-            }, *self.observations[-FULL_OBSERVATIONS_TO_KEEP:]]
+            }, *[self._compact_observation(item, is_recent=True) for item in self.observations[-FULL_OBSERVATIONS_TO_KEEP:]]]
         state = run_state or self._host_run_state()
         return [{"tool": "host_run_state", "arguments": {}, "result": state}, *recent]
 
@@ -249,8 +306,11 @@ class AgentLoop:
         approval_hint = None
         if approval_status == "required":
             approval_hint = f"Approval required: call request_human_approval with invoice_number {invoice['invoice_number']}."
-        return {
-            "intent": dict(self.task_intent or {}),
+        intent = dict(self.task_intent or {})
+        intent.pop("intent_guard", None)
+        intent = {k: v for k, v in intent.items() if v is not None}
+        raw_state = {
+            "intent": intent,
             "logged_in": bool(getattr(self.browser, "logged_in", False)),
             "selected_invoice": selected,
             "legal_vendor": legal_vendor,
@@ -268,6 +328,8 @@ class AgentLoop:
             "already_present": already_present,
             "duplicate_present": self.duplicate_present,
         }
+        required_keys = {"logged_in", "selected_invoice", "legal_vendor", "approval_status", "form_status", "last_erp_alert"}
+        return {k: v for k, v in raw_state.items() if v is not None or k in required_keys}
 
     def _canonical_action_label(self, action: str) -> str:
         action = " ".join(action.casefold().split())

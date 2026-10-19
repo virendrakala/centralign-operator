@@ -1592,6 +1592,47 @@ class AgentLoopUnitTests(unittest.TestCase):
             self.assertGreater(breakdown["history"]["characters"], breakdown["system_prompt"]["characters"])
             self.assertGreater(breakdown["history"]["characters"], breakdown["tool_schemas"]["characters"])
 
+    def test_prompt_compact_observation_and_budget_bounds(self) -> None:
+        loop = AgentLoop(Path("/tmp"), "test", "task", "http://127.0.0.1:8765", lambda *_: None, lambda *_: None, client=FakeLLM())
+        older_obs = {
+            "tool": "read_document",
+            "arguments": {"path": "inbox/invoice.txt"},
+            "result": {
+                "source_file": "inbox/invoice.txt",
+                "source_sha256": "abc12345",
+                "raw_text": "huge raw text content " * 100,
+                "field_matches": [{"field": "amount", "match": True}],
+                "invoice": {"vendor": "Acme", "amount": "100.00"},
+            },
+        }
+        compacted = loop._compact_observation(older_obs, is_recent=False)
+        self.assertNotIn("source_file", compacted["result"])
+        self.assertNotIn("source_sha256", compacted["result"])
+        self.assertNotIn("raw_text", compacted["result"])
+        self.assertNotIn("field_matches", compacted["result"])
+        self.assertEqual(compacted["result"]["invoice"]["vendor"], "Acme")
+
+        snap_obs = {
+            "tool": "browser_open",
+            "arguments": {"path": "/erp/invoices/new"},
+            "result": {
+                "snapshot": {
+                    "url": "http://127.0.0.1:8765/erp/invoices/new",
+                    "url_path": "/erp/invoices/new",
+                    "dom_tree": "<form>...</form>" * 50,
+                    "body_text": "text..." * 50,
+                    "form_fields": ["vendor", "amount"],
+                    "alert": None,
+                    "notice": None,
+                }
+            }
+        }
+        compacted_snap = loop._compact_observation(snap_obs, is_recent=False)
+        self.assertNotIn("dom_tree", compacted_snap["result"]["snapshot"])
+        self.assertNotIn("body_text", compacted_snap["result"]["snapshot"])
+        self.assertNotIn("form_fields", compacted_snap["result"]["snapshot"])
+        self.assertEqual(compacted_snap["result"]["snapshot"]["url_path"], "/erp/invoices/new")
+
     def test_repeated_same_action_warns_at_three_and_stops_at_five(self) -> None:
         repeated_action = ToolCall("browser_snapshot", {})
 
@@ -2370,6 +2411,11 @@ class BrowserAgentIntegrationTests(unittest.TestCase):
                 self.assertEqual(set(prompt_summary["average_breakdown_tokens"]), {"system_prompt", "tool_schemas", "run_state", "history"})
                 prompt_turn = next(event["payload"] for event in first_run["events"] if event["event_type"] == "prompt_size")
                 self.assertEqual(set(prompt_turn["breakdown"]), {"system_prompt", "tool_schemas", "run_state", "history"})
+                prompt_sizes = [event["payload"] for event in first_run["events"] if event["event_type"] == "prompt_size"]
+                self.assertLess(prompt_summary["average_tokens_with_run_state"], 5000)
+                self.assertLess(max(ps["approx_tokens"] for ps in prompt_sizes), 6500)
+                self.assertLessEqual(prompt_summary["average_breakdown_tokens"]["tool_schemas"], 1250)
+                self.assertLessEqual(prompt_summary["average_breakdown_tokens"]["run_state"], 260)
                 verification = next(event["payload"] for event in first_run["events"] if event["event_type"] == "verification")
                 self.assertEqual(verification["status"], "verified")
                 self.assertTrue(all(verification["matches"].values()))
