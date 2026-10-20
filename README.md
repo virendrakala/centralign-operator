@@ -143,8 +143,7 @@ The live Groq workbench was manually verified with a high-value Acme invoice: it
 4. **Incorrect invoice selection:** Enforced by candidate inspection rules (`latest_by_invoice_date`, explicit month/number matching).
 5. **False completion / hallucinated writes:** Blocked by independent Playwright DOM verification of the ERP ledger table against the source invoice fields.
 
-The project depends on Python packages listed in `requirements.txt`. It does not use a frontend framework; the workbench is HTML, CSS, and JavaScript in `web/`. Follow [DEMO.md](DEMO.md) for the offline replay walkthrough and the live-provider walkthrough.
-
+The project depends on Python packages listed in `requirements.txt`. It does not use a frontend framework; the workbench is HTML, CSS, and JavaScript in `web/`.
 ## Demo data and reset
 
 The checked-in inbox contains synthetic PDF and TXT invoices. The two canonical Acme PDFs are `INV-2026-2084` (August, INR 42,000) and `INV-2026-2116` (October, INR 68,500). Stale Acme TXT copies with conflicting invoice numbers and amounts were removed. The other TXT fixtures cover Northstar, Vertex, and an instruction-like line. `data/policies/procurement_policy.txt` is the single policy source for approval thresholds and approved vendors. On first startup, the host creates `data/policies/company_memory.md` locally with vendor-directory information and a random sandbox password; this local file is ignored by Git and is not exposed to the model.
