@@ -122,6 +122,7 @@ class RunManager:
         self.offline = offline
         self._sequence: dict[str, int] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self._pending: dict[str, asyncio.Future[str | None]] = {}
         self._approval_payload: dict[str, dict[str, Any]] = {}
         self._tokens: dict[str, dict[str, Any]] = {}
@@ -306,6 +307,8 @@ class RunManager:
         run_id = uuid.uuid4().hex[:12]
         self.company.start_run(run_id, run_task)
         self._sequence[run_id] = 0
+        cancel_event = threading.Event()
+        self._cancel_events[run_id] = cancel_event
         self.event(run_id, "task_started", {"task": run_task, "user_reply": task, "approval_mode": approval_mode, "runtime": "single-tool-call-agent-loop"})
         if resolution:
             self.event(run_id, "pending_question_reply", {
@@ -325,7 +328,7 @@ class RunManager:
             task_handle = asyncio.create_task(asyncio.sleep(0), name=f"operator-{run_id}")
         else:
             task_handle = asyncio.create_task(
-                self._execute(run_id, run_task, approval_mode, base_url, session_id, confirmation_context),
+                self._execute(run_id, run_task, approval_mode, base_url, session_id, confirmation_context, cancel_event),
                 name=f"operator-{run_id}",
             )
         self._tasks[run_id] = task_handle
@@ -431,6 +434,7 @@ class RunManager:
     async def _execute(
         self, run_id: str, task: str, approval_mode: str, base_url: str,
         session_id: str = "", confirmed_pending_context: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         try:
             status, summary = await run_computer_use_agent(
@@ -443,7 +447,23 @@ class RunManager:
                 approval_mode=approval_mode,
                 offline=self.offline,
                 confirmed_pending_context=confirmed_pending_context,
+                cancel_event=cancel_event,
             )
+        except asyncio.CancelledError:
+            if cancel_event is not None:
+                cancel_event.set()
+            status = "stopped_by_user"
+            summary = "The run was stopped before completion was confirmed."
+            self.event(run_id, "final_result", {
+                "status": status,
+                "summary": summary,
+                "what_was_done": "The run was stopped before completion was confirmed.",
+                "requested_actions": [],
+                "not_done_actions": [],
+                "not_done": "completion was not confirmed",
+                "evidence": {},
+                "elapsed_seconds": 0.0,
+            })
         except Exception as exc:
             final_event = next(
                 (event.get("payload", {}) for event in reversed(self.company.read_audit(run_id)) if event.get("event_type") == "final_result"),
@@ -459,6 +479,22 @@ class RunManager:
         self._save_pending_question(session_id, run_id, task, status)
         self.event(run_id, "task_finished", {"status": status, "summary": summary})
         self.company.finish_run(run_id, status, summary)
+        self._cancel_events.pop(run_id, None)
+
+    async def cancel_run(self, run_id: str) -> bool:
+        """Stop an active run and signal any provider retry thread to exit."""
+        task = self._tasks.get(run_id)
+        if task is None or task.done():
+            return False
+        cancel_event = self._cancel_events.get(run_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self.company.get_run(run_id)
@@ -483,6 +519,9 @@ class RunManager:
         for future in pending:
             future.cancel()
         running = [task for task in self._tasks.values() if task is not current and not task.done()]
+        for run_id, event in self._cancel_events.items():
+            if self._tasks.get(run_id) in running:
+                event.set()
         for task in running:
             task.cancel()
         if running:
@@ -571,6 +610,17 @@ def create_app(data_dir: Path | None = None, *, offline: bool = False) -> FastAP
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found.")
         return run
+
+    @application.post("/api/runs/{run_id}/cancel")
+    async def cancel_run(run_id: str) -> dict[str, Any]:
+        if not ID_RE.fullmatch(run_id):
+            raise HTTPException(status_code=400, detail="Invalid run id.")
+        run = manager.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        cancelled = await manager.cancel_run(run_id)
+        updated = manager.get_run(run_id) or run
+        return {"cancelled": cancelled, "status": updated.get("status", "unknown")}
 
     @application.get("/api/runs/{run_id}/screenshots/{index}")
     async def read_screenshot(run_id: str, index: int) -> FileResponse:

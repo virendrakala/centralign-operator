@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -181,6 +182,10 @@ class LiveProvidersExhausted(RuntimeError):
     """Every configured live provider failed; live runs must stop here."""
 
 
+class ProviderCallCancelled(RuntimeError):
+    """A live provider call was cancelled while waiting or after an HTTP request."""
+
+
 class ProviderConfigurationError(RuntimeError):
     """A live run was requested without valid live-provider configuration."""
 
@@ -218,6 +223,7 @@ def _safe_error_excerpt(body: str, url: str, headers: dict[str, str]) -> str | N
             if encoded:
                 cleaned = cleaned.replace(encoded, "[REDACTED]")
     cleaned = re.sub(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer [REDACTED]", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\borg_[A-Za-z0-9_-]+\b", "[REDACTED_ORG_ID]", cleaned)
     if not cleaned:
         return None
     return cleaned if len(cleaned) <= 300 else f"{cleaned[:297]}..."
@@ -897,7 +903,7 @@ class FakeLLM(IntentClassifierMixin):
 
 
 _PROVIDER_DEFAULTS = {
-    "groq": ("llama-3.3-70b-versatile", "https://api.groq.com/openai/v1/chat/completions"),
+    "groq": ("openai/gpt-oss-20b", "https://api.groq.com/openai/v1/chat/completions"),
     "openrouter": ("openrouter/free", "https://openrouter.ai/api/v1/chat/completions"),
     "gemini": ("gemini-2.5-flash-lite", None),
     "openai": ("gpt-4o", None),
@@ -980,6 +986,7 @@ class ResilientClient(IntentClassifierMixin):
         *,
         sleeper: Callable[[float], None] = time.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         if not providers:
             raise ProviderConfigurationError("A live run requires at least one configured provider API key.")
@@ -987,8 +994,13 @@ class ResilientClient(IntentClassifierMixin):
         self.on_recovery = on_recovery or (lambda _event: None)
         self.on_provider_turn = on_provider_turn or (lambda _event: None)
         self.sleeper, self.jitter = sleeper, jitter
+        self.cancel_event = cancel_event
         self.active_provider = 0
         self.turn = 0
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ProviderCallCancelled("Live provider call cancelled.")
 
     @property
     def name(self) -> str:
@@ -1011,6 +1023,13 @@ class ResilientClient(IntentClassifierMixin):
         exponential = 2 ** (retry_number - 1)
         return min(self.MAX_WAIT_SECONDS, exponential + self.jitter(0.0, 1.0))
 
+    @staticmethod
+    def _daily_quota_exhausted(error: ProviderRequestError) -> bool:
+        body = (error.response_body or "").casefold()
+        return any(marker in body for marker in (
+            "tokens per day", "(tpd)", "daily token limit", "daily quota",
+        ))
+
     def _call_with_retries(
         self,
         provider: str,
@@ -1020,11 +1039,24 @@ class ResilientClient(IntentClassifierMixin):
         tools: list[dict[str, Any]],
     ) -> ToolCall | None:
         for retry_number in range(self.MAX_RETRIES + 1):
+            self._check_cancelled()
             try:
-                return client.next_tool_call(task, observations, tools)
+                call = client.next_tool_call(task, observations, tools)
+                self._check_cancelled()
+                return call
             except ProviderRequestError as exc:
+                self._check_cancelled()
                 if exc.status_code not in {429, 503}:
                     raise
+                if self._daily_quota_exhausted(exc):
+                    self._safe_notify(self.on_recovery, {
+                        "marker": "[RATE_LIMIT_RECOVERY]", "action": "daily_quota_exhausted",
+                        "provider": provider, "model": client.model,
+                        "status_code": exc.status_code, "response_body": exc.response_body,
+                    })
+                    raise ProviderRetriesExhausted(
+                        provider, client.model, exc.status_code, retry_number, exc.response_body
+                    ) from exc
                 if retry_number >= self.MAX_RETRIES:
                     self._safe_notify(self.on_recovery, {
                         "marker": "[RATE_LIMIT_RECOVERY]", "action": "retries_exhausted",
@@ -1042,7 +1074,11 @@ class ResilientClient(IntentClassifierMixin):
                     "status_code": exc.status_code, "retry": retry_number + 1,
                     "retry_limit": self.MAX_RETRIES, "wait_seconds": wait_seconds,
                 })
-                self.sleeper(wait_seconds)
+                if self.cancel_event is not None:
+                    if self.cancel_event.wait(wait_seconds):
+                        self._check_cancelled()
+                else:
+                    self.sleeper(wait_seconds)
         raise AssertionError("Retry loop exited unexpectedly.")
 
     def _answered(self, provider: str, client: LLMClient) -> None:
@@ -1069,6 +1105,8 @@ class ResilientClient(IntentClassifierMixin):
             })
             try:
                 call = self._call_with_retries(fallback_provider, fallback_client, task, observations, tools)
+            except ProviderCallCancelled:
+                raise
             except Exception as fallback_error:
                 raise LiveProvidersExhausted(
                     f"Live providers failed: {primary_error}; "
@@ -1095,6 +1133,7 @@ def make_client(
     model_override: str | None = None,
     on_recovery: Callable[[dict[str, Any]], None] | None = None,
     on_provider_turn: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> LLMClient:
     if offline:
         return FakeLLM()
@@ -1107,4 +1146,4 @@ def make_client(
         (provider, _make_provider_client(provider, model, key))
         for provider, model, key in configured
     ]
-    return ResilientClient(providers, on_recovery, on_provider_turn)
+    return ResilientClient(providers, on_recovery, on_provider_turn, cancel_event=cancel_event)

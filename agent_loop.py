@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -96,6 +97,7 @@ class AgentLoop:
         offline: bool = False,
         client: LLMClient | None = None,
         confirmed_pending_context: dict[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.data_dir = data_dir.resolve()
         self.run_id = run_id
@@ -109,6 +111,7 @@ class AgentLoop:
             offline=offline,
             on_recovery=self._provider_recovery,
             on_provider_turn=self._provider_answered,
+            cancel_event=cancel_event,
         )
         self.company = CompanyApp(self.data_dir)
         self.browser = BrowserTools(data_dir, run_id, base_url, self._emit_browser_event)
@@ -2324,11 +2327,13 @@ async def run_computer_use_agent(
     approval_mode: str = "policy_driven",
     offline: bool = False,
     confirmed_pending_context: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, str]:
     """Run with a live provider, or FakeLLM replay when explicitly offline."""
     loop = AgentLoop(
         data_dir, run_id, task, base_url, emit, approval_handler,
         approval_mode=approval_mode, offline=offline,
         confirmed_pending_context=confirmed_pending_context,
+        cancel_event=cancel_event,
     )
     return await loop.run()

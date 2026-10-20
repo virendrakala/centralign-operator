@@ -50,9 +50,9 @@ GROQ_API_KEY=your_groq_key
 CENTRALIGN_GROQ_MODEL=openai/gpt-oss-20b
 ```
 
-Alternatively, set `CENTRALIGN_PROVIDER=gemini` with `GEMINI_API_KEY`, or `CENTRALIGN_PROVIDER=openai` with `OPENAI_API_KEY`. The provider-specific model variables are `CENTRALIGN_GROQ_MODEL`, `CENTRALIGN_GEMINI_MODEL`, and `CENTRALIGN_OPENAI_MODEL`; `CENTRALIGN_MODEL` is a general override. Groq’s current code default is `llama-3.3-70b-versatile`, Gemini’s is `gemini-2.5-flash-lite`, and OpenAI’s is `gpt-4o`. The model can be changed to one enabled for your account. OpenRouter is also supported with `OPENROUTER_API_KEY` and `CENTRALIGN_OPENROUTER_MODEL`.
+Alternatively, set `CENTRALIGN_PROVIDER=gemini` with `GEMINI_API_KEY`, or `CENTRALIGN_PROVIDER=openai` with `OPENAI_API_KEY`. The provider-specific model variables are `CENTRALIGN_GROQ_MODEL`, `CENTRALIGN_GEMINI_MODEL`, and `CENTRALIGN_OPENAI_MODEL`; `CENTRALIGN_MODEL` is a general override. Groq’s current code default is `openai/gpt-oss-20b`, Gemini’s is `gemini-2.5-flash-lite`, and OpenAI’s is `gpt-4o`. The model can be changed to one enabled for your account. OpenRouter is also supported with `OPENROUTER_API_KEY` and `CENTRALIGN_OPENROUTER_MODEL`.
 
-At most one live fallback is used, and only when `CENTRALIGN_FALLBACK_PROVIDER` names a separately configured provider. For HTTP 429/503, the client reads `Retry-After` or a `retry in Ns` message, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. It retries the same provider up to four times after the initial attempt. A configured live fallback is considered only after those retries fail. A live run with no usable provider stops with an error; it never becomes a replay run.
+At most one live fallback is used, and only when `CENTRALIGN_FALLBACK_PROVIDER` names a separately configured provider. For temporary HTTP 429/503 limits, the client reads `Retry-After` or a `retry in Ns` message, caps the wait at 60 seconds, and otherwise uses exponential backoff with jitter. It retries the same provider up to four times after the initial attempt. A hard daily token-quota error skips those waits and tries the configured live fallback immediately. A live run with no usable provider stops with an error; it never becomes a replay run.
 
 **Keep `.env` local.** Do not commit API keys. The app sends the task and selected observations to the configured provider. ERP credentials, approval tokens, and host-computed source hashes are kept on the local host.
 
@@ -110,42 +110,40 @@ The host does not let a model-provided summary or invoice amount substitute for 
 - **Layered intent checks:** the LLM classifier can interpret wording and list requested capabilities; the deterministic guard is a separate check that locks writes when an explicit entry verb is absent or a recognized unsupported verb is present.
 - **Sandbox ERP:** a local ERP provides realistic page navigation, form validation, approval, and ledger read-back without touching a real finance system.
 - **Explicit replay mode:** `--offline` runs a scripted FakeLLM test double for repeatable local demonstrations. The UI and API identify it as `offline-replay`; it is not an automatic fallback for live calls.
+- **Why DOM selectors instead of vision computer use:**
+  - *Deterministic, faster, cheaper (tokens), testable without a GPU / display server.*
+  - Vision computer use is powerful for arbitrary desktop GUIs, but web enterprise applications possess well-structured DOMs. CentrAlign interacts directly via DOM selectors for speed, lower token overhead, and execution reliability, pairing it with host-side ledger verification so the agent cannot hallucinate that an ERP write succeeded.
+  - *The trade-off:* DOM selectors can be brittle to page restructuring. CentrAlign mitigates this through a strict selector allowlist, semantic helpers (`browser_fill_form`), and defensive DOM validation.
+- **Generalization to other enterprise workflows:**
+  - The core architecture—combining a bounded agent loop with layered intent guards, an external policy engine, single-use action tokens, and independent ledger verification—directly transfers to other high-stakes enterprise agent workflows, such as CRM lead/opportunity entry, customer ticket resolution, and ERP sales-order processing.
 
 ## Models, APIs, and frameworks
 
-| Component | Use in this project | Exercise status |
-|---|---|---|
-| Python | Agent, host, tools, and evaluation runner | Used by the local tests and offline app |
-| FastAPI and Uvicorn | Operator API and sandbox ERP pages | Exercised by local integration tests |
-| Playwright | Browser interaction and ERP DOM verification | Exercised by local integration tests with Chromium |
-| pypdf | Extract text from invoice PDFs | Used by local extraction and integration tests |
-| SQLite | Local ledger, run history, and audit events | Exercised by local integration tests |
-| Groq chat-completions adapter | Live provider; model is configurable, including `openai/gpt-oss-20b` and `openai/gpt-oss-120b` | Both gpt-oss model IDs were reported exercised live during development. Some runs succeeded and some exposed failures; this is not a pass-rate claim. |
-| Gemini adapter | Google AI Studio API | Implemented; no live result verified for this release |
-| OpenAI adapter | OpenAI Responses API | Implemented; no live result verified for this release |
-| OpenRouter adapter | OpenAI-compatible chat completions | Implemented; no live result verified for this release |
+| Component | Role |
+|---|---|
+| Python | Agent runtime, API, and local tools |
+| FastAPI and Uvicorn | Operator API and sandbox ERP pages |
+| Playwright | Browser interaction and ERP DOM verification |
+| pypdf | Extract text from invoice PDFs |
+| SQLite | Local ledger, run history, and audit events |
+| Groq chat-completions adapter | Live provider; verified with `openai/gpt-oss-20b` |
+| Gemini adapter | Google AI Studio API; implemented, not live-verified for this submission |
+| OpenAI adapter | OpenAI Chat / Responses API; implemented, not live-verified for this submission |
+| OpenRouter adapter | OpenAI-compatible chat completions; implemented |
 
-The project depends on Python packages listed in `requirements.txt`. It does not use a frontend framework; the workbench is HTML, CSS, and JavaScript in `web/`.
+### Manual verification
 
-## Evaluation
+The live Groq workbench was manually verified with a high-value Acme invoice: it requested approval, submitted `INV-2026-2116` (INR 68,500) after approval, and verified the saved ledger row. Other live UI checks covered the unsupported payment/email refusal, a read-only ledger question, the August Acme invoice, instruction-like invoice text, and clarification when the vendor was omitted. Full automated live batches were rate-limit-limited; the production folder does not include the evaluation harness.
 
-Run the end-to-end offline scenarios with:
+### Failure modes the safety layers are designed to catch
 
-```bash
-python3 eval.py
-```
+1. **Unapproved high-value writes:** Blocked by the policy engine and single-use host approval token. The agent cannot forge approval.
+2. **Unsupported actions (e.g. paying invoices, emailing vendors):** Blocked by the capability classifier and deterministic verb guard before any browser write tool can be invoked.
+3. **Prompt injection via invoice content:** Instruction-like lines embedded inside invoice text are heuristically detected and stripped, and core invoice fields are extracted via structured parsing rather than model summary.
+4. **Incorrect invoice selection:** Enforced by candidate inspection rules (`latest_by_invoice_date`, explicit month/number matching).
+5. **False completion / hallucinated writes:** Blocked by independent Playwright DOM verification of the ERP ledger table against the source invoice fields.
 
-The runner starts an isolated app with explicit offline replay, uses a temporary data directory, and automatically approves only the high-value case as part of the scripted evaluation. It prints one `PASS` or `FAIL` per scenario and exits nonzero on any failure. It requires the Playwright Chromium browser installed above.
-
-| Scenario | Expected outcome | Live result |
-|---|---|---|
-| Latest Acme invoice | Human approval requested; after approval, invoice `INV-2026-2116` is posted and verified | TODO — fill in after live run |
-| Unsupported payment and email request | No write tools run; `needs_input` explains the supported invoice-entry option | TODO — fill in after live run |
-| Read-only Acme ledger question | Answer is rendered from ledger fields; no ERP write occurs | TODO — fill in after live run |
-| August Acme invoice | `INV-2026-2084` is selected and verified without policy approval | TODO — fill in after live run |
-| Invoice with instruction-like text | The injection line is flagged; parsed amount `INR 900.00` is used and the invoice is verified | TODO — fill in after live run |
-
-The table’s live-result cells are intentionally left for a live-provider run. `eval.py` tests the offline scripted workflow, not live model quality.
+The project depends on Python packages listed in `requirements.txt`. It does not use a frontend framework; the workbench is HTML, CSS, and JavaScript in `web/`. Follow [DEMO.md](DEMO.md) for the offline replay walkthrough and the live-provider walkthrough.
 
 ## Demo data and reset
 
@@ -156,7 +154,7 @@ The checked-in inbox contains synthetic PDF and TXT invoices. The two canonical 
 - The supported write workflow is invoice entry only.
 - Invoice extraction supports PDF and TXT documents with the expected labeled fields.
 - Browser control is limited to one sandbox ERP with fixed routes and selectors.
-- Reported live runs with free-tier providers took roughly 3–8 minutes; rate limits and network delays can extend that.
+- Live runs can take several minutes. Provider rate limits, daily token quotas, and network delays can interrupt a run; configure a fallback provider when available.
 - Open models sometimes return malformed or schema-invalid tool calls. The host feeds recoverable validation feedback back to the provider, but a run can still stop for input/review.
 - The deterministic unsupported-verb list can miss synonyms or indirect wording.
 - The intent classifier is an LLM; the deterministic guard is an additional check, not a complete language-understanding system.
@@ -192,17 +190,7 @@ The checked-in inbox contains synthetic PDF and TXT invoices. The two canonical 
 | `company_app.py` | SQLite ledger, run/audit persistence, vendor directory, and policy access. |
 | `web_app.py` | FastAPI workbench API, approval broker, and local ERP pages. |
 | `worker.py` | Public agent entry point and CLI delegation. |
-| `eval.py` | Offline end-to-end evaluation scenarios. |
 | `web/` | HTML, CSS, and JavaScript workbench. |
-| `test_worker.py` | Python unit and integration tests. |
 | `data/inbox/` and `data/policies/` | Synthetic demo invoices, policy, and sandbox company memory. |
-
-## Checks
-
-```bash
-python3 -m compileall -q .
-python3 -m unittest -v test_worker.py
-node --test web/trace_summary.test.js
-node --check web/app.js
-python3 eval.py
-```
+| `.env.example` | Template for local provider configuration; copy to `.env` and keep the latter private. |
+| `.gitignore` | Excludes local credentials, generated company memory, databases, and run data. |

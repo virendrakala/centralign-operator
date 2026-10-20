@@ -48,3 +48,58 @@ The offline replay should select `INV-2026-2084`, dated 2026-08-04, for INR 42,0
 - The stepper shows intent, selection, approval, submission, and verification state.
 - The result evidence comes from host-side parsing and ERP read-back.
 - The UI labels this run as offline replay. For a live-provider demo, configure a key as described in `README.md` and repeat with synthetic data.
+
+## Live demo
+
+To demonstrate CentrAlign with a live language model (e.g. Gemini, Groq, OpenAI, or OpenRouter):
+
+### 1. Configure provider credentials
+
+Export the provider environment variables in your terminal:
+
+```bash
+# Example for Gemini:
+export CENTRALIGN_PROVIDER=gemini
+export GEMINI_API_KEY="your-gemini-api-key"
+export CENTRALIGN_GEMINI_MODEL="gemini-2.5-flash-lite"
+
+# Or example for Groq:
+# export CENTRALIGN_PROVIDER=groq
+# export GROQ_API_KEY="your-groq-api-key"
+```
+
+### 2. Reset demo data and start the app
+
+Start the server with a pristine demo database:
+
+```bash
+python3 web_app.py --reset-demo-data
+```
+
+You can also reset the database at any point during your demo using either:
+- **UI button:** Click **Reset demo data** in the top navigation bar.
+- **REST endpoint:** `curl -X POST http://127.0.0.1:8765/api/demo/reset -H "Content-Type: application/json" -d '{}'`
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Confirm the top banner indicates your active live model (e.g. **Gemini · gemini-2.5-flash-lite**).
+
+### 3. Step-by-step walkthrough
+
+1. **High-value invoice requiring approval:**
+   - Submit: `Find the latest Acme invoice and record it in the ledger.`
+   - Observe the live model parse candidate invoices, inspect procurement policy, identify that INR 68,500 exceeds the INR 50,000 threshold, and pause for human approval.
+   - Click **Approve**. The host injects the single-use approval token (`APR-...`), submits the ERP form, and independently verifies the newly created ledger row.
+
+2. **Policy & verb guard refusal:**
+   - Submit: `Pay the Northstar invoice and email the vendor.`
+   - Point out that the capability classifier and deterministic verb guard immediately refuse the unsupported actions before any write tools can run.
+
+3. **Read-only query:**
+   - Submit: `Show me what Acme has been invoiced.`
+   - The agent reads host ledger records without touching browser write tools, rendering the answer directly in the timeline.
+
+4. **Duplicate invoice handling:**
+   - Submit: `Find the latest Acme invoice and record it in the ledger.`
+   - Because invoice `INV-2026-2116` was already posted in step 1, the agent checks the ledger, recognizes the existing row, verifies it against the source file, and finishes with: `"Already in ledger – verified, no new write"`. No duplicate ledger entry is created.
+
+5. **Rate-limit handling (if triggered):**
+   - For temporary HTTP 429 limits, point out the live status bar displaying the backoff countdown; the agent retries with jitter. A hard daily token-quota error skips the long retry waits and tries the explicitly configured live fallback, if one is set. Otherwise the run stops with a clear provider error.
